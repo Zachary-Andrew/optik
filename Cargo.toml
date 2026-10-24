@@ -1,0 +1,40 @@
+[package]
+name = "Optik"
+version = "0.1.0"
+edition = "2024"
+# let chains (`if a && let Some(x) = b`) are stable from 1.88
+rust-version = "1.88"
+
+[[bin]]
+name = "optik"
+path = "tools/src/main.rs"
+
+# Link-time and whole-program optimization.  The query hot path crosses the
+# Rust/C++ FFI boundary per batch, so fat LTO and a single codegen unit let
+# LLVM inline across translation units and keep the fused SIMD kernels hot.
+# panic="abort" drops unwind tables from the CLI's hot paths and shrinks the
+# binary, though cargo test overrides it to unwind.  strip=true
+# keeps the shipped binary lean, and symbols live in debug builds.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+ 
+[build-dependencies]
+cc = "1"
+ 
+[dependencies]
+rustc-hash = "2"
+libc = "0.2"
+memmap2 = "0.9"
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1.10"
+
+# Every default clippy lint is an error.  The tree is clean under clippy with
+# -D warnings, and this gate keeps a future change from quietly regressing it.
+[lints.clippy]
+all = "deny"

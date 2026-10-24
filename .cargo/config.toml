@@ -1,0 +1,9 @@
+# Compile the Rust side for THIS machine, matching build.rs's -march=native
+# for C++.  Lets LLVM use AVX2/AVX-512 in the Rust k-mer extraction and
+# encoding loops.  Binaries built this way may fault (SIGILL) on older CPUs,
+# so rebuild from source when deploying elsewhere.
+#
+# Setting the RUSTFLAGS environment variable replaces these flags entirely,
+# so any ad-hoc RUSTFLAGS must state -Ctarget-cpu=native again.
+[build]
+rustflags = ["-C", "target-cpu=native"]

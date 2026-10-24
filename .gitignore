@@ -1,0 +1,14 @@
+/target
+/temp
+/bench/results/*
+*.fa
+*.fna
+# Built indexes, such as the TUI's default index.spss output
+*.spss
+*.fm
+*.csv
+*.json
+.pixi
+__pycache__
+tmp*
+/graph.gfa
