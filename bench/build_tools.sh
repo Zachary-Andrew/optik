@@ -48,6 +48,16 @@ EXTRA_TARGETS=(scaling hg38 zlib-ng rtg)
 if [[ ${#SELECTED_TOOLS[@]} -eq 0 ]]; then
     SELECTED_TOOLS=("${ALL_TOOLS[@]}")
 fi
+# Download retries of curl.
+readonly CURL_RETRIES=3
+# Salmonella LT2 (NC_003197.1): bytes of its header line prefix checked, and its length in bases.
+readonly SALMONELLA_HEADER_BYTES=13
+readonly SALMONELLA_LEN=4857432
+# Primary chromosomes of hg38 (chr1-22, X, Y and M).
+readonly HG38_PRIMARY_CHROMOSOMES=25
+# Bytes of a scaling chromosome header checked against ">chrN".
+readonly CHROM_HEADER_BYTES=7
+
 
 info()  { printf "\033[1;34m[build]\033[0m %s\n" "$*"; }
 ok()    { printf "\033[1;32m[  ok]\033[0m %s\n" "$*"; }
@@ -92,6 +102,16 @@ done
 
 mkdir -p "$TOOLS_DIR"
 info "tools will be built into $TOOLS_DIR"
+
+# clean_make: run make with the compiler variables removed from its environment.
+# Under nix-shell, the stdenv exports CC (and CXX, CPP), and GNU make re-exports every variable that came from the environment, even when a Makefile reassigns it.
+# KMC's Makefile sets CC = g++, so its nested `cd 3rd_party/cloudflare; ./configure; make libz.a` sees CC=g++, configures zlib with g++, and the K&R C then fails to compile as C++.
+# With the variables unset, each Makefile's own choice stays private to it and nested ./configure scripts fall back to cc/gcc, which the Nix gcc wrapper provides.
+# This is harmless on other systems, where these variables are normally unset anyway.
+# Settings that a tool really needs are passed as arguments, e.g. clean_make -C dir CXXFLAGS=..., which still work.
+clean_make() {
+    env -u CC -u CXX -u CPP make "$@"
+}
 
 # CMake flags shared by every tool, which silence warnings-as-errors that older code bases trip with newer compilers.
 # Individual tools may add flags of their own.
@@ -184,7 +204,7 @@ build_fmsi() {
     rm -rf "$src/src/sdsl-lite/build"
     mkdir -p "$src/src/sdsl-lite/build"
     rm -f "$src/fmsi" "$src/src/fmsi"
-    make -C "$src" -j "$JOBS" CXXFLAGS="-g -Wall -Wno-unused-function -std=c++17 $OPT_FLAGS"
+    clean_make -C "$src" -j "$JOBS" CXXFLAGS="-g -Wall -Wno-unused-function -std=c++17 $OPT_FLAGS"
     [[ -x "$src/fmsi" ]] || fail "fmsi build produced no binary"
     ok "fmsi -> $src/fmsi"
 }
@@ -200,8 +220,8 @@ build_kmercamel() {
         fail "kmercamel requires libglpk-dev.  Install with: apt install libglpk-dev  OR  brew install glpk"
     fi
     clone_or_update "https://github.com/OndrejSladky/kmercamel.git" "$src"
-    make -C "$src" clean >/dev/null 2>&1 || true
-    make -C "$src" -j "$JOBS" CXXFLAGS="-g -Wall -Wno-unused-function -std=c++17 $OPT_FLAGS"
+    clean_make -C "$src" clean >/dev/null 2>&1 || true
+    clean_make -C "$src" -j "$JOBS" CXXFLAGS="-g -Wall -Wno-unused-function -std=c++17 $OPT_FLAGS"
     [[ -x "$src/kmercamel" ]] || fail "kmercamel build produced no binary"
     ok "kmercamel -> $src/kmercamel"
 }
@@ -212,8 +232,8 @@ build_kmercamel() {
 build_minimap2() {
     local src="$TOOLS_DIR/minimap2"
     clone_or_update "https://github.com/lh3/minimap2.git" "$src"
-    make -C "$src" clean >/dev/null 2>&1 || true
-    make -C "$src" -j "$JOBS" CFLAGS="-g -Wall $OPT_FLAGS -Wc++-compat"
+    clean_make -C "$src" clean >/dev/null 2>&1 || true
+    clean_make -C "$src" -j "$JOBS" CFLAGS="-g -Wall $OPT_FLAGS -Wc++-compat"
     [[ -x "$src/minimap2" ]] || fail "minimap2 build produced no binary"
     ok "minimap2 -> $src/minimap2"
 }
@@ -224,7 +244,7 @@ build_minimap2() {
 build_gfatools() {
     local src="$TOOLS_DIR/gfatools"
     clone_or_update "https://github.com/lh3/gfatools.git" "$src"
-    make -C "$src" -j "$JOBS"
+    clean_make -C "$src" -j "$JOBS"
     [[ -x "$src/gfatools" ]] || fail "gfatools build produced no binary"
     ok "gfatools -> $src/gfatools"
 }
@@ -260,7 +280,23 @@ build_sbwt() {
 build_kmc() {
     local src="$TOOLS_DIR/KMC"
     clone_or_update "https://github.com/refresh-bio/KMC" "$src"
-    make -C "$src" -j "$JOBS" kmc kmc_dump kmc_tools STATIC_CFLAGS= STATIC_LFLAGS=
+    # Drop objects and the Makefile that an earlier g++-configured attempt left in the bundled zlib.
+    git -C "$src" clean -fdxq -- 3rd_party/cloudflare
+    git -C "$src" checkout -q -- 3rd_party/cloudflare
+    # Build the bundled Cloudflare zlib ourselves, before KMC's Makefile would, because two things go wrong in its default flow.
+    # First, its configure must see a C compiler (clean_make's env -u CC handles that for the Makefile's nested call, here it is run directly).
+    # Second, with -DADLER32_SIMD_SSSE3 the archive's adler32.o calls adler32_simd_, which the linker then reports as an undefined hidden symbol, so kmc, kmc_dump and kmc_tools all fail to link.
+    # Dropping the SSSE3 adler32 flags gives the portable checksum, which only matters for the speed of reading gzipped input and not for the kmc_tools set operations used here.
+    # KMC's Makefile then finds libz.a already built and leaves it alone.
+    (
+        cd "$src/3rd_party/cloudflare" || exit 1
+        rm -f libz.a
+        env -u CC -u CXX -u CPP ./configure >/dev/null
+        sed -i 's/ -DADLER32_SIMD_SSSE3//g; s/ -mssse3//g' Makefile
+        env -u CC -u CXX -u CPP make libz.a >"$src/zlib_build.log" 2>&1
+    ) || { tail -n 20 "$src/zlib_build.log"; fail "KMC bundled zlib build failed (log: $src/zlib_build.log)"; }
+    [[ -f "$src/3rd_party/cloudflare/libz.a" ]] || fail "KMC bundled zlib produced no libz.a"
+    clean_make -C "$src" -j "$JOBS" kmc kmc_dump kmc_tools STATIC_CFLAGS= STATIC_LFLAGS=
     [[ -x "$src/bin/kmc" ]] || fail "kmc build produced no binary"
     [[ -x "$src/bin/kmc_dump" ]] || fail "kmc build produced no kmc_dump"
     [[ -x "$src/bin/kmc_tools" ]] || fail "kmc build produced no kmc_tools"
@@ -281,8 +317,8 @@ build_samtools() {
     clone_or_update "https://github.com/samtools/htslib.git" "$src/htslib"
     # htslib is built first, and samtools picks up the submodule at run time when present.
     ( cd "$src" && git submodule update --init 2>/dev/null || true )
-    ( cd "$src" && autoreconf -i 2>/dev/null && ./configure && make -j "$JOBS" ) \
-        || make -C "$src" -j "$JOBS"
+    ( cd "$src" && autoreconf -i 2>/dev/null && ./configure && clean_make -j "$JOBS" ) \
+        || clean_make -C "$src" -j "$JOBS"
     [[ -x "$src/samtools" ]] || fail "samtools build produced no binary"
     # samtools links htslib through -L../htslib, which is exported for later commands.
     export LD_LIBRARY_PATH="$src/htslib:${LD_LIBRARY_PATH:-}"
@@ -299,7 +335,7 @@ build_bwa() {
     fi
     local src="$TOOLS_DIR/bwa"
     clone_or_update "https://github.com/lh3/bwa.git" "$src"
-    make -C "$src" -j "$JOBS"
+    clean_make -C "$src" -j "$JOBS"
     [[ -x "$src/bwa" ]] || fail "bwa build produced no binary"
     ok "bwa -> $src/bwa"
 }
@@ -325,7 +361,7 @@ build_bcftools() {
     ( cd "$src/htslib" && rm -f config.h && autoreconf -i >/dev/null 2>&1 \
         && ./configure --disable-libcurl --disable-gcs --disable-s3 >/dev/null ) || fail "htslib configure failed"
     # htslib is cloned inside the bcftools tree, not beside it as the Makefile's ../htslib default expects.
-    make -C "$src" -j "$JOBS" HTSDIR=htslib
+    clean_make -C "$src" -j "$JOBS" HTSDIR=htslib
     [[ -x "$src/bcftools" ]] || fail "bcftools build produced no binary"
     ok "bcftools -> $src/bcftools"
 }
@@ -343,7 +379,7 @@ build_picard() {
     mkdir -p "$dir"
     url=$(curl -fsSL https://api.github.com/repos/broadinstitute/picard/releases/latest \
           | python3 -c "import json,sys; print([a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if a['name'] == 'picard.jar'][0])")
-    curl -fsSL --retry 3 -o "$dir/picard.jar.part" "$url" && mv "$dir/picard.jar.part" "$dir/picard.jar"
+    curl -fsSL --retry "$CURL_RETRIES" -o "$dir/picard.jar.part" "$url" && mv "$dir/picard.jar.part" "$dir/picard.jar"
     # Picard prints its version but exits 1 for this invocation, so check the output rather than the status.
     local out
     out=$(java -jar "$dir/picard.jar" ValidateSamFile --version 2>&1) || true
@@ -405,25 +441,25 @@ build_wfmash() {
 fetch_salmonella() {
     check_dep curl
     local out="$TOOLS_DIR/salmonella_LT2.fa"
-    if [[ -s "$out" ]] && head -c 13 "$out" | grep -q '^>NC_003197.1'; then
+    if [[ -s "$out" ]] && head -c "$SALMONELLA_HEADER_BYTES" "$out" | grep -q '^>NC_003197.1'; then
         ok "salmonella -> $out (present)"
     else
         local tmp="$out.part.$$"
-        curl -fsSL --retry 3 -o "$tmp" \
+        curl -fsSL --retry "$CURL_RETRIES" -o "$tmp" \
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_003197.1&rettype=fasta&retmode=text" \
             || { rm -f "$tmp"; fail "salmonella download failed"; }
         local len
         len=$(grep -v '^>' "$tmp" | tr -d '\n\r' | wc -c)
-        if ! head -c 13 "$tmp" | grep -q '^>NC_003197.1' || [[ "$len" -ne 4857432 ]]; then
+        if ! head -c "$SALMONELLA_HEADER_BYTES" "$tmp" | grep -q '^>NC_003197.1' || [[ "$len" -ne "$SALMONELLA_LEN" ]]; then
             rm -f "$tmp"; fail "salmonella download is not NC_003197.1 (length $len)"
         fi
         mv "$tmp" "$out"
         ok "salmonella -> $out (NC_003197.1, $len bp)"
     fi
     # wfmash needs the .fai, and samtools may not be on PATH yet (it may be built into temp/).
-    local st
-    st=$(command -v samtools || echo "$TOOLS_DIR/samtools/samtools")
-    [[ -x "$st" ]] && "$st" faidx "$out" && ok "salmonella .fai written"
+    local samtools_bin
+    samtools_bin=$(command -v samtools || echo "$TOOLS_DIR/samtools/samtools")
+    [[ -x "$samtools_bin" ]] && "$samtools_bin" faidx "$out" && ok "salmonella .fai written"
 }
 
 # scaling  UCSC hg38 chr21 and chr1 from the GRCh38 primary assembly
@@ -438,16 +474,16 @@ fetch_hg38() {
     check_dep gunzip
     mkdir -p "$TOOLS_DIR/scaling"
     local out="$TOOLS_DIR/scaling/hg38_primary.fa"
-    if [[ -s "$out" ]] && [[ "$(grep -c '^>' "$out")" -eq 25 ]]; then
+    if [[ -s "$out" ]] && [[ "$(grep -c '^>' "$out")" -eq "$HG38_PRIMARY_CHROMOSOMES" ]]; then
         ok "hg38 -> $out (present)"
         return
     fi
     local tmp="$out.part.$$"
-    curl -fsSL --retry 3 "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz" \
+    curl -fsSL --retry "$CURL_RETRIES" "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz" \
         | gunzip -c | awk '/^>/{keep = ($1 ~ /^>chr([0-9]+|X|Y|M)$/)} keep' > "$tmp" \
         || { rm -f "$tmp"; fail "hg38 download failed"; }
-    if [[ "$(grep -c '^>' "$tmp")" -ne 25 ]]; then
-        rm -f "$tmp"; fail "hg38 download does not hold the 25 primary chromosomes"
+    if [[ "$(grep -c '^>' "$tmp")" -ne "$HG38_PRIMARY_CHROMOSOMES" ]]; then
+        rm -f "$tmp"; fail "hg38 download does not hold the $HG38_PRIMARY_CHROMOSOMES primary chromosomes"
     fi
     mv "$tmp" "$out"
     ok "hg38 -> $out"
@@ -457,24 +493,24 @@ fetch_scaling() {
     check_dep curl
     check_dep gunzip
     mkdir -p "$TOOLS_DIR/scaling"
-    local c want
-    for c in chr21:46709983 chr1:248956422; do
-        want=${c#*:}; c=${c%%:*}
-        local out="$TOOLS_DIR/scaling/$c.fa"
+    local spec chrom want
+    for spec in chr21:46709983 chr1:248956422; do
+        want=${spec#*:}; chrom=${spec%%:*}
+        local out="$TOOLS_DIR/scaling/$chrom.fa"
         if [[ -s "$out" ]] && [[ "$(grep -v '^>' "$out" | tr -d '\n\r' | wc -c)" -eq "$want" ]]; then
-            ok "scaling $c -> $out (present)"
+            ok "scaling $chrom -> $out (present)"
             continue
         fi
         local tmp="$out.part.$$"
-        curl -fsSL --retry 3 "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/$c.fa.gz" \
-            | gunzip -c > "$tmp" || { rm -f "$tmp"; fail "scaling $c download failed"; }
+        curl -fsSL --retry "$CURL_RETRIES" "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/$chrom.fa.gz" \
+            | gunzip -c > "$tmp" || { rm -f "$tmp"; fail "scaling $chrom download failed"; }
         local len
         len=$(grep -v '^>' "$tmp" | tr -d '\n\r' | wc -c)
-        if ! head -c 7 "$tmp" | grep -q "^>$c" || [[ "$len" -ne "$want" ]]; then
-            rm -f "$tmp"; fail "scaling $c download is not hg38 $c (length $len, want $want)"
+        if ! head -c "$CHROM_HEADER_BYTES" "$tmp" | grep -q "^>$chrom" || [[ "$len" -ne "$want" ]]; then
+            rm -f "$tmp"; fail "scaling $chrom download is not hg38 $chrom (length $len, want $want)"
         fi
         mv "$tmp" "$out"
-        ok "scaling $c -> $out ($len bp)"
+        ok "scaling $chrom -> $out ($len bp)"
     done
 }
 
@@ -522,9 +558,9 @@ build_wfa2() {
     # WFA2-lib's Makefile does not order lib_wfa before the tools that link lib/libwfa.a, so a single -j build races with "No rule to make target '../../lib/libwfa.a'".
     # The library is therefore built in parallel first and the tools serially afterwards.
     # Both go through the default `all` target, which carries -O3 -march=native as a target-specific variable.
-    make -C "$src" setup
-    make -C "$src" -j "$JOBS" BUILD_TOOLS=0 BUILD_EXAMPLES=0
-    make -C "$src" BUILD_TOOLS=1 BUILD_EXAMPLES=0
+    clean_make -C "$src" setup
+    clean_make -C "$src" -j "$JOBS" BUILD_TOOLS=0 BUILD_EXAMPLES=0
+    clean_make -C "$src" BUILD_TOOLS=1 BUILD_EXAMPLES=0
     [[ -f "$src/lib/libwfa.a" ]] || fail "wfa2 build produced no library"
     [[ -x "$src/bin/align_benchmark" ]] || fail "wfa2 build produced no align_benchmark"
     ok "wfa2 -> $src/lib/libwfa.a + $src/bin/align_benchmark"
@@ -581,10 +617,13 @@ build_rtg() {
     # It drops the permission bits, which are restored from the archive so the launcher and the bundled JRE stay executable.
     python3 - "$zip" "$TOOLS_DIR" <<'PY'
 import os, sys, zipfile
+# The unix mode of a zip entry sits in the high 16 bits of external_attr; only its permission bits are restored.
+ZIP_UNIX_MODE_SHIFT = 16
+PERMISSION_BITS = 0o777
 z = zipfile.ZipFile(sys.argv[1])
 for info in z.infolist():
     path = z.extract(info, sys.argv[2])
-    mode = (info.external_attr >> 16) & 0o777
+    mode = (info.external_attr >> ZIP_UNIX_MODE_SHIFT) & PERMISSION_BITS
     if mode:
         os.chmod(path, mode)
 PY
