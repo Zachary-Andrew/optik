@@ -157,7 +157,7 @@ The scripts in `bench/` also need Python 3, hyperfine, Java 17 or newer for Pica
 | Platform | Packages |
 |---|---|
 | Debian, Ubuntu | `sudo apt install python3 hyperfine cmake autoconf automake pkg-config libbz2-dev liblzma-dev libncurses-dev libcurl4-openssl-dev libboost-all-dev libglpk-dev perl openjdk-17-jre-headless samtools bcftools bwa` |
-| Fedora, RHEL | `sudo dnf install python3 hyperfine cmake autoconf automake bzip2-devel xz-devel ncurses-devel libcurl-devel boost-devel glpk-devel perl java-21-openjdk-headless samtools bcftools bwa` |
+| Fedora, RHEL | `sudo dnf install python3 hyperfine cmake autoconf automake bzip2-devel xz-devel ncurses-devel libcurl-devel boost-devel glpk-devel perl java-25-openjdk-headless samtools bcftools bwa` |
 | Arch | `sudo pacman -S --needed python hyperfine cmake bzip2 xz ncurses curl boost glpk perl jre-openjdk-headless` |
 | openSUSE | `sudo zypper install python3 hyperfine cmake autoconf automake libbz2-devel xz-devel ncurses-devel libcurl-devel boost-devel glpk-devel perl java-21-openjdk-headless` |
 | Nix | `nix-shell -p python3 hyperfine cmake autoconf automake bzip2 xz ncurses curl boost glpk perl jdk21_headless samtools bcftools bwa` |
