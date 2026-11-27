@@ -16,6 +16,8 @@ Optik is a genome analysis toolkit for k-mer indexing, de Bruijn graph construct
 - [Usage](#usage) for [k-mer indexes](#k-mer-indexes), [de Bruijn graphs](#de-bruijn-graphs) and [read mapping](#read-mapping)
 - [Intended use and limitations](#intended-use-and-limitations)
 - [Benchmarks and validation](#benchmarks-and-validation)
+- [Documentation](#documentation)
+- [Formal proofs](#formal-proofs)
 
 ## Install
 
