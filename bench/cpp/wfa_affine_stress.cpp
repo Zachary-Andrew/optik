@@ -17,53 +17,53 @@
 #include "wfa_affine.hpp"
 using namespace tpoptoa;
 
-static int gotoh(const std::string& p, const std::string& t, AffinePenalties pen, int tbf, int tef) {
-    const int m = p.size(), n = t.size(), INF = INT_MAX / 4;
-    auto eq = [](char a, char b) { return a == b && a != 'N'; };
-    std::vector<int> M(n + 1), X(n + 1), Y(n + 1), pM(n + 1), pX(n + 1), pY(n + 1);
+static int gotoh(const std::string& pattern, const std::string& text, AffinePenalties pen, int tbf, int tef) {
+    const int pattern_len = pattern.size(), text_len = text.size(), INF = INT_MAX / 4;
+    auto same = [](char lhs, char rhs) { return lhs == rhs && lhs != 'N'; };
+    std::vector<int> match_row(text_len + 1), gap_text_row(text_len + 1), gap_pattern_row(text_len + 1), prev_match(text_len + 1), prev_gap_text(text_len + 1), prev_gap_pattern(text_len + 1);
     // X is a gap in the pattern, consuming text, and Y a gap in the text, consuming pattern
-    for (int j = 0; j <= n; ++j) { pM[j] = j <= tbf ? 0 : INF; pX[j] = j <= tbf ? INF : INF; pY[j] = INF; }
+    for (int j = 0; j <= text_len; ++j) { prev_match[j] = j <= tbf ? 0 : INF; prev_gap_text[j] = j <= tbf ? INF : INF; prev_gap_pattern[j] = INF; }
     // allow leading text gap beyond tbf as a real gap from column tbf
-    for (int j = 1; j <= n; ++j) if (j > tbf) { pX[j] = std::min(pM[j - 1] + pen.o + pen.e, pX[j - 1] + pen.e); pM[j] = pX[j]; }
-    for (int i = 1; i <= m; ++i) {
-        M[0] = INF; X[0] = INF; Y[0] = std::min(pM[0] + pen.o + pen.e, pY[0] + pen.e);
-        M[0] = Y[0];
-        for (int j = 1; j <= n; ++j) {
-            X[j] = std::min(M[j - 1] + pen.o + pen.e, X[j - 1] + pen.e);
-            Y[j] = std::min(pM[j] + pen.o + pen.e, pY[j] + pen.e);
-            const int d = pM[j - 1] + (eq(p[i - 1], t[j - 1]) ? 0 : pen.x);
-            M[j] = std::min(d, std::min(X[j], Y[j]));
+    for (int j = 1; j <= text_len; ++j) if (j > tbf) { prev_gap_text[j] = std::min(prev_match[j - 1] + pen.gap_open + pen.gap_extend, prev_gap_text[j - 1] + pen.gap_extend); prev_match[j] = prev_gap_text[j]; }
+    for (int i = 1; i <= pattern_len; ++i) {
+        match_row[0] = INF; gap_text_row[0] = INF; gap_pattern_row[0] = std::min(prev_match[0] + pen.gap_open + pen.gap_extend, prev_gap_pattern[0] + pen.gap_extend);
+        match_row[0] = gap_pattern_row[0];
+        for (int j = 1; j <= text_len; ++j) {
+            gap_text_row[j] = std::min(match_row[j - 1] + pen.gap_open + pen.gap_extend, gap_text_row[j - 1] + pen.gap_extend);
+            gap_pattern_row[j] = std::min(prev_match[j] + pen.gap_open + pen.gap_extend, prev_gap_pattern[j] + pen.gap_extend);
+            const int diag = prev_match[j - 1] + (same(pattern[i - 1], text[j - 1]) ? 0 : pen.mismatch);
+            match_row[j] = std::min(diag, std::min(gap_text_row[j], gap_pattern_row[j]));
         }
-        std::swap(M, pM); std::swap(X, pX); std::swap(Y, pY);
+        std::swap(match_row, prev_match); std::swap(gap_text_row, prev_gap_text); std::swap(gap_pattern_row, prev_gap_pattern);
     }
     int best = INF;
-    for (int j = std::max(0, n - tef); j <= n; ++j) best = std::min(best, pM[j]);
+    for (int j = std::max(0, text_len - tef); j <= text_len; ++j) best = std::min(best, prev_match[j]);
     return best;
 }
 
-static int rescore(const std::string& cig, const std::string& p, const std::string& t, int tb,
+static int rescore(const std::string& cig, const std::string& pattern, const std::string& text, int text_begin,
                    AffinePenalties pen, int& pconsumed, int& tend) {
-    int i = 0, j = tb, sc = 0; std::size_t q = 0;
-    while (q < cig.size()) {
-        int len = 0; while (isdigit(cig[q])) len = len * 10 + (cig[q++] - '0');
-        const char op = cig[q++];
-        if (op == 'M') { for (int r = 0; r < len; ++r, ++i, ++j) if (p[i] != t[j] || p[i] == 'N') return -9; }
-        else if (op == 'X') { for (int r = 0; r < len; ++r, ++i, ++j) sc += pen.x; }
-        else if (op == 'I') { sc += pen.o + pen.e * len; i += len; }
-        else if (op == 'D') { sc += pen.o + pen.e * len; j += len; }
+    int pat_pos = 0, text_pos = text_begin, score = 0; std::size_t cig_pos = 0;
+    while (cig_pos < cig.size()) {
+        int len = 0; while (isdigit(cig[cig_pos])) len = len * 10 + (cig[cig_pos++] - '0');
+        const char cig_op = cig[cig_pos++];
+        if (cig_op == 'M') { for (int r = 0; r < len; ++r, ++pat_pos, ++text_pos) if (pattern[pat_pos] != text[text_pos] || pattern[pat_pos] == 'N') return -9; }
+        else if (cig_op == 'X') { for (int r = 0; r < len; ++r, ++pat_pos, ++text_pos) score += pen.mismatch; }
+        else if (cig_op == 'I') { score += pen.gap_open + pen.gap_extend * len; pat_pos += len; }
+        else if (cig_op == 'D') { score += pen.gap_open + pen.gap_extend * len; text_pos += len; }
     }
-    pconsumed = i; tend = j;
-    return sc;
+    pconsumed = pat_pos; tend = text_pos;
+    return score;
 }
 
 /// Independent O(mn) semi-global unit-cost edit distance with the pattern end to end and the text ends free.
 /// A pattern 'N' matches nothing.
-static int naive_semi_global_ed(const std::string& p, const std::string& t) {
-    std::vector<int> prev(t.size() + 1, 0), cur(t.size() + 1);
-    for (std::size_t i = 1; i <= p.size(); ++i) {
+static int naive_semi_global_ed(const std::string& pattern, const std::string& text) {
+    std::vector<int> prev(text.size() + 1, 0), cur(text.size() + 1);
+    for (std::size_t i = 1; i <= pattern.size(); ++i) {
         cur[0] = static_cast<int>(i);
-        for (std::size_t j = 1; j <= t.size(); ++j) {
-            const int sub = prev[j - 1] + ((p[i - 1] != t[j - 1] || p[i - 1] == 'N') ? 1 : 0);
+        for (std::size_t j = 1; j <= text.size(); ++j) {
+            const int sub = prev[j - 1] + ((pattern[i - 1] != text[j - 1] || pattern[i - 1] == 'N') ? 1 : 0);
             cur[j] = std::min({sub, prev[j] + 1, cur[j - 1] + 1});
         }
         std::swap(prev, cur);
@@ -74,34 +74,34 @@ static int naive_semi_global_ed(const std::string& p, const std::string& t) {
 /// Global Gotoh with gap-state constraints, where start_free means it may begin inside an open gap of that kind at no open cost, 1 consuming text and 2 consuming pattern.
 /// end_in requires ending with a gap of that kind.
 /// Full matrices.
-static int gotoh_c(const std::string& p, const std::string& t, AffinePenalties pen,
+static int gotoh_c(const std::string& pattern, const std::string& text, AffinePenalties pen,
                    int start_free, int end_in) {
-    const int m = p.size(), n = t.size(), INF = INT_MAX / 4;
-    auto eq = [](char a, char b) { return a == b && a != 'N'; };
-    std::vector<std::vector<int>> M(m + 1, std::vector<int>(n + 1, INF)), X = M, Y = M;
-    M[0][0] = 0;
-    if (start_free == 1) X[0][0] = 0;
-    if (start_free == 2) Y[0][0] = 0;
-    for (int i = 0; i <= m; ++i)
-        for (int j = 0; j <= n; ++j) {
-            if (j > 0) X[i][j] = std::min(X[i][j], std::min(M[i][j - 1] + pen.o + pen.e, X[i][j - 1] + pen.e));
-            if (i > 0) Y[i][j] = std::min(Y[i][j], std::min(M[i - 1][j] + pen.o + pen.e, Y[i - 1][j] + pen.e));
-            if (i > 0 && j > 0) M[i][j] = std::min(M[i][j], M[i - 1][j - 1] + (eq(p[i - 1], t[j - 1]) ? 0 : pen.x));
-            if (i || j) M[i][j] = std::min(M[i][j], std::min(X[i][j], Y[i][j]));
+    const int pattern_len = pattern.size(), text_len = text.size(), INF = INT_MAX / 4;
+    auto same = [](char lhs, char rhs) { return lhs == rhs && lhs != 'N'; };
+    std::vector<std::vector<int>> match_dp(pattern_len + 1, std::vector<int>(text_len + 1, INF)), gap_text_dp = match_dp, gap_pattern_dp = match_dp;
+    match_dp[0][0] = 0;
+    if (start_free == 1) gap_text_dp[0][0] = 0;
+    if (start_free == 2) gap_pattern_dp[0][0] = 0;
+    for (int i = 0; i <= pattern_len; ++i)
+        for (int j = 0; j <= text_len; ++j) {
+            if (j > 0) gap_text_dp[i][j] = std::min(gap_text_dp[i][j], std::min(match_dp[i][j - 1] + pen.gap_open + pen.gap_extend, gap_text_dp[i][j - 1] + pen.gap_extend));
+            if (i > 0) gap_pattern_dp[i][j] = std::min(gap_pattern_dp[i][j], std::min(match_dp[i - 1][j] + pen.gap_open + pen.gap_extend, gap_pattern_dp[i - 1][j] + pen.gap_extend));
+            if (i > 0 && j > 0) match_dp[i][j] = std::min(match_dp[i][j], match_dp[i - 1][j - 1] + (same(pattern[i - 1], text[j - 1]) ? 0 : pen.mismatch));
+            if (i || j) match_dp[i][j] = std::min(match_dp[i][j], std::min(gap_text_dp[i][j], gap_pattern_dp[i][j]));
         }
-    const int v = end_in == 1 ? X[m][n] : end_in == 2 ? Y[m][n] : M[m][n];
-    return v >= INF ? -1 : v;
+    const int result = end_in == 1 ? gap_text_dp[pattern_len][text_len] : end_in == 2 ? gap_pattern_dp[pattern_len][text_len] : match_dp[pattern_len][text_len];
+    return result >= INF ? -1 : result;
 }
 
-static std::string mutate(const std::string& p, double er, std::mt19937_64& rng) {
-    const char* A = "ACGT";
+static std::string mutate(const std::string& pattern, double err_rate, std::mt19937_64& rng) {
+    const char* bases = "ACGT";
     std::string core;
-    for (char c : p) {
-        double u = std::uniform_real_distribution<double>(0, 1)(rng);
-        if (u < er / 3) continue;
-        if (u < 2 * er / 3) { core.push_back(A[rng() % 4]); core.push_back(c); continue; }
-        if (u < er) { core.push_back(A[rng() % 4]); continue; }
-        core.push_back(c);
+    for (char ch : pattern) {
+        double roll = std::uniform_real_distribution<double>(0, 1)(rng);
+        if (roll < err_rate / 3) continue;
+        if (roll < 2 * err_rate / 3) { core.push_back(bases[rng() % 4]); core.push_back(ch); continue; }
+        if (roll < err_rate) { core.push_back(bases[rng() % 4]); continue; }
+        core.push_back(ch);
     }
     return core;
 }
@@ -109,64 +109,64 @@ static std::string mutate(const std::string& p, double er, std::mt19937_64& rng)
 int main() {
     std::mt19937_64 rng(11);
     int fail = 0; long cases = 0;
-    const char* A = "ACGT";
+    const char* bases = "ACGT";
     for (int it = 0; it < 20000; ++it) {
         AffinePenalties pen;
-        pen.x = 1 + rng() % 6; pen.o = rng() % 8; pen.e = 1 + rng() % 4;
-        const int m = 1 + rng() % 120;
-        std::string p; for (int i = 0; i < m; ++i) p.push_back(rng() % 50 == 0 ? 'N' : A[rng() % 4]);
+        pen.mismatch = 1 + rng() % 6; pen.gap_open = rng() % 8; pen.gap_extend = 1 + rng() % 4;
+        const int pattern_len = 1 + rng() % 120;
+        std::string pattern; for (int i = 0; i < pattern_len; ++i) pattern.push_back(rng() % 50 == 0 ? 'N' : bases[rng() % 4]);
         // text = flank + mutated pattern + flank
         std::string core;
-        const double er = (rng() % 4) * 0.05;
-        for (char c : p) {
-            double u = std::uniform_real_distribution<double>(0, 1)(rng);
-            if (u < er / 3) continue;
-            if (u < 2 * er / 3) { core.push_back(A[rng() % 4]); core.push_back(c); continue; }
-            if (u < er) { core.push_back(A[rng() % 4]); continue; }
-            core.push_back(c);
+        const double err_rate = (rng() % 4) * 0.05;
+        for (char ch : pattern) {
+            double roll = std::uniform_real_distribution<double>(0, 1)(rng);
+            if (roll < err_rate / 3) continue;
+            if (roll < 2 * err_rate / 3) { core.push_back(bases[rng() % 4]); core.push_back(ch); continue; }
+            if (roll < err_rate) { core.push_back(bases[rng() % 4]); continue; }
+            core.push_back(ch);
         }
-        std::string l, r;
-        const int fl = rng() % 30, fr = rng() % 30;
-        for (int i = 0; i < fl; ++i) l.push_back(A[rng() % 4]);
-        for (int i = 0; i < fr; ++i) r.push_back(A[rng() % 4]);
-        const std::string t = (rng() % 8 == 0) ? std::string() + A[rng() % 4] : l + core + r;
-        const int n = t.size();
-        const int tbf = (rng() % 3 == 0) ? 0 : rng() % (n + 1);
-        const int tef = (rng() % 3 == 0) ? 0 : rng() % (n + 1);
-        const int want = gotoh(p, t, pen, tbf, tef);
-        WfaAffine w(pen);
-        auto res = w.align(p.data(), m, t.data(), n, tbf, tef);
+        std::string left_flank, right_flank;
+        const int left_len = rng() % 30, right_len = rng() % 30;
+        for (int i = 0; i < left_len; ++i) left_flank.push_back(bases[rng() % 4]);
+        for (int i = 0; i < right_len; ++i) right_flank.push_back(bases[rng() % 4]);
+        const std::string text = (rng() % 8 == 0) ? std::string() + bases[rng() % 4] : left_flank + core + right_flank;
+        const int text_len = text.size();
+        const int tbf = (rng() % 3 == 0) ? 0 : rng() % (text_len + 1);
+        const int tef = (rng() % 3 == 0) ? 0 : rng() % (text_len + 1);
+        const int want = gotoh(pattern, text, pen, tbf, tef);
+        WfaAffine aligner(pen);
+        auto res = aligner.align(pattern.data(), pattern_len, text.data(), text_len, tbf, tef);
         ++cases;
-        int pc = 0, te = 0;
-        const int rs = rescore(res.cigar, p, t, res.text_begin, pen, pc, te);
-        bool ok = res.score == want && rs == want && pc == m && te == res.text_end
-                  && res.text_begin <= tbf && res.text_end >= n - tef && res.text_end <= n;
+        int pat_consumed = 0, text_end = 0;
+        const int rescored = rescore(res.cigar, pattern, text, res.text_begin, pen, pat_consumed, text_end);
+        bool passed = res.score == want && rescored == want && pat_consumed == pattern_len && text_end == res.text_end
+                  && res.text_begin <= tbf && res.text_end >= text_len - tef && res.text_end <= text_len;
         // max_score cut-off
         if (want > 0) {
-            auto cut = w.align(p.data(), m, t.data(), n, tbf, tef, want - 1, false);
-            ok = ok && cut.score == -1;
-            auto at = w.align(p.data(), m, t.data(), n, tbf, tef, want, false);
-            ok = ok && at.score == want;
+            auto cut = aligner.align(pattern.data(), pattern_len, text.data(), text_len, tbf, tef, want - 1, false);
+            passed = passed && cut.score == -1;
+            auto at_cap = aligner.align(pattern.data(), pattern_len, text.data(), text_len, tbf, tef, want, false);
+            passed = passed && at_cap.score == want;
         }
-        if (!ok && ++fail <= 5)
+        if (!passed && ++fail <= 5)
             std::printf("FAIL m=%d n=%d x=%d o=%d e=%d tbf=%d tef=%d want=%d got=%d rescore=%d pc=%d te=%d/%d cig=%s\n",
-                        m, n, pen.x, pen.o, pen.e, tbf, tef, want, res.score, rs, pc, te, res.text_end, res.cigar.c_str());
+                        pattern_len, text_len, pen.mismatch, pen.gap_open, pen.gap_extend, tbf, tef, want, res.score, rescored, pat_consumed, text_end, res.text_end, res.cigar.c_str());
     }
     // edit mode (x=1, o=0, e=1, text ends fully free, capped) == the scalar semi-global edit-distance DP used by the mapper before
     {
-        WfaAffine ed(AffinePenalties{1, 0, 1});
+        WfaAffine edit_aligner(AffinePenalties{1, 0, 1});
         int bad = 0;
         for (int it = 0; it < 20000; ++it) {
-            const int m = 1 + rng() % 150;
-            std::string p; for (int i = 0; i < m; ++i) p.push_back(rng() % 60 == 0 ? 'N' : A[rng() % 4]);
-            std::string t; const int n = rng() % 260;
-            for (int i = 0; i < n; ++i) t.push_back(A[rng() % 4]);
-            if (n > m && rng() % 2) t.replace(rng() % (n - m + 1), m, p);   // plant the read
+            const int pattern_len = 1 + rng() % 150;
+            std::string pattern; for (int i = 0; i < pattern_len; ++i) pattern.push_back(rng() % 60 == 0 ? 'N' : bases[rng() % 4]);
+            std::string text; const int text_len = rng() % 260;
+            for (int i = 0; i < text_len; ++i) text.push_back(bases[rng() % 4]);
+            if (text_len > pattern_len && rng() % 2) text.replace(rng() % (text_len - pattern_len + 1), pattern_len, pattern);   // plant the read
             const int cap = rng() % 20;
-            const int want = std::min(naive_semi_global_ed(p, t), cap + 1);
-            auto r = ed.align(p.data(), m, t.data(), n, n, n, cap, false);
-            const int got = r.score < 0 ? cap + 1 : r.score;
-            if (got != want && ++bad <= 3) std::printf("EDIT FAIL m=%d n=%d cap=%d want=%d got=%d\n", m, n, cap, want, got);
+            const int want = std::min(naive_semi_global_ed(pattern, text), cap + 1);
+            auto result = edit_aligner.align(pattern.data(), pattern_len, text.data(), text_len, text_len, text_len, cap, false);
+            const int got = result.score < 0 ? cap + 1 : result.score;
+            if (got != want && ++bad <= 3) std::printf("EDIT FAIL m=%d n=%d cap=%d want=%d got=%d\n", pattern_len, text_len, cap, want, got);
         }
         fail += bad; cases += 20000;
     }
@@ -177,34 +177,34 @@ int main() {
         int bad = 0;
         for (int it = 0; it < 20000; ++it) {
             AffinePenalties pen;
-            pen.x = 1 + rng() % 6; pen.o = rng() % 8; pen.e = 1 + rng() % 4;
-            const int m = rng() % 60;
-            std::string p; for (int i = 0; i < m; ++i) p.push_back(rng() % 40 == 0 ? 'N' : A[rng() % 4]);
-            std::string t = mutate(p, (rng() % 5) * 0.08, rng);
-            if (rng() % 6 == 0) t.clear();
-            const int sf = rng() % 3, ei = 0;
-            const int want = gotoh_c(p, t, pen, sf, ei);
-            WfaAffine w(pen);
-            const int cap = 4 * (m + (int)t.size()) * (pen.x + pen.o + pen.e) + 8;
-            auto r = w.align_global(p.data(), m, t.data(), t.size(), cap,
-                                    static_cast<GapEnd>(sf), static_cast<GapEnd>(ei));
-            bool ok = r.score == want;
-            if (ok && want >= 0) {
-                int pc = 0, te = 0;
-                int rs = rescore(r.cigar, p, t, 0, pen, pc, te);
+            pen.mismatch = 1 + rng() % 6; pen.gap_open = rng() % 8; pen.gap_extend = 1 + rng() % 4;
+            const int pattern_len = rng() % 60;
+            std::string pattern; for (int i = 0; i < pattern_len; ++i) pattern.push_back(rng() % 40 == 0 ? 'N' : bases[rng() % 4]);
+            std::string text = mutate(pattern, (rng() % 5) * 0.08, rng);
+            if (rng() % 6 == 0) text.clear();
+            const int start_free = rng() % 3, end_in = 0;
+            const int want = gotoh_c(pattern, text, pen, start_free, end_in);
+            WfaAffine aligner(pen);
+            const int cap = 4 * (pattern_len + (int)text.size()) * (pen.mismatch + pen.gap_open + pen.gap_extend) + 8;
+            auto result = aligner.align_global(pattern.data(), pattern_len, text.data(), text.size(), cap,
+                                    static_cast<GapEnd>(start_free), static_cast<GapEnd>(end_in));
+            bool passed = result.score == want;
+            if (passed && want >= 0) {
+                int pat_consumed = 0, text_end = 0;
+                int rescored = rescore(result.cigar, pattern, text, 0, pen, pat_consumed, text_end);
                 // A free start gap is not charged its open, so it is credited back.
-                if (sf && !r.cigar.empty()) {
-                    std::size_t q = 0; while (isdigit(r.cigar[q])) ++q;
-                    const char op0 = r.cigar[q];
-                    if ((sf == 1 && op0 == 'D') || (sf == 2 && op0 == 'I')) rs -= pen.o;
+                if (start_free && !result.cigar.empty()) {
+                    std::size_t cig_pos = 0; while (isdigit(result.cigar[cig_pos])) ++cig_pos;
+                    const char op0 = result.cigar[cig_pos];
+                    if ((start_free == 1 && op0 == 'D') || (start_free == 2 && op0 == 'I')) rescored -= pen.gap_open;
                 }
-                const char last = r.cigar.empty() ? 0 : r.cigar.back();
-                ok = rs == want && pc == m && te == (int)t.size()
-                     && (ei == 0 || (ei == 1 && last == 'D') || (ei == 2 && last == 'I'));
+                const char last = result.cigar.empty() ? 0 : result.cigar.back();
+                passed = rescored == want && pat_consumed == pattern_len && text_end == (int)text.size()
+                     && (end_in == 0 || (end_in == 1 && last == 'D') || (end_in == 2 && last == 'I'));
             }
-            if (!ok && ++bad <= 3)
+            if (!passed && ++bad <= 3)
                 std::printf("CONSTRAINED FAIL m=%d n=%zu x=%d o=%d e=%d sf=%d ei=%d want=%d got=%d cig=%s p=%s t=%s\n",
-                            m, t.size(), pen.x, pen.o, pen.e, sf, ei, want, r.score, r.cigar.c_str(), p.c_str(), t.c_str());
+                            pattern_len, text.size(), pen.mismatch, pen.gap_open, pen.gap_extend, start_free, end_in, want, result.score, result.cigar.c_str(), pattern.c_str(), text.c_str());
         }
         fail += bad; cases += 20000;
     }
@@ -213,26 +213,26 @@ int main() {
         int bad = 0;
         for (int it = 0; it < 30000; ++it) {
             AffinePenalties pen;
-            pen.x = 1 + rng() % 6; pen.o = rng() % 8; pen.e = 1 + rng() % 4;
-            const int m = rng() % 160;
-            std::string p; for (int i = 0; i < m; ++i) p.push_back(rng() % 50 == 0 ? 'N' : A[rng() % 4]);
-            std::string t = mutate(p, (rng() % 6) * 0.06, rng);
-            if (rng() % 10 == 0) { t.clear(); for (int i = 0, L = rng() % 80; i < L; ++i) t.push_back(A[rng() % 4]); }
-            const int want = gotoh(p, t, pen, 0, 0);
+            pen.mismatch = 1 + rng() % 6; pen.gap_open = rng() % 8; pen.gap_extend = 1 + rng() % 4;
+            const int pattern_len = rng() % 160;
+            std::string pattern; for (int i = 0; i < pattern_len; ++i) pattern.push_back(rng() % 50 == 0 ? 'N' : bases[rng() % 4]);
+            std::string text = mutate(pattern, (rng() % 6) * 0.06, rng);
+            if (rng() % 10 == 0) { text.clear(); for (int i = 0, rand_len = rng() % 80; i < rand_len; ++i) text.push_back(bases[rng() % 4]); }
+            const int want = gotoh(pattern, text, pen, 0, 0);
             const int base = (int[]){0, 8, 512}[it % 3];
-            BiWfa b(pen, base);
-            auto r = b.align(p.data(), m, t.data(), t.size());
-            int pc = 0, te = 0;
-            const int rs = r.score >= 0 ? rescore(r.cigar, p, t, 0, pen, pc, te) : -1;
-            const bool ok = r.score == want && rs == want && pc == m && te == (int)t.size();
-            if (!ok && ++bad <= 3)
+            BiWfa biwfa(pen, base);
+            auto result = biwfa.align(pattern.data(), pattern_len, text.data(), text.size());
+            int pat_consumed = 0, text_end = 0;
+            const int rescored = result.score >= 0 ? rescore(result.cigar, pattern, text, 0, pen, pat_consumed, text_end) : -1;
+            const bool passed = result.score == want && rescored == want && pat_consumed == pattern_len && text_end == (int)text.size();
+            if (!passed && ++bad <= 3)
                 std::printf("BIWFA FAIL base=%d m=%d n=%zu x=%d o=%d e=%d want=%d got=%d rescore=%d pc=%d te=%d cig=%s\n",
-                            base, m, t.size(), pen.x, pen.o, pen.e, want, r.score, rs, pc, te, r.cigar.c_str());
+                            base, pattern_len, text.size(), pen.mismatch, pen.gap_open, pen.gap_extend, want, result.score, rescored, pat_consumed, text_end, result.cigar.c_str());
             // score cap
-            if (ok && want > 0) {
-                BiWfa c(pen, base);
-                if (c.align(p.data(), m, t.data(), t.size(), want - 1).score != -1 && ++bad <= 3)
-                    std::printf("BIWFA CAP FAIL m=%d want=%d\n", m, want);
+            if (passed && want > 0) {
+                BiWfa capped(pen, base);
+                if (capped.align(pattern.data(), pattern_len, text.data(), text.size(), want - 1).score != -1 && ++bad <= 3)
+                    std::printf("BIWFA CAP FAIL m=%d want=%d\n", pattern_len, want);
             }
         }
         fail += bad; cases += 30000;
@@ -242,17 +242,17 @@ int main() {
         int bad = 0;
         for (int it = 0; it < 40; ++it) {
             AffinePenalties pen;                       // mapper penalties
-            const int m = 2000 + rng() % 18000;
-            std::string p; for (int i = 0; i < m; ++i) p.push_back(A[rng() % 4]);
-            std::string t = mutate(p, 0.02 + (rng() % 15) * 0.02, rng);
-            WfaAffine w(pen);
-            const int want = w.align(p.data(), m, t.data(), t.size(), 0, 0, -1, false).score;
-            BiWfa b(pen);
-            auto r = b.align(p.data(), m, t.data(), t.size());
-            int pc = 0, te = 0;
-            const int rs = rescore(r.cigar, p, t, 0, pen, pc, te);
-            if ((r.score != want || rs != want || pc != m || te != (int)t.size()) && ++bad <= 3)
-                std::printf("BIWFA LARGE FAIL m=%d n=%zu want=%d got=%d rescore=%d\n", m, t.size(), want, r.score, rs);
+            const int pattern_len = 2000 + rng() % 18000;
+            std::string pattern; for (int i = 0; i < pattern_len; ++i) pattern.push_back(bases[rng() % 4]);
+            std::string text = mutate(pattern, 0.02 + (rng() % 15) * 0.02, rng);
+            WfaAffine aligner(pen);
+            const int want = aligner.align(pattern.data(), pattern_len, text.data(), text.size(), 0, 0, -1, false).score;
+            BiWfa biwfa(pen);
+            auto result = biwfa.align(pattern.data(), pattern_len, text.data(), text.size());
+            int pat_consumed = 0, text_end = 0;
+            const int rescored = rescore(result.cigar, pattern, text, 0, pen, pat_consumed, text_end);
+            if ((result.score != want || rescored != want || pat_consumed != pattern_len || text_end != (int)text.size()) && ++bad <= 3)
+                std::printf("BIWFA LARGE FAIL m=%d n=%zu want=%d got=%d rescore=%d\n", pattern_len, text.size(), want, result.score, rescored);
         }
         fail += bad; cases += 40;
     }

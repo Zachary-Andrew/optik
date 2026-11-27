@@ -12,3 +12,10 @@
 __pycache__
 tmp*
 /graph.gfa
+# Documentation build output and its pinned tool environment
+/docs/_build
+/docs/.venv
+# Lean build output and the Mathlib checkout lake fetches
+/lean/.lake
+# The Lean test vectors are checked in, since a Rust test includes mapq.json at compile time
+!/lean/vectors/*.json

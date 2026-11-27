@@ -20,52 +20,63 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+/* Mode of the -o / -e output files. */
+enum { OUTPUT_FILE_MODE = 0644 };
+/* Exit status when the command cannot be started, and the base added to a terminating signal, as shells report them. */
+enum { EXIT_EXEC_FAILED = 127, EXIT_SIGNAL_BASE = 128 };
+/* Positional arguments: the address-space limit, the result file and the command. */
+enum { MIN_POSITIONAL_ARGS = 3 };
+/* ru_oublock / ru_inblock count 512-byte blocks. */
+enum { BLOCK_BYTES = 512 };
+/* Nanoseconds per second. */
+#define NS_PER_SEC 1e9
 
-static void redirect(const char* path, int fd) {
-    const int f = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (f < 0) { perror(path); _exit(127); }
-    if (dup2(f, fd) < 0) { perror("dup2"); _exit(127); }
+
+static void redirect(const char* path, int target_fd) {
+    const int src_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, OUTPUT_FILE_MODE);
+    if (src_fd < 0) { perror(path); _exit(EXIT_EXEC_FAILED); }
+    if (dup2(src_fd, target_fd) < 0) { perror("dup2"); _exit(EXIT_EXEC_FAILED); }
 }
 
 int main(int argc, char** argv) {
-    int append = 0, a = 1;
+    int append = 0, arg_idx = 1;
     const char* out = NULL;
     const char* err = NULL;
-    while (a < argc && argv[a][0] == '-' && argv[a][1] != '\0') {
-        if (strcmp(argv[a], "-a") == 0) { append = 1; a += 1; }
-        else if (strcmp(argv[a], "-o") == 0 && a + 1 < argc) { out = argv[a + 1]; a += 2; }
-        else if (strcmp(argv[a], "-e") == 0 && a + 1 < argc) { err = argv[a + 1]; a += 2; }
+    while (arg_idx < argc && argv[arg_idx][0] == '-' && argv[arg_idx][1] != '\0') {
+        if (strcmp(argv[arg_idx], "-a") == 0) { append = 1; arg_idx += 1; }
+        else if (strcmp(argv[arg_idx], "-o") == 0 && arg_idx + 1 < argc) { out = argv[arg_idx + 1]; arg_idx += 2; }
+        else if (strcmp(argv[arg_idx], "-e") == 0 && arg_idx + 1 < argc) { err = argv[arg_idx + 1]; arg_idx += 2; }
         else break;
     }
-    if (argc - a < 3) {
+    if (argc - arg_idx < MIN_POSITIONAL_ARGS) {
         fprintf(stderr, "usage: rusage_exec [-a] [-o OUT] [-e ERR] AS_LIMIT RESULT cmd [args]\n");
         return 2;
     }
-    const unsigned long long lim = strtoull(argv[a], NULL, 10);
-    const char* result = argv[a + 1];
-    char** cmd = argv + a + 2;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const unsigned long long lim = strtoull(argv[arg_idx], NULL, 10);
+    const char* result = argv[arg_idx + 1];
+    char** cmd = argv + arg_idx + 2;
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return 2; }
     if (pid == 0) {
         if (out) redirect(out, 1);
         if (err) redirect(err, 2);
-        if (lim) { struct rlimit r = {lim, lim}; setrlimit(RLIMIT_AS, &r); }
+        if (lim) { struct rlimit limit_spec = {lim, lim}; setrlimit(RLIMIT_AS, &limit_spec); }
         execvp(cmd[0], cmd);
         perror("execvp");
-        _exit(127);
+        _exit(EXIT_EXEC_FAILED);
     }
-    int st = 0;
-    struct rusage ru;
-    if (wait4(pid, &st, 0, &ru) < 0) { perror("wait4"); return 2; }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    const int code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-    FILE* f = fopen(result, append ? "a" : "w");
-    if (f) {
-        fprintf(f, "%d %.6f %ld %lld %lld\n", code, (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9,
-                ru.ru_maxrss, (long long)ru.ru_oublock * 512LL, (long long)ru.ru_inblock * 512LL);
-        fclose(f);
+    int status = 0;
+    struct rusage usage;
+    if (wait4(pid, &status, 0, &usage) < 0) { perror("wait4"); return 2; }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    const int code = WIFEXITED(status) ? WEXITSTATUS(status) : EXIT_SIGNAL_BASE + WTERMSIG(status);
+    FILE* result_file = fopen(result, append ? "a" : "w");
+    if (result_file) {
+        fprintf(result_file, "%d %.6f %ld %lld %lld\n", code, (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / NS_PER_SEC,
+                usage.ru_maxrss, (long long)usage.ru_oublock * (long long)BLOCK_BYTES, (long long)usage.ru_inblock * (long long)BLOCK_BYTES);
+        fclose(result_file);
     }
     return code;
 }

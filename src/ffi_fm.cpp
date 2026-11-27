@@ -1,8 +1,9 @@
-/*
- * ffi_fm.cpp - C ABI of the FM k-mer index (build-fm, query), the okfm_* functions.
+/**
+ * @file
+ * @brief The `okfm_*` C ABI behind build-fm and query on FM indexes.
  *
- * The build path counts the canonical k-mers (minimizer-partitioned counter, kmer_count.cpp) into a de Bruijn graph with the observed (k+1)-mer edges, walk its maximal unitigs, and index the separator-delimited unitigs with an FM-index over the k-order BWT (fm_index.hpp).
- * Membership is exact.
+ * Building counts k-mers into a de Bruijn graph (kmer_count.cpp) and walks its maximal unitigs into one separator-joined text.
+ * That text is then indexed with the k-order BWT in fm_index.hpp, and lookups are exact.
  */
 #include <cstdio>
 #include <cstring>
@@ -19,62 +20,76 @@
 #include "ffi_error.hpp"
 
 using tpoptoa::ffi::set_error;
+using tpoptoa::ffi::kStatusFailed;
+using tpoptoa::ffi::kStatusOk;
+
+/// Text capacity is n_kmers * (1 + 1/kTextSlackDiv), with the extra reserved for separators.
+constexpr std::size_t kTextSlackDiv = 4;
 
 extern "C" {
 
-/// OkFmIndex - an FM index and whether its lookups go through find_batch().
 struct OkFmIndex { tpoptoa::FmIndex* idx; bool batch; };
 
-/// okfm_build_from_fasta() - build an FM index from the k-mers of a FASTA/FASTQ file.
-/// @min_count filters the k-mers by abundance (1 = all).
-/// Returns nullptr with a message in @errbuf on failure.
-OkFmIndex* okfm_build_from_fasta(const char* fasta_path, uint64_t k,
+/// @p min_count = 1 keeps every k-mer.
+/// Errors come back as nullptr plus a message in @p errbuf.
+OkFmIndex* okfm_build_from_fasta(const char* fasta_path, uint64_t kmer_len_u64,
                                  uint64_t min_count, uint32_t nthreads,
                                  char* errbuf, uint64_t errbuf_len) {
     try {
-        if (k < 1 || k > tpoptoa::kMaxK) {
+        if (kmer_len_u64 < 1 || kmer_len_u64 > tpoptoa::kMaxK) {
             if (errbuf && errbuf_len)
                 std::snprintf(errbuf, errbuf_len,
                               "k must be in [1, %zu] (got %llu)",
-                              tpoptoa::kMaxK, (unsigned long long)k);
+                              tpoptoa::kMaxK, (unsigned long long)kmer_len_u64);
+
             return nullptr;
         }
-        tpoptoa::PhaseTimer pt;
-        const unsigned K = static_cast<unsigned>(k);
-        // Walk the maximal unitigs straight into the FM symbol text.
-        // The The graph lives only for the walk, since the FM index needs nothing but the text, so the graph is freed before the BWT is sorted.
+
+        tpoptoa::PhaseTimer timer;
+        const unsigned kmer_len = static_cast<unsigned>(kmer_len_u64);
+        // The FM index only needs the text, so the graph is scoped to the walk and freed before the BWT sort.
+        // Otherwise both would be resident at the memory peak.
         std::vector<uint8_t> text;
         std::size_t n_kmers = 0, n_units = 0;
+
         {
-            tpoptoa::DbgGraph g(K);
-            std::unique_ptr<tpoptoa::DbgGraphEF> ef;       // when the node table would not fit the limit
-            std::unique_ptr<tpoptoa::PartUnitigs> pu;      // partitioned compaction
-            tpoptoa::detail::count_into_graph(fasta_path, static_cast<std::size_t>(K),
-                                              static_cast<uint32_t>(min_count), nthreads, g, &ef,
-                                              tpoptoa::part_mode_wanted(K) ? &pu : nullptr);
-            n_kmers = pu ? pu->core_size() : ef ? ef->core_size() : g.core_size();
+            tpoptoa::DbgGraph graph(kmer_len);
+            std::unique_ptr<tpoptoa::DbgGraphEF> ef_graph;       // set if the plain table won't fit
+            std::unique_ptr<tpoptoa::PartUnitigs> part_unitigs;
+
+            // The counter fills exactly one of the three graph forms, chosen by k and by whether the plain table fits the memory limit.
+            tpoptoa::detail::count_into_graph(fasta_path, static_cast<std::size_t>(kmer_len),
+                                              static_cast<uint32_t>(min_count), nthreads, graph, &ef_graph,
+                                              tpoptoa::part_mode_wanted(kmer_len) ? &part_unitigs : nullptr);
+            n_kmers = part_unitigs ? part_unitigs->core_size() : ef_graph ? ef_graph->core_size() : graph.core_size();
+
             if (n_kmers == 0) {
                 set_error(errbuf, errbuf_len, "no k-mers extracted from input");
                 return nullptr;
             }
-            pt.lap("fm: count k-mers + graph");
-            text.reserve(n_kmers + n_kmers / 4);
+
+            timer.lap("fm: count k-mers + graph");
+            text.reserve(n_kmers + n_kmers / kTextSlackDiv);
             auto add = [&](const uint8_t* seq, uint32_t len, uint64_t) {
                 tpoptoa::FmIndex::append_unitig(text, reinterpret_cast<const char*>(seq), len);
                 ++n_units;
             };
-            if (pu) pu->unitigs(add, nthreads);
-            else if (ef) ef->unitigs(add, nthreads);
-            else g.unitigs(add, nthreads);
+
+            // Whichever graph was filled is walked into unitigs, and each one goes into the text followed by its separator.
+            if (part_unitigs) part_unitigs->unitigs(add, nthreads);
+            else if (ef_graph) ef_graph->unitigs(add, nthreads);
+            else graph.unitigs(add, nthreads);
         }
-        pt.lap("fm: unitig walk");
-        auto* h = new OkFmIndex();
-        h->idx = new tpoptoa::FmIndex(K, std::move(text), n_units, n_kmers, nthreads);
-        h->batch = h->idx->batch_pays();
-        pt.lap("fm: FM index (k-order BWT, rank)");
-        return h;
-    } catch (const std::exception& e) {
-        set_error(errbuf, errbuf_len, e.what());
+        timer.lap("fm: unitig walk");
+        auto* handle = new OkFmIndex();
+
+        handle->idx = new tpoptoa::FmIndex(kmer_len, std::move(text), n_units, n_kmers, nthreads);
+        // Batched lookups only help once the rank blocks outgrow the last-level cache, which batch_pays() decides from the index size.
+        handle->batch = handle->idx->batch_pays();
+        timer.lap("fm: FM index (k-order BWT, rank)");
+        return handle;
+    } catch (const std::exception& err) {
+        set_error(errbuf, errbuf_len, err.what());
         return nullptr;
     } catch (...) {
         set_error(errbuf, errbuf_len, "build failed (allocation error)");
@@ -82,16 +97,18 @@ OkFmIndex* okfm_build_from_fasta(const char* fasta_path, uint64_t k,
     }
 }
 
-/// okfm_load() - read and validate a saved index (FmIndex::load()).
+/// Loads a saved FM index, or returns null with the reason in @p errbuf when the file is not a valid one.
 OkFmIndex* okfm_load(const char* path, char* errbuf, uint64_t errbuf_len) {
     try {
         auto* idx = tpoptoa::FmIndex::load(path);
+
         if (!idx) {
             set_error(errbuf, errbuf_len,
                       "not a valid optik FM index (corrupt, truncated or written by an older optik); "
                       "rebuild it with build-fm");
             return nullptr;
         }
+
         return new OkFmIndex{idx, idx->batch_pays()};
     } catch (...) {
         set_error(errbuf, errbuf_len, "load failed (allocation error)");
@@ -99,65 +116,76 @@ OkFmIndex* okfm_load(const char* path, char* errbuf, uint64_t errbuf_len) {
     }
 }
 
-/// okfm_save() - write the index to @path, returning 0 on success and -1 on an I/O error.
-int okfm_save(const OkFmIndex* h, const char* path,
+/// Writes the index to @p path and returns kStatusOk, or kStatusFailed with the reason in @p errbuf.
+int okfm_save(const OkFmIndex* handle, const char* path,
               char* errbuf, uint64_t errbuf_len) {
     try {
-        if (!h->idx->save(path)) {
+        if (!handle->idx->save(path)) {
             set_error(errbuf, errbuf_len, "save failed (I/O error)");
-            return -1;
+            return kStatusFailed;
         }
-        return 0;
+
+        return kStatusOk;
     } catch (...) {
         set_error(errbuf, errbuf_len, "save failed (I/O error)");
-        return -1;
+        return kStatusFailed;
     }
 }
 
-void okfm_free(OkFmIndex* h) { if (h) { delete h->idx; delete h; } }
+/// Frees the handle together with its index, and accepts null.
+void okfm_free(OkFmIndex* handle) { if (handle) { delete handle->idx; delete handle; } }
 
-unsigned    okfm_k(const OkFmIndex* h)           { return h->idx->k(); }
-uint64_t    okfm_size(const OkFmIndex* h)        { return h->idx->size(); }
-uint64_t    okfm_num_unitigs(const OkFmIndex* h) { return h->idx->num_unitigs(); }
-uint64_t    okfm_super_len(const OkFmIndex* h)   { return h->idx->super_len(); }
-uint64_t    okfm_bwt_len(const OkFmIndex* h)     { return h->idx->bwt_len(); }
-uint64_t    okfm_bytes(const OkFmIndex* h)       { return h->idx->bytes(); }
-double      okfm_bits_per_entry(const OkFmIndex* h) { return h->idx->bits_per_entry(); }
+// Read-only figures for the summaries that build-fm and query print.
+unsigned    okfm_k(const OkFmIndex* handle)           { return handle->idx->kmer_len(); }
+uint64_t    okfm_size(const OkFmIndex* handle)        { return handle->idx->size(); }
+uint64_t    okfm_num_unitigs(const OkFmIndex* handle) { return handle->idx->num_unitigs(); }
+uint64_t    okfm_super_len(const OkFmIndex* handle)   { return handle->idx->super_len(); }
+uint64_t    okfm_bwt_len(const OkFmIndex* handle)     { return handle->idx->bwt_len(); }
+uint64_t    okfm_bytes(const OkFmIndex* handle)       { return handle->idx->bytes(); }
+double      okfm_bits_per_entry(const OkFmIndex* handle) { return handle->idx->bits_per_entry(); }
 
-/// okfm_scan_seq() - look up every k-mer of one record (non-ACGT characters restart the k-mer), one FFI call per record.
-///
-/// num_searches counts full index lookups, as SSHash counts them (a lookup that is not a streaming extension).
-/// This scan has no streaming extension, so every valid k-mer is one full lookup.
-void okfm_scan_seq(const OkFmIndex* h, const char* seq, uint64_t slen, uint64_t k,
+/// Handles one record per FFI call.
+/// @p num_searches follows SSHash's definition, counting lookups that aren't streaming extensions.
+/// Because this scan never extends, it always equals @p num_valid.
+void okfm_scan_seq(const OkFmIndex* handle, const char* seq, uint64_t slen, uint64_t kmer_len,
                    uint64_t* num_valid, uint64_t* num_positive, uint64_t* num_searches) {
-    // The k-mers are collected and looked up kScanChunk at a time, through find_batch() when the index is larger than the last-level cache, which overlaps their memory latency.
-    // The buffers are per thread and reused across records.
+    // Batching lets find_batch() overlap cache misses once the index outgrows the LLC.
+    // The buffers are thread_local, so consecutive records reuse them.
     constexpr std::size_t kScanChunk = 4096;
-    thread_local std::vector<tpoptoa::KmerWord> kms;
+    thread_local std::vector<tpoptoa::KmerWord> kmers;
     thread_local std::vector<uint8_t> hits;
-    kms.clear();
-    uint64_t nvalid = 0, npos = 0;
+
+    kmers.clear();
+    uint64_t valid_count = 0, positive_count = 0;
     auto flush = [&] {
-        hits.resize(kms.size());
-        if (h->batch) {
-            h->idx->find_batch(kms.data(), kms.size(), hits.data());
+        hits.resize(kmers.size());
+
+        // batch_pays() is false while the rank blocks fit in the LLC, where plain find() is faster than the batched lanes.
+        if (handle->batch) {
+            handle->idx->find_batch(kmers.data(), kmers.size(), hits.data());
         } else {
-            for (std::size_t i = 0; i < kms.size(); ++i) hits[i] = h->idx->find(kms[i]);
+            for (std::size_t i = 0; i < kmers.size(); ++i) hits[i] = handle->idx->find(kmers[i]);
         }
-        for (uint8_t x : hits) npos += x;
-        kms.clear();
+
+        for (uint8_t hit : hits) positive_count += hit;
+
+        kmers.clear();
     };
+
     tpoptoa::extract_kmers(seq, static_cast<std::size_t>(slen),
-                           static_cast<std::size_t>(k),
-                           [&](tpoptoa::KmerWord km) {
-        ++nvalid;
-        kms.push_back(km);
-        if (kms.size() == kScanChunk) flush();
+                           static_cast<std::size_t>(kmer_len),
+                           [&](tpoptoa::KmerWord kmer) {
+        ++valid_count;
+        kmers.push_back(kmer);
+
+        if (kmers.size() == kScanChunk) flush();
     });
-    if (!kms.empty()) flush();
-    *num_valid = nvalid;
-    *num_positive = npos;
-    *num_searches = nvalid;   // every valid k-mer is one full lookup
+    if (!kmers.empty()) flush();
+
+    *num_valid = valid_count;
+    *num_positive = positive_count;
+    // Every valid k-mer counts as a search because FmIndex::find() never reuses the previous k-mer's interval.
+    *num_searches = valid_count;
 }
 
 }  // extern "C"

@@ -11,10 +11,10 @@ path = "tools/src/main.rs"
 
 # Link-time and whole-program optimization.  The query hot path crosses the
 # Rust/C++ FFI boundary per batch, so fat LTO and a single codegen unit let
-# LLVM inline across translation units and keep the fused SIMD kernels hot.
+# LLVM inline across translation units and keep the fused SIMD kernels in the hot path.
 # panic="abort" drops unwind tables from the CLI's hot paths and shrinks the
 # binary, though cargo test overrides it to unwind.  strip=true
-# keeps the shipped binary lean, and symbols live in debug builds.
+# keeps the shipped binary lean, and symbols are kept in debug builds.
 [profile.release]
 lto = "fat"
 codegen-units = 1

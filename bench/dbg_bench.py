@@ -38,26 +38,41 @@ import threading
 import time
 from pathlib import Path
 
-R = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(R, "bench"))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(ROOT, "bench"))
 
 import hw
 import memcap
 import report as results_file
-import scaling_bench as sb
+import scaling_bench
 from config import PATHS
+from units import BITS_PER_BYTE, BYTES_PER_GB, BYTES_PER_GIB
 
-OPTIK = os.path.join(R, "target/release/optik")
-SAL = os.path.join(R, "temp/salmonella_LT2.fa")
-CHR1 = os.path.join(R, "temp/scaling/chr1.fa")
-HG38 = os.path.join(R, "temp/scaling/hg38_primary.fa")
-GUT = os.path.join(R, "temp/published_sets/cf2-gut")
-DIGEST_SRC = os.path.join(R, "bench/cpp/unitig_digest.cpp")
+OPTIK = os.path.join(ROOT, "target/release/optik")
+SAL = os.path.join(ROOT, "temp/salmonella_LT2.fa")
+CHR1 = os.path.join(ROOT, "temp/scaling/chr1.fa")
+HG38 = os.path.join(ROOT, "temp/scaling/hg38_primary.fa")
+GUT = os.path.join(ROOT, "temp/published_sets/cf2-gut")
+DIGEST_SRC = os.path.join(ROOT, "bench/cpp/unitig_digest.cpp")
 SECTIONS = ["reads", "modes", "grch38", "index", "gut"]
 # The compact-graph row of grch38 fixes the counting limit so the human node table cannot fit, and needs this much cap above it for the graph itself.
 EF_MAX_MEM = "23G"
 EF_MIN_CAP = 24 << 30
-T = str(hw.cpus())  # thread count of every command, set from --threads
+THREADS = str(hw.cpus())  # thread count of every command, set from --threads
+
+# read coverage of the Salmonella and chr1 read sets
+SAL_COVERAGE = 30
+CHR1_COVERAGE = 10
+# index section: windows of WINDOW_LEN bases (seeded by WINDOWS_SEED), each holding WINDOW_LEN - INDEX_K + 1 k-mers
+WINDOWS_SEED = 7
+NUM_WINDOWS = 20000
+WINDOW_LEN = 150
+INDEX_K = 31
+DEFAULT_RUNS = 3
+
+
+# Both k-mer indexes are built, each with the flags its build needs.
+INDEX_BUILDS = (("build-fm", []), ("build-spss", ["--compact"]))
 
 
 class Bench:
@@ -71,17 +86,17 @@ class Bench:
         self.rows = os.path.join(out, "rows.tsv")
         # Only the Runner's measure.py path is used.
         # Its row() is not, since rows go to rows.tsv.
-        self.run = sb.Runner(
-            os.devnull, cap, T, warmup, runs, scratch=os.path.join(work, ".measure")
+        self.run = scaling_bench.Runner(
+            os.devnull, cap, THREADS, warmup, runs, scratch=os.path.join(work, ".measure")
         )
 
-    def row(self, section, inp, tool, setting, wall, mb, status, extra=""):
+    def row(self, section, inp, tool, setting, wall, peak_mb, status, extra=""):
         """Append one row to rows.tsv, adding the spread of the measurement it reports."""
         # The spread of the measurement this row reports, whose mean is `wall`
-        r = self.run.last
-        if r is not None and r.ok and wall is not None and wall == r.wall["mean"]:
-            sd = f"{r.wall['sd']:.3g}" if r.wall.get("sd") is not None else "-"
-            extra = (f"sd={sd} runs={r.runs} warmup={r.warmup} " + extra).rstrip()
+        last = self.run.last
+        if last is not None and last.succeeded and wall is not None and wall == last.wall["mean"]:
+            wall_sd = f"{last.wall['sd']:.3g}" if last.wall.get("sd") is not None else "-"
+            extra = (f"sd={wall_sd} runs={last.runs} warmup={last.warmup} " + extra).rstrip()
         line = "\t".join(
             [
                 section,
@@ -89,30 +104,30 @@ class Bench:
                 tool,
                 setting,
                 "" if wall is None else f"{wall:.2f}",
-                "" if mb is None else f"{mb:.0f}",
+                "" if peak_mb is None else f"{peak_mb:.0f}",
                 status,
                 extra,
             ]
         )
         print(line, flush=True)
-        with open(self.rows, "a") as f:
-            f.write(line + "\n")
+        with open(self.rows, "a") as handle:
+            handle.write(line + "\n")
 
     def cmd(self, name, cmd):
         """Measure `cmd` through bench/measure.py, returning mean wall s, peak MB, status and output.
 
         The mean covers the --runs that follow the discarded warmups.
         The last run's output goes to logs/<name>.log."""
-        r = self.run.run(cmd)
-        with open(os.path.join(self.logs, name + ".log"), "w") as f:
-            f.write(" ".join(map(str, cmd)) + "\n" + (r[3] or ""))
-        return r
+        wall, peak_mb, status, output = self.run.run(cmd)
+        with open(os.path.join(self.logs, name + ".log"), "w") as handle:
+            handle.write(" ".join(map(str, cmd)) + "\n" + (output or ""))
+        return wall, peak_mb, status, output
 
 
 def stat(out, key):
     """Value of a 'key<TAB>value' line in optik's report, or an empty string."""
-    m = re.search(rf"^{key}\t(\S+)", out or "", re.MULTILINE)
-    return m.group(1) if m else ""
+    match = re.search(rf"^{key}\t(\S+)", out or "", re.MULTILINE)
+    return match.group(1) if match else ""
 
 
 def digest_tool(work):
@@ -137,7 +152,7 @@ def reads(work, ref, cov, name, extra_err):
         subprocess.run(
             [
                 sys.executable,
-                os.path.join(R, "bench/gen_reads.py"),
+                os.path.join(ROOT, "bench/gen_reads.py"),
                 "-r",
                 ref,
                 "-c",
@@ -162,8 +177,8 @@ def reads(work, ref, cov, name, extra_err):
 def sec_reads(bench, work):
     """The reads section.
     Returns the chr1 10x read file that the modes section reuses."""
-    sal = reads(work, SAL, 30, "sal30x.fa", ["--ins", "0.0005", "--del", "0.0005"])
-    w, mb, st, o = bench.cmd(
+    sal = reads(work, SAL, SAL_COVERAGE, "sal30x.fa", ["--ins", "0.0005", "--del", "0.0005"])
+    wall, peak_mb, status, output = bench.cmd(
         "sal30x",
         [
             OPTIK,
@@ -175,7 +190,7 @@ def sec_reads(bench, work):
             "-c",
             "2",
             "-t",
-            T,
+            THREADS,
             "-o",
             os.path.join(work, "sal30x.gfa"),
         ],
@@ -184,17 +199,18 @@ def sec_reads(bench, work):
         "reads",
         "Salmonella 30x",
         "optik",
-        f"-k 31 -c 2 -t {T}, GFA",
-        w,
-        mb,
-        st,
-        f"unitigs={stat(o, 'unitigs')}",
+        f"-k 31 -c 2 -t {THREADS}, GFA",
+        wall,
+        peak_mb,
+        status,
+        f"unitigs={stat(output, 'unitigs')}",
     )
-    c10 = reads(work, CHR1, 10, "chr1_10x.fa", [])
+    # The 10x chr1 read set is built with both unitig builders, which must write byte-identical graphs.
+    c10 = reads(work, CHR1, CHR1_COVERAGE, "chr1_10x.fa", [])
     for mode in ("part", "table"):
         for lim in ([], ["--max-mem", "4G"]):
             setting = f"--graph {mode}" + (" --max-mem 4G" if lim else "")
-            w, mb, st, o = bench.cmd(
+            wall, peak_mb, status, output = bench.cmd(
                 f"chr1_10x_{mode}{'_4G' if lim else ''}",
                 [
                     OPTIK,
@@ -206,7 +222,7 @@ def sec_reads(bench, work):
                     "-c",
                     "2",
                     "-t",
-                    T,
+                    THREADS,
                     "--graph",
                     mode,
                     *lim,
@@ -218,14 +234,14 @@ def sec_reads(bench, work):
                 "reads",
                 "chr1 10x",
                 "optik dbruijn",
-                setting + f", -k 31 -c 2 -t {T}",
-                w,
-                mb,
-                st,
-                f"unitigs={stat(o, 'unitigs')}",
+                setting + f", -k 31 -c 2 -t {THREADS}",
+                wall,
+                peak_mb,
+                status,
+                f"unitigs={stat(output, 'unitigs')}",
             )
-    a, b = (os.path.join(work, f"c10_{m}.gfa") for m in ("part", "table"))
-    same = subprocess.run(["cmp", "-s", a, b], check=False).returncode == 0
+    part_gfa, table_gfa = (os.path.join(work, f"c10_{mode_name}.gfa") for mode_name in ("part", "table"))
+    same = subprocess.run(["cmp", "-s", part_gfa, table_gfa], check=False).returncode == 0
     bench.row(
         "reads",
         "chr1 10x",
@@ -235,80 +251,83 @@ def sec_reads(bench, work):
         None,
         "same" if same else "DIFFERENT",
     )
-    os.remove(a)
-    os.remove(b)
-    for sub, extra in (("build-fm", []), ("build-spss", ["--compact"])):
-        p = os.path.join(work, f"c10.{sub}")
-        w, mb, st, _ = bench.cmd(
+    os.remove(part_gfa)
+    os.remove(table_gfa)
+    for sub, extra in INDEX_BUILDS:
+        index_path = os.path.join(work, f"c10.{sub}")
+        wall, peak_mb, status, _ = bench.cmd(
             f"chr1_10x_{sub}",
-            [OPTIK, sub, *extra, "-i", c10, "-k", "31", "-c", "2", "-t", T, "-o", p],
+            [OPTIK, sub, *extra, "-i", c10, "-k", "31", "-c", "2", "-t", THREADS, "-o", index_path],
         )
         bench.row(
             "reads",
             "chr1 10x",
             f"optik {sub}",
-            " ".join(extra + [f"-k 31 -c 2 -t {T}"]),
-            w,
-            mb,
-            st,
+            " ".join(extra + [f"-k 31 -c 2 -t {THREADS}"]),
+            wall,
+            peak_mb,
+            status,
         )
-        if os.path.exists(p):
-            os.remove(p)
+        if os.path.exists(index_path):
+            os.remove(index_path)
     return c10
 
 
 def sec_modes(bench, work, c10):
     """The modes section, partitioned compaction against --graph table at several k and cutoffs."""
-    for k in ("31", "21", "15"):
+    # Each k runs both unitig builders on chr1, which must agree byte for byte, across the range of k users pick.
+    for kmer_arg in ("31", "21", "15"):
         outs = []
         for mode in ("part", "table"):
-            o_ = os.path.join(work, f"chr1_k{k}_{mode}.gfa")
-            w, mb, st, o = bench.cmd(
-                f"chr1_k{k}_{mode}",
+            gfa_path = os.path.join(work, f"chr1_k{kmer_arg}_{mode}.gfa")
+            wall, peak_mb, status, output = bench.cmd(
+                f"chr1_k{kmer_arg}_{mode}",
                 [
                     OPTIK,
                     "dbruijn",
                     "-i",
                     CHR1,
                     "-k",
-                    k,
+                    kmer_arg,
                     "-c",
                     "1",
                     "-t",
-                    T,
+                    THREADS,
                     "--graph",
                     mode,
                     "-o",
-                    o_,
+                    gfa_path,
                 ],
             )
             bench.row(
                 "modes",
                 "chr1",
                 "optik dbruijn",
-                f"--graph {mode}, -k {k} -c 1 -t {T}, GFA",
-                w,
-                mb,
-                st,
-                f"unitigs={stat(o, 'unitigs')}",
+                f"--graph {mode}, -k {kmer_arg} -c 1 -t {THREADS}, GFA",
+                wall,
+                peak_mb,
+                status,
+                f"unitigs={stat(output, 'unitigs')}",
             )
-            outs.append(o_)
+            outs.append(gfa_path)
         same = subprocess.run(["cmp", "-s", *outs], check=False).returncode == 0
         bench.row(
             "modes",
             "chr1",
             "optik dbruijn",
-            f"part vs table GFA, k = {k}",
+            f"part vs table GFA, k = {kmer_arg}",
             None,
             None,
             "same" if same else "DIFFERENT",
         )
-        for o_ in outs:
-            os.remove(o_)
+        # The chr1 graphs are large, so each pair is deleted once compared.
+        for gfa_path in outs:
+            os.remove(gfa_path)
+    # The 10x reads at -c 3 add the solid-k-mer filter, under which the two builders must still agree.
     outs = []
     for mode in ("part", "table"):
-        o_ = os.path.join(work, f"c10_k21_{mode}.gfa")
-        w, mb, st, o = bench.cmd(
+        gfa_path = os.path.join(work, f"c10_k21_{mode}.gfa")
+        wall, peak_mb, status, output = bench.cmd(
             f"chr1_10x_k21_c3_{mode}",
             [
                 OPTIK,
@@ -320,24 +339,24 @@ def sec_modes(bench, work, c10):
                 "-c",
                 "3",
                 "-t",
-                T,
+                THREADS,
                 "--graph",
                 mode,
                 "-o",
-                o_,
+                gfa_path,
             ],
         )
         bench.row(
             "modes",
             "chr1 10x",
             "optik dbruijn",
-            f"--graph {mode}, -k 21 -c 3 -t {T}, GFA",
-            w,
-            mb,
-            st,
-            f"unitigs={stat(o, 'unitigs')}",
+            f"--graph {mode}, -k 21 -c 3 -t {THREADS}, GFA",
+            wall,
+            peak_mb,
+            status,
+            f"unitigs={stat(output, 'unitigs')}",
         )
-        outs.append(o_)
+        outs.append(gfa_path)
     same = subprocess.run(["cmp", "-s", *outs], check=False).returncode == 0
     bench.row(
         "modes",
@@ -358,7 +377,7 @@ def sec_grch38(bench, work):
             file=sys.stderr,
         )
         return
-    dg = digest_tool(work)
+    digest_bin = digest_tool(work)
     runs = [
         (
             "optik",
@@ -373,7 +392,7 @@ def sec_grch38(bench, work):
                 "-c",
                 "1",
                 "-t",
-                T,
+                THREADS,
                 "-o",
                 os.path.join(work, "hg.gfa"),
             ],
@@ -392,7 +411,7 @@ def sec_grch38(bench, work):
                 "-c",
                 "1",
                 "-t",
-                T,
+                THREADS,
                 "-o",
                 os.path.join(work, "hg.fa"),
             ],
@@ -410,7 +429,7 @@ def sec_grch38(bench, work):
                 "-k",
                 "31",
                 "-t",
-                T,
+                THREADS,
                 "-o",
                 os.path.join(work, "hgcf"),
                 "-w",
@@ -432,7 +451,7 @@ def sec_grch38(bench, work):
                 "-c",
                 "1",
                 "-t",
-                T,
+                THREADS,
                 "--graph",
                 "table",
                 "--max-mem",
@@ -443,40 +462,41 @@ def sec_grch38(bench, work):
             "hg_ef.fa",
         ),
     ]
+    # Every GRCh38 run is reduced to an order-independent digest of its unitigs, and all digests must equal the first one.
     ref = None
     for tool, setting, cmd, outf in runs:
         if outf == "hg_ef.fa" and memcap.parse_size(bench.cap) < EF_MIN_CAP:
-            reason = f"needs a cap of at least {EF_MIN_CAP >> 30} GiB, got {bench.cap}"
+            reason = f"needs a cap of at least {EF_MIN_CAP // BYTES_PER_GIB} GiB, got {bench.cap}"
             bench.row("grch38", "GRCh38", tool, setting, None, None, "skipped", reason)
             continue
-        w, mb, st, o = bench.cmd(f"grch38_{outf}", cmd)
-        p = os.path.join(work, outf)
-        dig = digest(dg, p) if st == "ok" and os.path.exists(p) else ""
+        wall, peak_mb, status, output = bench.cmd(f"grch38_{outf}", cmd)
+        out_path = os.path.join(work, outf)
+        dig = digest(digest_bin, out_path) if status == "ok" and os.path.exists(out_path) else ""
         ref = ref or dig
         bench.row(
             "grch38",
             "GRCh38",
             tool,
-            setting + f", -k 31 -t {T}",
-            w,
-            mb,
-            st,
+            setting + f", -k 31 -t {THREADS}",
+            wall,
+            peak_mb,
+            status,
             f"digest={dig}"
             + ("" if not dig or dig == ref else " DIFFERENT")
-            + (f" links={stat(o, 'links')}" if outf.endswith(".gfa") else ""),
+            + (f" links={stat(output, 'links')}" if outf.endswith(".gfa") else ""),
         )
-        if os.path.exists(p):
-            os.remove(p)
+        if os.path.exists(out_path):
+            os.remove(out_path)
 
 
 def windows(work):
     """Write 20,000 random N-free 150 bp windows of GRCh38 with seed 7, and the same windows with one substitution each at a random position."""
-    ex, sb_ = os.path.join(work, "win_exact.fa"), os.path.join(work, "win_sub.fa")
+    exact_path, sb_ = os.path.join(work, "win_exact.fa"), os.path.join(work, "win_sub.fa")
     if os.path.exists(sb_):
-        return ex, sb_
+        return exact_path, sb_
     seqs, cur = [], []
-    with open(HG38) as fh:
-        for line in fh:
+    with open(HG38) as handle:
+        for line in handle:
             if line.startswith(">"):
                 if cur:
                     seqs.append("".join(cur))
@@ -485,79 +505,82 @@ def windows(work):
                 cur.append(line.strip().upper())
     if cur:
         seqs.append("".join(cur))
-    lens = [len(s) for s in seqs]
+    lens = [len(seq) for seq in seqs]
     tot = sum(lens)
-    r = random.Random(7)
-    with open(ex, "w") as e, open(sb_, "w") as s:
-        n = 0
-        while n < 20000:
-            x = r.randrange(tot)
-            i = 0
-            while x >= lens[i]:
-                x -= lens[i]
-                i += 1
-            if x + 150 > lens[i]:
+    rng = random.Random(WINDOWS_SEED)
+    with open(exact_path, "w") as exact_handle, open(sb_, "w") as sub_handle:
+        count = 0
+        while count < NUM_WINDOWS:
+            offset = rng.randrange(tot)
+            seq_idx = 0
+            while offset >= lens[seq_idx]:
+                offset -= lens[seq_idx]
+                seq_idx += 1
+            if offset + WINDOW_LEN > lens[seq_idx]:
                 continue
-            w = seqs[i][x : x + 150]
-            if set(w) - set("ACGT"):
+            window = seqs[seq_idx][offset : offset + WINDOW_LEN]
+            if set(window) - set("ACGT"):
                 continue
-            p = r.randrange(150)
-            m = w[:p] + r.choice([b for b in "ACGT" if b != w[p]]) + w[p + 1 :]
-            e.write(f">{n}\n{w}\n")
-            s.write(f">{n}\n{m}\n")
-            n += 1
-    return ex, sb_
+            sub_pos = rng.randrange(WINDOW_LEN)
+            mutated = window[:sub_pos] + rng.choice([base for base in "ACGT" if base != window[sub_pos]]) + window[sub_pos + 1 :]
+            exact_handle.write(f">{count}\n{window}\n")
+            sub_handle.write(f">{count}\n{mutated}\n")
+            count += 1
+    return exact_path, sb_
 
 
 def sec_index(bench, work):
     """The index section, which builds both indexes on GRCh38 and queries exact and substituted windows."""
     idx, res = {}, []
-    for sub, extra in (("build-fm", []), ("build-spss", ["--compact"])):
-        p = os.path.join(work, f"hg.{sub}")
-        w, mb, st, o = bench.cmd(
+    for sub, extra in INDEX_BUILDS:
+        index_path = os.path.join(work, f"hg.{sub}")
+        wall, peak_mb, status, output = bench.cmd(
             f"grch38_{sub}",
-            [OPTIK, sub, *extra, "-i", HG38, "-k", "31", "-t", T, "-o", p],
+            [OPTIK, sub, *extra, "-i", HG38, "-k", "31", "-t", THREADS, "-o", index_path],
         )
-        n = re.search(r"distinct_kmers\t(\d+)", o or "")
-        res.append((sub, extra, w, mb, st, int(n.group(1)) if n else None))
-        if st == "ok":
-            idx[sub] = p
+        num_match = re.search(r"distinct_kmers\t(\d+)", output or "")
+        res.append((sub, extra, wall, peak_mb, status, int(num_match.group(1)) if num_match else None))
+        if status == "ok":
+            idx[sub] = index_path
     # Bits per distinct k-mer, both over the count the builds report (build-spss prints it)
-    nk = next((r[5] for r in res if r[5]), None)
-    for sub, extra, w, mb, st, n in res:
-        bits = f"{os.path.getsize(idx[sub]) * 8 / nk:.2f}" if sub in idx and nk else ""
+    # Both builders index the same k-mer set, so whichever reported a count sizes bits per k-mer for both.
+    num_kmers = next((distinct for *_, distinct in res if distinct), None)
+    for sub, extra, wall, peak_mb, status, distinct in res:
+        bits = f"{os.path.getsize(idx[sub]) * BITS_PER_BYTE / num_kmers:.2f}" if sub in idx and num_kmers else ""
         bench.row(
             "index",
             "GRCh38",
             f"optik {sub}",
-            " ".join(extra + [f"-k 31 -t {T}"]),
-            w,
-            mb,
-            st,
-            f"distinct_kmers={n} bits_per_kmer={bits}",
+            " ".join(extra + [f"-k 31 -t {THREADS}"]),
+            wall,
+            peak_mb,
+            status,
+            f"distinct_kmers={distinct} bits_per_kmer={bits}",
         )
-    ex, su = windows(work)
+    exact_path, sub_path = windows(work)
     got = {}
-    for sub, p in idx.items():
-        for wl, q in (("exact", ex), ("one substitution", su)):
-            w, mb, st, o = bench.cmd(
-                f"grch38_{sub}_query_{wl.split()[0]}",
-                [OPTIK, "query", "-i", p, "-q", q, "-k", "31", "-t", T],
+    for sub, index_path in idx.items():
+        for workload, query_path in (("exact", exact_path), ("one substitution", sub_path)):
+            wall, peak_mb, status, output = bench.cmd(
+                f"grch38_{sub}_query_{workload.split()[0]}",
+                [OPTIK, "query", "-i", index_path, "-q", query_path, "-k", "31", "-t", THREADS],
             )
-            pos, tot = sb.kv(o, "num_positive_kmers"), sb.kv(o, "num_kmers")
-            got[(sub, wl)] = pos
-            ok = st == "ok" and tot == 20000 * 120 and (wl != "exact" or pos == tot)
+            pos, tot = scaling_bench.report_value(output, "num_positive_kmers"), scaling_bench.report_value(output, "num_kmers")
+            got[(sub, workload)] = pos
+            # Exact windows come from the genome and must hit fully. Substituted ones have no fixed answer.
+            passed = status == "ok" and tot == NUM_WINDOWS * (WINDOW_LEN - INDEX_K + 1) and (workload != "exact" or pos == tot)
             bench.row(
                 "index",
                 "GRCh38 windows",
                 f"optik {sub}",
-                f"query {wl}",
-                w,
-                mb,
-                st if ok else "FAIL",
+                f"query {workload}",
+                wall,
+                peak_mb,
+                status if passed else "FAIL",
                 f"kmers={tot} present={pos}",
             )
-    if len(idx) == 2:
+    # Substituted windows have no oracle, but both index types must still give the same answer.
+    if len(idx) == len(INDEX_BUILDS):
         agree = (
             got[("build-fm", "one substitution")]
             == got[("build-spss", "one substitution")]
@@ -571,8 +594,8 @@ def sec_index(bench, work):
             None,
             "same" if agree else "DIFFERENT",
         )
-    for p in idx.values():
-        os.remove(p)
+    for index_path in idx.values():
+        os.remove(index_path)
 
 
 class DiskPeak(threading.Thread):
@@ -585,8 +608,8 @@ class DiskPeak(threading.Thread):
 
     def used(self):
         """Bytes in use on the filesystem."""
-        st = os.statvfs(self.path)
-        return (st.f_blocks - st.f_bfree) * st.f_frsize
+        fs_stat = os.statvfs(self.path)
+        return (fs_stat.f_blocks - fs_stat.f_bfree) * fs_stat.f_frsize
 
     def run(self):
         while not self.stop.wait(1.0):
@@ -598,15 +621,15 @@ def sec_gut(bench, work):
     # The files the fetch recorded, since PROVENANCE.json lists nine paired individuals in 18 files
     want = (
         sorted(
-            f["path"]
-            for f in json.loads(Path(os.path.join(GUT, "PROVENANCE.json")).read_text())[
+            entry["path"]
+            for entry in json.loads(Path(os.path.join(GUT, "PROVENANCE.json")).read_text())[
                 "files"
             ]
         )
         if os.path.exists(os.path.join(GUT, "PROVENANCE.json"))
         else []
     )
-    ins = [f for f in want if os.path.exists(f)]
+    ins = [path for path in want if os.path.exists(path)]
     if not want or len(ins) != len(want):
         bench.row(
             "gut",
@@ -619,6 +642,7 @@ def sec_gut(bench, work):
             f"{len(ins)} of {len(want)} files in {GUT}",
         )
         return
+    # On the gut read set, optik runs at its default and again with --max-mem 13G, and Cuttlefish 3 at its documented setting.
     runs = [
         (
             "optik",
@@ -626,13 +650,13 @@ def sec_gut(bench, work):
             [
                 OPTIK,
                 "dbruijn",
-                *[a for f in ins for a in ("-i", f)],
+                *[arg for path in ins for arg in ("-i", path)],
                 "-k",
                 "27",
                 "-c",
                 "2",
                 "-t",
-                T,
+                THREADS,
                 "-o",
                 os.path.join(work, "gut.fa"),
             ],
@@ -643,13 +667,13 @@ def sec_gut(bench, work):
             [
                 OPTIK,
                 "dbruijn",
-                *[a for f in ins for a in ("-i", f)],
+                *[arg for path in ins for arg in ("-i", path)],
                 "-k",
                 "27",
                 "-c",
                 "2",
                 "-t",
-                T,
+                THREADS,
                 "--max-mem",
                 "13G",
                 "-o",
@@ -662,11 +686,11 @@ def sec_gut(bench, work):
             [
                 str(PATHS["cuttlefish"]),
                 "build",
-                *[a for f in ins for a in ("-s", f)],
+                *[arg for path in ins for arg in ("-s", path)],
                 "-k",
                 "27",
                 "-t",
-                T,
+                THREADS,
                 "-m",
                 "13",
                 "--read",
@@ -681,30 +705,30 @@ def sec_gut(bench, work):
     ]
     for tool, setting, cmd in runs:
         # The disk peak spans every run, warmups included, with each run's output replacing the last.
-        dp = DiskPeak(work)
-        dp.start()
-        w, mb, st, o = bench.cmd(f"gut_{tool}_{setting.split()[0].strip('-')}", cmd)
-        dp.stop.set()
-        dp.join()
-        r = bench.run.last
-        io = (
-            f"written_gb={r.written / 1e9:.1f} read_gb={r.read / 1e9:.1f}"
-            if r is not None and r.ok and r.written is not None
+        disk_peak = DiskPeak(work)
+        disk_peak.start()
+        wall, peak_mb, status, output = bench.cmd(f"gut_{tool}_{setting.split()[0].strip('-')}", cmd)
+        disk_peak.stop.set()
+        disk_peak.join()
+        last = bench.run.last
+        io_stats = (
+            f"written_gb={last.written / BYTES_PER_GB:.1f} read_gb={last.read / BYTES_PER_GB:.1f}"
+            if last is not None and last.succeeded and last.written is not None
             else ""
         )
         bench.row(
             "gut",
             "cf2-gut",
             tool,
-            setting + f", -k 27 -c 2 -t {T}",
-            w,
-            mb,
-            st,
-            f"{io} peak_disk_gb={dp.peak / 1e9:.0f} unitigs={stat(o, 'unitigs')}",
+            setting + f", -k 27 -c 2 -t {THREADS}",
+            wall,
+            peak_mb,
+            status,
+            f"{io_stats} peak_disk_gb={disk_peak.peak / BYTES_PER_GB:.0f} unitigs={stat(output, 'unitigs')}",
         )
-    a, b = os.path.join(work, "gut.fa"), os.path.join(work, "gut13.fa")
-    if os.path.exists(a) and os.path.exists(b):
-        same = subprocess.run(["cmp", "-s", a, b], check=False).returncode == 0
+    gut_fa, gut13_fa = os.path.join(work, "gut.fa"), os.path.join(work, "gut13.fa")
+    if os.path.exists(gut_fa) and os.path.exists(gut13_fa):
+        same = subprocess.run(["cmp", "-s", gut_fa, gut13_fa], check=False).returncode == 0
         bench.row(
             "gut",
             "cf2-gut",
@@ -714,97 +738,98 @@ def sec_gut(bench, work):
             None,
             "same" if same else "DIFFERENT",
         )
-    for x in glob.glob(os.path.join(work, "gut*.fa")):
-        os.remove(x)
+    for path in glob.glob(os.path.join(work, "gut*.fa")):
+        os.remove(path)
 
 
 def main():
     """Entry point that runs the sections named by --only."""
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("out")
-    ap.add_argument("--only", default=",".join(SECTIONS))
-    ap.add_argument(
+    parser.add_argument("out")
+    parser.add_argument("--only", default=",".join(SECTIONS))
+    parser.add_argument(
         "--cap",
         default=hw.default_cap_str(),
         help="per-command resident-memory cap (memcap; default: usable memory less 2 GiB)",
     )
-    ap.add_argument("--work", default=os.path.join(R, "temp/dbg_bench_work"))
-    ap.add_argument(
+    parser.add_argument("--work", default=os.path.join(ROOT, "temp/dbg_bench_work"))
+    parser.add_argument(
         "--threads",
         type=int,
         default=hw.cpus(),
         help="threads of every command (default: the usable CPUs)",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--warmup", type=int, default=1, help="warmup runs of every command, discarded"
     )
-    ap.add_argument(
+    parser.add_argument(
         "--runs",
         type=int,
-        default=3,
+        default=DEFAULT_RUNS,
         help="measured runs of every command (statistics over these)",
     )
-    results_file.add_argument(ap)
-    a = ap.parse_args()
-    global T
-    T = str(a.threads)
-    only = a.only.split(",")
-    bad = [s for s in only if s not in SECTIONS]
+    results_file.add_argument(parser)
+    args = parser.parse_args()
+    global THREADS
+    THREADS = str(args.threads)
+    only = args.only.split(",")
+    bad = [section for section in only if section not in SECTIONS]
     if bad:
         sys.exit(f"unknown section(s) {bad}; known: {SECTIONS}")
-    os.makedirs(a.out, exist_ok=True)
-    os.makedirs(a.work, exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
+    os.makedirs(args.work, exist_ok=True)
+    # meta.txt records the git revision and the binary's hash, so a result can be traced to the build that made it.
     rev = subprocess.run(
-        ["git", "-C", R, "describe", "--always", "--dirty"],
+        ["git", "-C", ROOT, "describe", "--always", "--dirty"],
         capture_output=True,
         text=True,
         check=False,
     ).stdout.strip()
     sha = hashlib.sha256(Path(OPTIK).read_bytes()).hexdigest()
-    with open(os.path.join(a.out, "meta.txt"), "w") as f:
-        f.write(
-            f"git {rev}\noptik sha256 {sha}\ncap {a.cap}\nthreads {T}\nwarmup {a.warmup}\nruns {a.runs}\n"
+    with open(os.path.join(args.out, "meta.txt"), "w") as handle:
+        handle.write(
+            f"git {rev}\noptik sha256 {sha}\ncap {args.cap}\nthreads {THREADS}\nwarmup {args.warmup}\nruns {args.runs}\n"
             f"started {time.ctime()}\n"
             f"cmd {' '.join(sys.argv)}\n"
         )
-    bench = Bench(a.out, a.cap, a.work, a.warmup, a.runs)
+    bench = Bench(args.out, args.cap, args.work, args.warmup, args.runs)
     # Rows of earlier runs into the same directory stay in rows.tsv but not in this run's report.
     first_row = 0
     if os.path.exists(bench.rows):
-        with open(bench.rows) as fh:
-            first_row = sum(1 for _ in fh)
+        with open(bench.rows) as handle:
+            first_row = sum(1 for _ in handle)
     c10 = None
     if "reads" in only or "modes" in only:
         c10 = (
-            sec_reads(bench, a.work)
+            sec_reads(bench, args.work)
             if "reads" in only
-            else reads(a.work, CHR1, 10, "chr1_10x.fa", [])
+            else reads(args.work, CHR1, CHR1_COVERAGE, "chr1_10x.fa", [])
         )
     if "modes" in only:
-        sec_modes(bench, a.work, c10)
+        sec_modes(bench, args.work, c10)
     if "grch38" in only:
-        sec_grch38(bench, a.work)
+        sec_grch38(bench, args.work)
     if "index" in only:
-        sec_index(bench, a.work)
+        sec_index(bench, args.work)
     if "gut" in only:
-        sec_gut(bench, a.work)
-    with open(os.path.join(a.out, "meta.txt"), "a") as f:
-        f.write(f"finished {time.ctime()}\n")
-    by = {}
-    with open(bench.rows) as f:
-        for line in list(f)[first_row:]:
-            r = dict(zip(TSV_COLS, line.rstrip("\n").split("\t"), strict=False))
-            by.setdefault(r.pop("section"), []).append(r)
+        sec_gut(bench, args.work)
+    with open(os.path.join(args.out, "meta.txt"), "a") as handle:
+        handle.write(f"finished {time.ctime()}\n")
+    rows_by_section = {}
+    with open(bench.rows) as handle:
+        for line in list(handle)[first_row:]:
+            row = dict(zip(TSV_COLS, line.rstrip("\n").split("\t"), strict=False))
+            rows_by_section.setdefault(row.pop("section"), []).append(row)
     results_file.write_section(
-        a.report,
+        args.report,
         "dbg",
         "optik dbruijn against Cuttlefish, GGCAT and Bifrost on read sets, modes, GRCh38, "
         "index building and a gut metagenome (wall s mean over the measured runs, peak RSS MB)",
-        list(by.items()),
+        list(rows_by_section.items()),
         notes=[
-            f"Raw TSV, metadata and per-command logs: `{os.path.relpath(a.out, R)}`"
+            f"Raw TSV, metadata and per-command logs: `{os.path.relpath(args.out, ROOT)}`"
         ],
     )
 

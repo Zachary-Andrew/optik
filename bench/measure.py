@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""measure.py - the single timing path of every optik benchmark.
+"""The single timing path of every optik benchmark.
 
 measure(cmd, warmup, runs, ...) runs `cmd` under hyperfine (-N, no shell) with the --warmup W and --runs R of the bench's command line, all under a resident-memory cap (memcap.py, applied to the whole process group on any Linux without root).
 Each run goes through rusage_exec (bench/cpp/rusage_exec.c) in append mode, so every run, warmups first, leaves one line of wall time, peak RSS and block I/O.
@@ -15,7 +15,7 @@ Before every run, warmups included, hyperfine's --prepare reads the command's in
 Inputs larger than half the available memory cannot stay cached and are streamed by every run alike.
 
 The command's stdout and stderr go to files (rusage_exec -o/-e) truncated on each run, so afterwards they hold the last measured run's output, which the bench's correctness gate reads.
-A run that fails (non-zero exit, or killed at the cap) ends the measurement, with Result.ok False, .capped telling whether the cap killed it and .err holding its stderr.
+A run that fails (non-zero exit, or killed at the cap) ends the measurement, with Result.succeeded False, .capped telling whether the cap killed it and .err holding its stderr.
 """
 
 import json
@@ -23,11 +23,44 @@ import os
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import (
+    dataclass,
+    field,
+)
+from typing import NamedTuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import statistics
+
 import memcap
+from diagnostics import LOG_TAIL_CHARS
+from units import KIB_PER_MIB
+
+# exit code of a Result whose failure is the bench's own (a count mismatch), not the command's
+NO_EXIT_CODE = -1
+
+
+class RusageLine(NamedTuple):
+    """One line of rusage_exec output, describing a single run of the command."""
+
+    exit_code: int
+    wall_s: float
+    peak_rss_kib: int
+    bytes_written: int | None
+    bytes_read: int | None
+
+    @classmethod
+    def parse(cls, line):
+        """Parse "code wall_s rss_kib [written read]".
+
+        The two block-I/O fields are None when rusage_exec omits them.
+        """
+        code, wall_s, rss_kib, *io_fields = line.split()
+        # Newer rusage_exec builds append bytes written and bytes read, and older lines stop after RSS.
+        written, read = (int(io_fields[0]), int(io_fields[1])) if len(io_fields) >= 2 else (None, None)
+        return cls(int(code), float(wall_s), int(rss_kib), written, read)
+
 
 RUSAGE_SRC = os.path.join(HERE, "cpp", "rusage_exec.c")
 RUSAGE_EXEC = os.path.join(HERE, "..", "temp", "measure", "rusage_exec")
@@ -47,7 +80,7 @@ def rusage_exec():
 class Result:
     """Outcome and statistics of one measure() call."""
 
-    ok: bool
+    succeeded: bool
     capped: bool = False
     code: int = 0
     warmup: int = 0
@@ -66,7 +99,7 @@ class Result:
 
     def wall_row(self):
         """The wall-time cell of a results row, {mean, sd, median, min, max, runs, warmup}, which the benches print as mean±sd."""
-        return dict(self.wall, runs=self.runs, warmup=self.warmup) if self.ok else None
+        return dict(self.wall, runs=self.runs, warmup=self.warmup) if self.succeeded else None
 
     def rss(self):
         """Peak resident MB over the measured runs."""
@@ -74,32 +107,32 @@ class Result:
 
     def row(self, prefix=""):
         """Flat fields for a results row."""
-        p = prefix
-        d = {
-            f"{p}wall_s": self.wall.get("mean"),
-            f"{p}wall_sd": self.wall.get("sd"),
-            f"{p}wall_median": self.wall.get("median"),
-            f"{p}wall_min": self.wall.get("min"),
-            f"{p}wall_max": self.wall.get("max"),
-            f"{p}user_s": self.user_s,
-            f"{p}sys_s": self.sys_s,
-            f"{p}rss_mb": self.rss_mb.get("max"),
-            f"{p}rss_mb_median": self.rss_mb.get("median"),
-            f"{p}warmup": self.warmup,
-            f"{p}runs": self.runs,
+        col_prefix = prefix
+        fields = {
+            f"{col_prefix}wall_s": self.wall.get("mean"),
+            f"{col_prefix}wall_sd": self.wall.get("sd"),
+            f"{col_prefix}wall_median": self.wall.get("median"),
+            f"{col_prefix}wall_min": self.wall.get("min"),
+            f"{col_prefix}wall_max": self.wall.get("max"),
+            f"{col_prefix}user_s": self.user_s,
+            f"{col_prefix}sys_s": self.sys_s,
+            f"{col_prefix}rss_mb": self.rss_mb.get("max"),
+            f"{col_prefix}rss_mb_median": self.rss_mb.get("median"),
+            f"{col_prefix}warmup": self.warmup,
+            f"{col_prefix}runs": self.runs,
         }
         if self.written is not None:
-            d[f"{p}written_bytes"] = self.written
-            d[f"{p}read_bytes"] = self.read
-        return d
+            fields[f"{col_prefix}written_bytes"] = self.written
+            fields[f"{col_prefix}read_bytes"] = self.read
+        return fields
 
 
 def _read(path):
     """Text of the file at path, or an empty string when it is missing."""
     if not os.path.exists(path):
         return ""
-    with open(path, errors="replace") as f:
-        return f.read()
+    with open(path, errors="replace") as handle:
+        return handle.read()
 
 
 # Seconds per unit of a hyperfine 2 time value
@@ -114,8 +147,8 @@ class AppendLog:
 
     def write(self, text):
         """Append `text` to the log file."""
-        with open(self.path, "a") as fh:
-            fh.write(text)
+        with open(self.path, "a") as handle:
+            handle.write(text)
 
     def flush(self):
         """Nothing to flush, since every write closes the file."""
@@ -127,48 +160,46 @@ def hyperfine_result(doc):
     hyperfine 1.x lists `times`, `mean`, `stddev`, `median`, `min`, `max`, `user`, `system`, `exit_codes` and `memory_usage_byte` per result.
     hyperfine 2 instead gives each run in `measurements` and the statistics in `summary`, so those are converted here and both versions read alike.
     """
-    r = doc["results"][0]
-    if "times" in r:
-        return r
-    runs = r.get("measurements", [])
-    summ = r.get("summary", {})
+    first_result = doc["results"][0]
+    if "times" in first_result:
+        return first_result
+    runs = first_result.get("measurements", [])
+    summ = first_result.get("summary", {})
 
-    def sec(v):
+    def sec(time_val):
         """A hyperfine 2 time value in seconds."""
-        return v["value"] * _SECONDS.get(v.get("unit", "second"), 1.0)
+        return time_val["value"] * _SECONDS.get(time_val.get("unit", "second"), 1.0)
 
     wall = summ.get("time_wall_clock", {})
     scale = _SECONDS.get(wall.get("unit", "second"), 1.0)
     out = {
-        "command": r.get("command"),
-        "times": [sec(m["time_wall_clock"]) for m in runs],
-        "exit_codes": [m.get("exit_code", 0) for m in runs],
+        "command": first_result.get("command"),
+        "times": [sec(measurement["time_wall_clock"]) for measurement in runs],
+        "exit_codes": [measurement.get("exit_code", 0) for measurement in runs],
         "memory_usage_byte": [
-            int(m["memory_peak_resident"]["value"])
-            for m in runs
-            if "memory_peak_resident" in m
+            int(measurement["memory_peak_resident"]["value"])
+            for measurement in runs
+            if "memory_peak_resident" in measurement
         ],
     }
-    for k in ("mean", "median", "min", "max"):
-        out[k] = wall[k] * scale if k in wall else None
+    for stat in ("mean", "median", "min", "max"):
+        out[stat] = wall[stat] * scale if stat in wall else None
     out["stddev"] = (
         wall["stddev"] * scale if len(runs) > 1 and "stddev" in wall else None
     )
-    for k, src in (("user", "time_user"), ("system", "time_system")):
-        s = summ.get(src, {})
-        out[k] = (
-            s["mean"] * _SECONDS.get(s.get("unit", "second"), 1.0)
-            if "mean" in s
+    for stat, src in (("user", "time_user"), ("system", "time_system")):
+        stats = summ.get(src, {})
+        out[stat] = (
+            stats["mean"] * _SECONDS.get(stats.get("unit", "second"), 1.0)
+            if "mean" in stats
             else None
         )
     return out
 
 
-def _median(xs):
+def _median(values):
     """Median of xs, the mean of the two middle values for an even count."""
-    s = sorted(xs)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    return statistics.median(values)
 
 
 def measure(
@@ -182,17 +213,19 @@ def measure(
         raise ValueError("runs must be >= 1")
     scratch = os.path.abspath(scratch or os.path.join(cwd or ".", ".measure"))
     os.makedirs(scratch, exist_ok=True)
-    res_f, out_f, err_f, js = (
-        os.path.join(scratch, x)
-        for x in ("rusage.txt", "stdout.txt", "stderr.txt", "hyperfine.json")
+    res_f, out_f, err_f, json_path = (
+        os.path.join(scratch, name)
+        for name in ("rusage.txt", "stdout.txt", "stderr.txt", "hyperfine.json")
     )
-    for f in (res_f, js):
-        if os.path.exists(f):
-            os.remove(f)
+    # Results left by an earlier call would be read as this one's, so they are removed first.
+    for path in (res_f, json_path):
+        if os.path.exists(path):
+            os.remove(path)
+    # rusage_exec appends one line of exit code, wall time, peak RSS and I/O per run, while hyperfine times the wrapper as a whole.
     inner = [rusage_exec(), "-a", "-o", out_f, "-e", err_f, "0", res_f] + [
-        str(c) for c in cmd
+        str(arg) for arg in cmd
     ]
-    hf = [
+    hyperfine_cmd = [
         "hyperfine",
         "-N",
         "--warmup",
@@ -200,96 +233,97 @@ def measure(
         "--runs",
         str(runs),
         "--export-json",
-        js,
+        json_path,
         "--command-name",
         tag,
         "--style",
         "none",
     ]
-    ins = [os.path.abspath(os.path.join(cwd or ".", x)) for x in inputs if x]
-    ins = [x for x in ins if os.path.isfile(x)]
+    ins = [os.path.abspath(os.path.join(cwd or ".", path)) for path in inputs if path]
+    ins = [path for path in ins if os.path.isfile(path)]
+    # The inputs are read back into the page cache before every run, so each run starts from the same cache state.
     if ins:
-        hf += [
+        hyperfine_cmd += [
+            # Before each run, --prepare reads the inputs into the page cache so every run starts equally warm.
             "--prepare",
             shlex.join(
                 [sys.executable, os.path.join(HERE, "memcap.py"), "--warm", *ins]
             ),
         ]
-    hf.append(shlex.join(inner))
+    hyperfine_cmd.append(shlex.join(inner))
     if log:
-        log.write(f"[{tag}] {shlex.join(hf)}\n")
+        log.write(f"[{tag}] {shlex.join(hyperfine_cmd)}\n")
         log.flush()
-    p = memcap.run(
-        hf, cap, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    proc = memcap.run(
+        hyperfine_cmd, cap, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
     err = _read(err_f)
-    lines = [x.split() for x in _read(res_f).splitlines()]
-    if p.returncode != 0 or p.capped:
-        code = int(lines[-1][0]) if lines else p.returncode
+    lines = [RusageLine.parse(line) for line in _read(res_f).splitlines() if line.strip()]
+    if proc.returncode != 0 or proc.capped:
+        # The rusage wrapper knows the tool's own exit code. hyperfine's code only says that some run failed.
+        code = lines[-1].exit_code if lines else proc.returncode
         return Result(
-            ok=False,
-            capped=bool(p.capped),
+            succeeded=False,
+            capped=bool(proc.capped),
             code=code,
             warmup=warmup,
             runs=runs,
-            err=err or (p.stderr or "")[-2000:],
+            err=err or (proc.stderr or "")[-LOG_TAIL_CHARS:],
             out=out_f,
         )
+    # One rusage line per run is expected, so any other count means a run was lost or the file was shared.
     if len(lines) != warmup + runs:
         return Result(
-            ok=False,
-            code=-1,
+            succeeded=False,
+            code=NO_EXIT_CODE,
             warmup=warmup,
             runs=runs,
             err=f"measure: {len(lines)} rusage lines for {warmup} warmups + {runs} runs",
         )
+    # Warmup runs are timed by hyperfine but left out of the statistics.
     kept = lines[warmup:]
-    h = hyperfine_result(json.loads(_read(js)))
-    times = h["times"]
+    hyperfine = hyperfine_result(json.loads(_read(json_path)))
+    times = hyperfine["times"]
     if len(times) != runs:
         return Result(
-            ok=False,
-            code=-1,
+            succeeded=False,
+            code=NO_EXIT_CODE,
             warmup=warmup,
             runs=runs,
             err=f"measure: hyperfine reported {len(times)} runs, {runs} asked",
         )
-    rss = [int(x[2]) / 1024 for x in kept]
-    wr = [int(x[3]) for x in kept if len(x) >= 5]
-    rd = [int(x[4]) for x in kept if len(x) >= 5]
+    # Wall time comes from hyperfine and memory from the rusage wrapper, both from the same runs.
+    rss = [run.peak_rss_kib / KIB_PER_MIB for run in kept]
+    written = [run.bytes_written for run in kept if run.bytes_written is not None]
+    read_bytes = [run.bytes_read for run in kept if run.bytes_read is not None]
     return Result(
-        ok=True,
+        succeeded=True,
         code=0,
         warmup=warmup,
         runs=runs,
         wall={
-            "mean": h["mean"],
-            "sd": h["stddev"] if runs > 1 else None,
-            "median": h["median"],
-            "min": h["min"],
-            "max": h["max"],
+            "mean": hyperfine["mean"],
+            "sd": hyperfine["stddev"] if runs > 1 else None,
+            "median": hyperfine["median"],
+            "min": hyperfine["min"],
+            "max": hyperfine["max"],
         },
-        user_s=h.get("user"),
-        sys_s=h.get("system"),
+        user_s=hyperfine.get("user"),
+        sys_s=hyperfine.get("system"),
         rss_mb={"median": _median(rss), "max": max(rss)},
-        written=int(_median(wr)) if wr else None,
-        read=int(_median(rd)) if rd else None,
+        written=int(_median(written)) if written else None,
+        read=int(_median(read_bytes)) if read_bytes else None,
         out=out_f,
         err=err,
         per_run=[
-            (
-                float(x[1]),
-                int(x[2]),
-                int(x[3]) if len(x) >= 5 else None,
-                int(x[4]) if len(x) >= 5 else None,
-            )
-            for x in kept
+            (run.wall_s, run.peak_rss_kib, run.bytes_written, run.bytes_read)
+            for run in kept
         ],
     )
 
 
 if __name__ == "__main__":
     # python3 bench/measure.py W R cmd... gives a quick check of the path.
-    w, r, *c = sys.argv[1:]
-    m = measure(c, int(w), int(r))
-    print(json.dumps(m.__dict__, indent=1, default=str))
+    warmup, runs, *cmd = sys.argv[1:]
+    result = measure(cmd, int(warmup), int(runs))
+    print(json.dumps(result.__dict__, indent=1, default=str))

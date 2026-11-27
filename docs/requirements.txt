@@ -1,0 +1,8 @@
+# Python side of the documentation build, installed by docs/build.sh into docs/.venv.
+# Breathe 5.1 still trips on namespace declarations under Sphinx 9, so Sphinx stays on 8.2.
+sphinx==8.2.3
+breathe==5.1.0
+furo==2025.12.19
+# myst-parser reads the Lean page's Markdown docstrings and lean/APPENDIX_B.md.
+# Its 4.0 release is the one that supports Sphinx 8.
+myst-parser==4.0.1

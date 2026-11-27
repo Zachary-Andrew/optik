@@ -1,20 +1,20 @@
 #pragma once
 
-/*
- * dyn_spss.hpp - dynamic exact k-mer set, a static SpssCore plus two buffered edit sets.
+/**
+ * @file
+ * @brief An exact k-mer set that accepts edits, built from a static SpssCore plus two edit buffers.
  *
- * The source is the static-core-plus-buffered-updates design of BufBOSS (Alanko et al. 2021).
- * BufBOSS buffers edits next to a BOSS de Bruijn graph.
- * Here the static part is optik's SPSS index and the buffers are the DeltaOA hash sets of delta_oa.hpp.
+ * The layout follows BufBOSS (Alanko et al. 2021), which buffers edits beside a BOSS graph.
+ * Here, though, the static part is our SPSS index and the buffers are DeltaOA hash sets (delta_oa.hpp):
  *
- *   added_    canonical k-mers inserted that the static core lacks
- *   deleted_  canonical k-mers of the static core that were erased
+ *   added_    k-mers inserted that the core doesn't have
+ *   deleted_  core k-mers that were erased
  *
- * A k-mer is present if the core has it and it is not in deleted_, or the core lacks it and it is in added_.
- * Edits are keyed by canonical value, so they stay correct when the static input repeats a k-mer.
+ * Membership is (in core && !in deleted_) || (!in core && in added_).
+ * Both buffers hold canonical k-mers, so a k-mer repeated in the original input can't confuse the bookkeeping.
  *
- * compact() folds the edits into a fresh static core (k-mers -> maximal unitigs -> SpssCore) and empties both sets.
- * It must not run concurrently with any other operation on the object.
+ * compact() rebuilds the core with the edits folded in and then clears the buffers.
+ * Nothing else may touch the object while it runs.
  */
 
 #include <memory>
@@ -29,56 +29,67 @@ namespace tpoptoa {
 
 class DynSpss {
 public:
-    /// Initial expected size of each edit set, which DeltaOA grows past.
+    /// Starting capacity of each edit buffer, which DeltaOA grows as needed.
     static constexpr std::size_t kEditSetInitialKeys = 1024;
 
     explicit DynSpss(std::unique_ptr<SpssCore> core) : core_(std::move(core)) {}
 
     const SpssCore& core() const noexcept { return *core_; }
-    unsigned k() const noexcept { return core_->k(); }
+    unsigned kmer_len() const noexcept { return core_->kmer_len(); }
     std::size_t added() const noexcept { return added_->size(); }
     std::size_t deleted() const noexcept { return deleted_->size(); }
 
-    /// insert() - add k-mer @x in either orientation, reporting true when it was absent.
-    bool insert(uint64_t x) {
-        const uint64_t c = canon(x);
-        if (core_->contains(x)) return deleted_->erase(c);
-        return added_->insert(c);
+    /// Accepts either orientation and returns true if @p kmer wasn't already present.
+    bool insert(uint64_t kmer) {
+        const uint64_t canonical = canon(kmer);
+
+        if (core_->contains(kmer)) return deleted_->erase(canonical);
+
+        return added_->insert(canonical);
     }
 
-    /// erase() - remove k-mer @x, true when it had been present.
-    bool erase(uint64_t x) {
-        const uint64_t c = canon(x);
-        if (core_->contains(x)) return deleted_->insert(c);
-        return added_->erase(c);
+    /// True if @p kmer was present.
+    bool erase(uint64_t kmer) {
+        const uint64_t canonical = canon(kmer);
+
+        if (core_->contains(kmer)) return deleted_->insert(canonical);
+
+        return added_->erase(canonical);
     }
 
-    /// compact() - rebuild the static core from the current set (maximal unitigs of the node-centric graph over the k-mers) and clear the edit sets.
-    /// Keeps the core's k and minimizer length.
-    /// Returns false, with the object unchanged, if the SPSS build fails.
+    /// Rebuilds the core from the current set's maximal unitigs, keeping k and the minimizer length.
+    /// If the SPSS build fails, however, nothing changes and the result is false.
     bool compact(unsigned nthreads = 0) {
-        const unsigned K = core_->k(), M = core_->m();
-        // DbgGraph takes counted k-mers, so each canonical k-mer gets a count of 1
+        const unsigned kmer_len = core_->kmer_len(), minimizer_len = core_->minimizer_len();
+        // DbgGraph expects (k-mer, count) pairs, and a count of 1 is all we need here.
         std::vector<std::pair<uint64_t, uint32_t>> kmer_counts;
+
         kmer_counts.reserve(core_->stats().kmers + added_->size());
-        core_->for_each_kmer([&](uint64_t c) {
-            if (deleted_->empty() || !deleted_->contains(c)) kmer_counts.push_back({c, 1});
+        core_->for_each_kmer([&](uint64_t kmer) {
+            if (deleted_->empty() || !deleted_->contains(kmer)) kmer_counts.push_back({kmer, 1});
         });
-        added_->for_each([&](uint64_t c) { kmer_counts.push_back({c, 1}); });
+        added_->for_each([&](uint64_t kmer) { kmer_counts.push_back({kmer, 1}); });
+        // An added k-mer may already be in the core, so the merged list is deduplicated.
         std::sort(kmer_counts.begin(), kmer_counts.end());
         kmer_counts.erase(std::unique(kmer_counts.begin(), kmer_counts.end(),
-                                      [](const auto& a, const auto& b) { return a.first == b.first; }),
+                                      [](const auto& lhs, const auto& rhs) { return lhs.first == rhs.first; }),
                           kmer_counts.end());
         std::vector<std::string> seqs;
+
         if (!kmer_counts.empty()) {
-            DbgGraph g(K);
-            g.build_core(std::move(kmer_counts));
-            g.unitigs([&](const uint8_t* s, uint32_t len, uint64_t) {
-                seqs.emplace_back(reinterpret_cast<const char*>(s), len);
+            DbgGraph graph(kmer_len);
+
+            graph.build_core(std::move(kmer_counts));
+            graph.unitigs([&](const uint8_t* unitig, uint32_t len, uint64_t) {
+                seqs.emplace_back(reinterpret_cast<const char*>(unitig), len);
             }, nthreads);
         }
+
         auto fresh = std::make_unique<SpssCore>();
-        if (!fresh->build(seqs, K, M, nthreads, &seqs)) return false;
+
+        // The new core replaces the old one only once it is fully built, which is why a failed build leaves the index unchanged.
+        if (!fresh->build(seqs, kmer_len, minimizer_len, nthreads, &seqs)) return false;
+
         core_ = std::move(fresh);
         added_ = std::make_unique<DeltaOA>(kEditSetInitialKeys);
         deleted_ = std::make_unique<DeltaOA>(kEditSetInitialKeys);
@@ -86,9 +97,10 @@ public:
     }
 
 private:
-    uint64_t canon(uint64_t x) const noexcept {
-        const uint64_t r = SpssCore::rc(x, core_->k());
-        return x < r ? x : r;
+    uint64_t canon(uint64_t kmer) const noexcept {
+        const uint64_t rev_comp = SpssCore::revcomp_packed(kmer, core_->kmer_len());
+
+        return kmer < rev_comp ? kmer : rev_comp;
     }
 
     std::unique_ptr<SpssCore> core_;

@@ -1,9 +1,11 @@
 #pragma once
 
-/*
- * cache_info.hpp - CPU cache sizes from sysfs, which any user may read.
+/**
+ * @file
+ * @brief CPU cache sizes read from sysfs (readable without root).
  *
- * Code that changes strategy with the working set, such as FmIndex's batched lookups and the micro benchmark's cache- and DRAM-sized cases, reads the sizes here instead of assuming one machine's caches.
+ * FmIndex's batched lookups and the micro benchmark's cache/DRAM cases size themselves from these.
+ * That way neither assumes one particular machine.
  */
 
 #include <cstddef>
@@ -11,44 +13,56 @@
 #include <fstream>
 #include <string>
 
+#include "bits.hpp"
+
 namespace tpoptoa {
 
-/// Cache sizes assumed when sysfs lists none, typical of current x86-64 CPUs.
+// Typical x86-64 sizes, used when sysfs has nothing (containers, odd kernels).
 inline constexpr std::size_t kFallbackL1dBytes = std::size_t(32) << 10;
 inline constexpr std::size_t kFallbackLlcBytes = std::size_t(32) << 20;
-/// Sysfs cache entries examined per CPU (index0, index1, ...).
-inline constexpr int kMaxCacheIndex = 16;
+// Real CPUs list 4 or 5 entries (index0, index1, ...), so this is a generous upper bound.
+inline constexpr int kMaxSysfsCacheEntries = 16;
 
-/// cache_bytes() - size of the largest data or unified cache of @cpu at
-/// @level, or of the highest level present when @level is 0, from /sys/devices/system/cpu/cpuN/cache.
-/// Returns 0 when sysfs lists none.
+/// Largest data/unified cache of @p cpu at @p level, where level 0 means the highest one present.
+/// Returns 0 when sysfs doesn't list a match.
 inline std::size_t cache_bytes(int cpu, int level) {
     std::size_t best = 0;
     int best_level = 0;
-    for (int i = 0; i < kMaxCacheIndex; ++i) {
+
+    for (int i = 0; i < kMaxSysfsCacheEntries; ++i) {
         const std::string dir = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cache/index" +
                                 std::to_string(i) + "/";
-        std::ifstream lf(dir + "level"), tf(dir + "type"), sf(dir + "size");
-        int lv = 0;
+        std::ifstream level_file(dir + "level"), type_file(dir + "type"), size_file(dir + "size");
+        int cache_level = 0;
         std::string type, size;
-        if (!(lf >> lv) || !(tf >> type) || !(sf >> size)) continue;
-        if (type == "Instruction" || (level != 0 && lv != level)) continue;
-        std::size_t bytes = std::strtoull(size.c_str(), nullptr, 10);
+
+        if (!(level_file >> cache_level) || !(type_file >> type) || !(size_file >> size)) continue;
+
+        if (type == "Instruction" || (level != 0 && cache_level != level)) continue;
+
+        std::size_t bytes = std::strtoull(size.c_str(), nullptr, kDecimalBase);
+
+        // sysfs prints sizes like "32K" or "32M", in binary units.
+        constexpr std::size_t kKiB = 1024, kMiB = kKiB * 1024, kGiB = kMiB * 1024;
         const char unit = size.empty() ? ' ' : size.back();
-        if (unit == 'K') bytes <<= 10;
-        else if (unit == 'M') bytes <<= 20;
-        else if (unit == 'G') bytes <<= 30;
-        if (lv > best_level || (lv == best_level && bytes > best)) { best = bytes; best_level = lv; }
+        if (unit == 'K') bytes *= kKiB;
+        else if (unit == 'M') bytes *= kMiB;
+        else if (unit == 'G') bytes *= kGiB;
+
+        if (cache_level > best_level || (cache_level == best_level && bytes > best)) { best = bytes; best_level = cache_level; }
     }
+
     return best;
 }
 
-/// last_level_cache_bytes() - the last-level cache of CPU 0, read once, or kFallbackLlcBytes when sysfs lists none.
+/// Last-level cache of CPU 0, read once.
 inline std::size_t last_level_cache_bytes() {
     static const std::size_t llc = [] {
-        const std::size_t b = cache_bytes(0, 0);
-        return b ? b : kFallbackLlcBytes;
+        const std::size_t detected = cache_bytes(0, 0);
+
+        return detected ? detected : kFallbackLlcBytes;
     }();
+
     return llc;
 }
 

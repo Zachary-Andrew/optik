@@ -1,28 +1,31 @@
 #pragma once
 
-/*
- * wyhash.hpp - 64-bit integer hashes.
+/**
+ * @file
+ * @brief 64-bit integer hashes.
  *
- * wymix() and the four secret constants are taken from wyhash by Wang Yi (public domain, https://github.com/wangyi-fudan/wyhash).
- * Only the multiply-fold mixer is kept.
- * The SPSS index checksum in ffi_spss.cpp folds file blocks with it, so the streaming and PRNG parts of wyhash are not included and the checksum is not output-compatible with the reference wyhash.
+ * wymix() and its secret come from Wang Yi's public-domain wyhash (github.com/wangyi-fudan/wyhash).
+ * Checksumming SPSS index files (ffi_spss.cpp) needs only the multiply-fold step, so the streaming and PRNG parts were left out.
+ * Consequently, our checksum won't match reference wyhash output.
  *
- * mix64() is MurmurHash3's 64-bit finalizer, the seeded hash optik's tables use for k-mers and keys.
+ * mix64() is MurmurHash3's finalizer and serves as the seeded hash for every k-mer table.
  */
 
 #include <cstdint>
 
+#include "bits.hpp"
+
 namespace tpoptoa {
 
-/// wymix() - multiply-fold, the 128-bit product of @a and @b with the high half XORed into the low half.
-///
-/// Both halves of the product depend on every input bit, so folding them gives full avalanche from one multiplication.
-constexpr inline uint64_t wymix(uint64_t a, uint64_t b) noexcept {
-    unsigned __int128 r = a;
-    r *= b;
-    a = static_cast<uint64_t>(r);
-    b = static_cast<uint64_t>(r >> 64);
-    return a ^ b;
+/// XORs the high half of the 128-bit product into the low half.
+/// Since each half depends on every input bit, one multiplication is enough for full avalanche.
+constexpr inline uint64_t wymix(uint64_t lhs, uint64_t rhs) noexcept {
+    unsigned __int128 product = lhs;
+
+    product *= rhs;
+    lhs = static_cast<uint64_t>(product);
+    rhs = static_cast<uint64_t>(product >> kWordBits);
+    return lhs ^ rhs;
 }
 
 /// The default secret of the reference wyhash.
@@ -31,16 +34,29 @@ inline constexpr uint64_t kWyhashDefaultSecret[4] = {
     UINT64_C(0x8ebc6af09c88c6e3), UINT64_C(0x589965cc75374cc3),
 };
 
-/// mix64() - MurmurHash3's 64-bit finalizer (fmix64) applied to @x ^ @seed.
-constexpr inline uint64_t mix64(uint64_t x, uint64_t seed) noexcept {
-    x ^= seed;
-    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
+/// 2^64 / phi, rounded to odd.
+/// Multiplying by it scatters consecutive keys across the 64-bit range (Fibonacci hashing), and SplitMix64 uses it as its increment.
+/// Index files store hashes seeded with this value, so changing it would break every saved index.
+inline constexpr uint64_t kGoldenRatio64 = 0x9E3779B97F4A7C15ULL;
+
+/// Computes fmix64(@p value ^ @p seed), so pass @p seed = 0 for plain fmix64.
+/// The low bits make a safe table index even for keys that differ only in their high bits.
+constexpr inline uint64_t mix64(uint64_t value, uint64_t seed) noexcept {
+    // Appleby picked these by searching for the best avalanche behaviour.
+    constexpr unsigned shift = 33;
+    constexpr uint64_t first_multiplier = 0xff51afd7ed558ccdULL;
+    constexpr uint64_t second_multiplier = 0xc4ceb9fe1a85ec53ULL;
+
+    value ^= seed;
+    value ^= value >> shift;
+    value *= first_multiplier;
+    value ^= value >> shift;
+    value *= second_multiplier;
+    value ^= value >> shift;
+    return value;
 }
 
-// Hash tables built from mix64 are stored in index files, so its output is fixed.
+// Saved indexes depend on this exact output.
 static_assert(mix64(1, 0) == 0xb456bcfc34c2cb2cULL, "MurmurHash3 fmix64(1)");
 
 }

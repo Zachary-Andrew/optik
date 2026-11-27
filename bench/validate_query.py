@@ -29,67 +29,59 @@ import subprocess
 import sys
 import tempfile
 
+from diagnostics import DETAIL_CHARS
+from dna import read_fasta, revcomp
+
+# timeouts of the external commands, in seconds
+QUERY_TIMEOUT_S = 300
+BUILD_TIMEOUT_S = 1800
+SSHASH_QUERY_TIMEOUT_S = 600
+# most random absent k-mers in the negative set
+MAX_NEGATIVE_KMERS = 5000
+# reference k-mers mutated for the near-miss set, and the most near-miss k-mers kept
+NEAR_MISS_SOURCE_KMERS = 2000
+MAX_NEAR_MISS_KMERS = 2000
+# probability that a probe or streaming record is written reverse-complemented
+REVCOMP_PROB = 0.5
+# streaming records: count, length, the shortest reference they are drawn from, and substitutions per record (exclusive upper bound)
+STREAM_RECORDS = 2000
+STREAM_READ_LEN = 150
+STREAM_MIN_REF_LEN = 200
+STREAM_MAX_SUBS = 4
+# SSHash minimizer length, at most k - 1
+SSHASH_MINIMIZER_LEN = 15
+# argparse defaults
+DEFAULT_MAX_QUERY_KMERS = 50000
+DEFAULT_SEED = 42
+
 # k-mer helpers
-
-COMPLEMENT = str.maketrans("ACGT", "TGCA")
-
-
-def rc(seq: str) -> str:
-    """Reverse complement of seq."""
-    return seq.translate(COMPLEMENT)[::-1]
 
 
 def canonicalize(kmer: str) -> str:
     """Canonical form of kmer, the smaller of it and its reverse complement."""
-    r = rc(kmer)
-    return min(kmer, r)
+    rev = revcomp(kmer)
+    return min(kmer, rev)
 
 
-def extract_kmers(seq: str, k: int):
+def extract_kmers(seq: str, kmer_len: int):
     """Canonical k-mers of seq, case-insensitive, where any non-ACGT base breaks the run as it does in optik and SSHash."""
     kmers = []
     run = []
-    for c in seq.upper() + "N":
-        if c in "ACGT":
-            run.append(c)
+    for base in seq.upper() + "N":
+        if base in "ACGT":
+            run.append(base)
             continue
-        r = "".join(run)
-        kmers.extend(canonicalize(r[j : j + k]) for j in range(len(r) - k + 1))
+        run_seq = "".join(run)
+        kmers.extend(canonicalize(run_seq[j : j + kmer_len]) for j in range(len(run_seq) - kmer_len + 1))
         run = []
     return kmers
 
 
-def read_fasta(path: str):
-    """Read a FASTA file into a list of (name, sequence) records."""
-    sequences = []
-    name = None
-    parts = []
-    seq_idx = 0
-    import gzip
-
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                if name is not None:
-                    sequences.append((name, "".join(parts)))
-                tokens = line[1:].split()
-                name = tokens[0] if tokens else f"seq_{seq_idx}"
-                seq_idx += 1
-                parts = []
-            else:
-                parts.append(line)
-    if name is not None:
-        sequences.append((name, "".join(parts)))
-    return sequences
-
-
-def build_oracle(ref_path: str, k: int):
+def build_oracle(ref_path: str, kmer_len: int):
     """Set of all canonical k-mers of the reference."""
     oracle = set()
     for _, seq in read_fasta(ref_path):
-        oracle.update(extract_kmers(seq, k))
+        oracle.update(extract_kmers(seq, kmer_len))
     return oracle
 
 
@@ -100,16 +92,16 @@ def random_dna(length: int, rng: random.Random) -> str:
 
 def make_single_kmer_fasta(kmers, path):
     """Write a FASTA file with one k-mer per record."""
-    with open(path, "w") as f:
-        f.writelines(f">q{i}\n{kmer}\n" for i, kmer in enumerate(kmers))
+    with open(path, "w") as handle:
+        handle.writelines(f">q{i}\n{kmer}\n" for i, kmer in enumerate(kmers))
 
 
-def run_optik_query(index_path: str, queries_fa: str, k: int, optik_bin: str):
+def run_optik_query(index_path: str, queries_fa: str, kmer_len: int, optik_bin: str):
     """Run optik query and parse its summary output."""
-    cmd = [optik_bin, "query", "-i", index_path, "-q", queries_fa, "-k", str(k)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
+    cmd = [optik_bin, "query", "-i", index_path, "-q", queries_fa, "-k", str(kmer_len)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=QUERY_TIMEOUT_S, check=False)
     if proc.returncode != 0:
-        return None, f"optik query failed: {proc.stderr[:500]}"
+        return None, f"optik query failed: {proc.stderr[:DETAIL_CHARS]}"
 
     result = {}
     for line in proc.stdout.split("\n"):
@@ -142,20 +134,20 @@ def parse_counts(text: str):
         try:
             out[key.strip()] = int(val)
         except ValueError:
-            pass
+            pass  # not a count line
     return out
 
 
 def validate(args):
     """Run every query check against the oracle and SSHash and return the report dict."""
     checks = {}
-    k = args.k
+    kmer_len = args.k
     optik = args.optik
     tmpdir = tempfile.mkdtemp(prefix="vq_")
 
     try:
         # Oracle k-mer set
-        oracle = build_oracle(args.ref, k)
+        oracle = build_oracle(args.ref, kmer_len)
         checks["oracle_size"] = len(oracle)
 
         # Controlled query sets
@@ -168,8 +160,8 @@ def validate(args):
 
         # Negative queries, random k-mers absent from the reference
         neg_kmers = set()
-        while len(neg_kmers) < min(len(pos_kmers), 5000):
-            kmer = random_dna(k, rng)
+        while len(neg_kmers) < min(len(pos_kmers), MAX_NEGATIVE_KMERS):
+            kmer = random_dna(kmer_len, rng)
             can = canonicalize(kmer)
             if can not in oracle:
                 neg_kmers.add(can)
@@ -178,20 +170,20 @@ def validate(args):
         # Near-miss negative queries, single substitutions of reference k-mers
         off1_kmers = set()
         bases = "ACGT"
-        sample_pos = rng.sample(pos_kmers, min(2000, len(pos_kmers)))
+        sample_pos = rng.sample(pos_kmers, min(NEAR_MISS_SOURCE_KMERS, len(pos_kmers)))
         for kmer in sample_pos:
-            for pos in range(k):
-                for b in bases:
-                    if b != kmer[pos]:
-                        mutated = kmer[:pos] + b + kmer[pos + 1 :]
+            for pos in range(kmer_len):
+                for base in bases:
+                    if base != kmer[pos]:
+                        mutated = kmer[:pos] + base + kmer[pos + 1 :]
                         can = canonicalize(mutated)
                         if can not in oracle:
                             off1_kmers.add(can)
-                            if len(off1_kmers) >= 2000:
+                            if len(off1_kmers) >= MAX_NEAR_MISS_KMERS:
                                 break
-                if len(off1_kmers) >= 2000:
+                if len(off1_kmers) >= MAX_NEAR_MISS_KMERS:
                     break
-            if len(off1_kmers) >= 2000:
+            if len(off1_kmers) >= MAX_NEAR_MISS_KMERS:
                 break
         off1_kmers = list(off1_kmers)
 
@@ -204,7 +196,7 @@ def validate(args):
         # Probes are written in random orientation, half of them as the reverse complement of the canonical form, so a lookup that finds k-mers only in canonical orientation cannot pass.
         def orient(kms):
             """kms with each k-mer reverse-complemented with probability one half."""
-            return [rc(x) if rng.random() < 0.5 else x for x in kms]
+            return [revcomp(kmer) if rng.random() < REVCOMP_PROB else kmer for kmer in kms]
 
         make_single_kmer_fasta(orient(pos_kmers), pos_fa)
         make_single_kmer_fasta(orient(neg_kmers), neg_fa)
@@ -213,24 +205,24 @@ def validate(args):
 
         # Streaming records are reference windows from both strands with a few substitutions, so each record mixes present and absent k-mers and exercises the multi-k-mer extension path rather than single-k-mer lookups.
         # The expected counts come from the oracle k-mer by k-mer.
-        refs = [sq for _, sq in read_fasta(args.ref) if len(sq) >= 200]
+        refs = [seq for _, seq in read_fasta(args.ref) if len(seq) >= STREAM_MIN_REF_LEN]
         stream_fa = os.path.join(tmpdir, "stream_reads.fa")
         s_total = s_pos = 0
-        with open(stream_fa, "w") as fh:
-            for i in range(2000):
-                sq = rng.choice(refs)
-                p0 = rng.randrange(0, len(sq) - 150 + 1)
-                r = list(sq[p0 : p0 + 150])
-                for _ in range(rng.randrange(0, 4)):
-                    j = rng.randrange(len(r))
-                    r[j] = rng.choice("ACGT".replace(r[j].upper(), "") or "ACGT")
-                r = "".join(r)
-                if rng.random() < 0.5:
-                    r = rc(r)
-                fh.write(f">s{i}\n{r}\n")
-                ks = extract_kmers(r, k)
-                s_total += len(ks)
-                s_pos += sum(1 for x in ks if x in oracle)
+        with open(stream_fa, "w") as handle:
+            for i in range(STREAM_RECORDS):
+                seq = rng.choice(refs)
+                start = rng.randrange(0, len(seq) - STREAM_READ_LEN + 1)
+                read = list(seq[start : start + STREAM_READ_LEN])
+                for _ in range(rng.randrange(0, STREAM_MAX_SUBS)):
+                    mut_pos = rng.randrange(len(read))
+                    read[mut_pos] = rng.choice("ACGT".replace(read[mut_pos].upper(), "") or "ACGT")
+                read = "".join(read)
+                if rng.random() < REVCOMP_PROB:
+                    read = revcomp(read)
+                handle.write(f">s{i}\n{read}\n")
+                kmers = extract_kmers(read, kmer_len)
+                s_total += len(kmers)
+                s_pos += sum(1 for kmer in kmers if kmer in oracle)
 
         sets = {
             "positive": (pos_fa, len(pos_kmers), len(pos_kmers)),
@@ -244,8 +236,8 @@ def validate(args):
         ss_counts = {}
         if args.sshash and os.path.isfile(args.sshash):
             ss_idx = os.path.join(tmpdir, "sshash.idx")
-            m = min(k - 1, 15)
-            b = subprocess.run(
+            minimizer_len = min(kmer_len - 1, SSHASH_MINIMIZER_LEN)
+            base = subprocess.run(
                 [
                     args.sshash,
                     "build",
@@ -254,77 +246,77 @@ def validate(args):
                     "-o",
                     ss_idx,
                     "-k",
-                    str(k),
+                    str(kmer_len),
                     "-m",
-                    str(m),
+                    str(minimizer_len),
                     "-d",
                     tmpdir,
                 ],
                 capture_output=True,
                 text=True,
-                timeout=1800,
+                timeout=BUILD_TIMEOUT_S,
                 check=False,
             )
             checks["sshash_build"] = {
-                "pass": b.returncode == 0,
-                "cmd": f"sshash build -i REF -k {k} -m {m}",
-                "error": b.stderr[-300:] if b.returncode else "",
+                "pass": base.returncode == 0,
+                "cmd": f"sshash build -i REF -k {kmer_len} -m {minimizer_len}",
+                "error": base.stderr[-DETAIL_CHARS:] if base.returncode else "",
             }
-            if b.returncode == 0:
-                for name, (fa, _, _) in sets.items():
-                    q = subprocess.run(
-                        [args.sshash, "query", "-i", ss_idx, "-q", fa],
+            if base.returncode == 0:
+                for name, (query_fa, _, _) in sets.items():
+                    proc = subprocess.run(
+                        [args.sshash, "query", "-i", ss_idx, "-q", query_fa],
                         capture_output=True,
                         text=True,
-                        timeout=600,
+                        timeout=SSHASH_QUERY_TIMEOUT_S,
                         check=False,
                     )
-                    ss_counts[name] = parse_counts(q.stdout)
+                    ss_counts[name] = parse_counts(proc.stdout)
 
         # optik with both index formats on every set, against the oracle and SSHash
         for fmt, build_cmd in (("spss", "build-spss"), ("fm", "build-fm")):
             idx_path = os.path.join(tmpdir, f"optik_{fmt}.idx")
-            b = subprocess.run(
-                [optik, build_cmd, "-i", args.ref, "-k", str(k), "-o", idx_path],
+            base = subprocess.run(
+                [optik, build_cmd, "-i", args.ref, "-k", str(kmer_len), "-o", idx_path],
                 capture_output=True,
                 text=True,
-                timeout=1800,
+                timeout=BUILD_TIMEOUT_S,
                 check=False,
             )
-            if b.returncode != 0:
-                checks[f"{fmt}_build"] = {"pass": False, "error": b.stderr[-500:]}
+            if base.returncode != 0:
+                checks[f"{fmt}_build"] = {"pass": False, "error": base.stderr[-DETAIL_CHARS:]}
                 continue
-            for name, (fa, n_kmers, expected) in sets.items():
-                result, err = run_optik_query(idx_path, fa, k, optik)
+            for name, (query_fa, n_kmers, expected) in sets.items():
+                result, err = run_optik_query(idx_path, query_fa, kmer_len, optik)
                 key = f"{fmt}_{name}_query"
                 if err:
                     checks[key] = {"pass": False, "error": err}
                     continue
                 got_pos = result.get("num_positive_kmers")
                 got_n = result.get("num_kmers")
-                ss = ss_counts.get(name)
-                ok = got_pos == expected and got_n == n_kmers
-                c = {
+                ss_count = ss_counts.get(name)
+                passed = got_pos == expected and got_n == n_kmers
+                check = {
                     "expected_positive": expected,
                     "optik_positive": got_pos,
                     "optik_kmers": got_n,
                     "expected_kmers": n_kmers,
                 }
-                if ss is not None:
-                    c["sshash_positive"] = ss.get("num_positive_kmers")
-                    c["sshash_kmers"] = ss.get("num_kmers")
-                    ok = (
-                        ok
-                        and ss.get("num_positive_kmers") == got_pos
-                        and ss.get("num_kmers") == got_n
+                if ss_count is not None:
+                    check["sshash_positive"] = ss_count.get("num_positive_kmers")
+                    check["sshash_kmers"] = ss_count.get("num_kmers")
+                    passed = (
+                        passed
+                        and ss_count.get("num_positive_kmers") == got_pos
+                        and ss_count.get("num_kmers") == got_n
                     )
-                c["pass"] = ok
-                c["detail"] = (
+                check["pass"] = passed
+                check["detail"] = (
                     "optik == oracle and == SSHash's reported counts"
-                    if ss is not None
+                    if ss_count is not None
                     else "optik == oracle"
                 )
-                checks[key] = c
+                checks[key] = check
 
     finally:
         import shutil
@@ -348,10 +340,10 @@ def main():
     parser.add_argument(
         "--max-query-kmers",
         type=int,
-        default=50000,
+        default=DEFAULT_MAX_QUERY_KMERS,
         help="Max k-mers in positive query set",
     )
-    parser.add_argument("-s", "--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("-s", "--seed", type=int, default=DEFAULT_SEED, help="Random seed")
     args = parser.parse_args()
 
     if not os.path.isfile(args.optik):
@@ -362,9 +354,9 @@ def main():
 
     # Overall verdict
     all_pass = all(
-        c.get("pass", False)
-        for c in checks.values()
-        if isinstance(c, dict) and "pass" in c
+        check.get("pass", False)
+        for check in checks.values()
+        if isinstance(check, dict) and "pass" in check
     )
     overall = "PASS" if all_pass else "FAIL"
 

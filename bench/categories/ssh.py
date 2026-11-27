@@ -3,20 +3,16 @@
 optik has one runner per index.
 
     OptikSpssRunner
-        The SPSS index built by ``optik build-spss``, with super-k-mer strings, a
-        minimizer MPHF, streaming queries and dense k-mer ids.  It is
-        compared with SSHash and SBWT.
+        The SPSS index built by ``optik build-spss``, with super-k-mer strings, a minimizer MPHF, streaming queries and dense k-mer ids.
+        It is compared with SSHash and SBWT.
 
     OptikFMRunner
-        The FM-index mode, a k-order BWT over the unitigs, built with
-        ``optik build-fm`` at several thread counts and queried with
-        ``optik query``.  It is a near-minimal exact membership index of a few bits per k-mer, compared with the
-        FMSI and KmerCamel FM-index pipeline.
+        The FM-index mode, a k-order BWT over the unitigs, built with ``optik build-fm`` at several thread counts and queried with ``optik query``.
+        It is a near-minimal exact membership index of a few bits per k-mer, compared with the FMSI and KmerCamel FM-index pipeline.
 
     SshashRunner
-        The reference SSHash implementation at m = k/2 (15 for k = 31, the
-        value optik-spss uses).  SSHash has no --canonical flag, since a
-        k-mer and its reverse complement always share a bucket.
+        The reference SSHash implementation at m = k/2 (15 for k = 31, the value optik-spss uses).
+        SSHash has no --canonical flag, since a k-mer and its reverse complement always share a bucket.
 
 Methodology
     * The headline parity basis is whole-process timing under hyperfine for the build and query phases, the same measurement for optik, sshash and sbwt.
@@ -33,8 +29,11 @@ import time
 from pathlib import Path
 
 from config import PATHS
+from diagnostics import DETAIL_CHARS
+from units import BITS_PER_BYTE, BYTES_PER_MIB, NS_PER_SECOND
 
 from ._base import (
+    DEFAULT_BUILD_THREADS,
     ThreadSweepMixin,
     ToolRunner,
     check_binary,
@@ -54,6 +53,10 @@ BENCH_TIMEOUT = 300
 # Random independent k-mers for the random-lookup throughput benchmark.
 # Each is a uniformly random sequence, so consecutive lookups share no cache locality.
 RANDOM_KMER_COUNT = 1_000_000
+
+
+# SSHash needs -m, and no paper gives one for these inputs, so m = k / 2.
+K_PER_MINIMIZER_LEN = 2
 
 
 def _parse_report_field(text, key):
@@ -92,24 +95,24 @@ def _parse_tsv_report(text):
     return out
 
 
-def _positive_metrics(hf):
+def _positive_metrics(hyperfine_res):
     """Nanoseconds per k-mer and positive fraction of a high-hit query run."""
-    if "error" in hf:
-        return {"pos_error": hf["error"]}
-    out = hf["stdout"] + hf["stderr"]
-    n = _parse_report_field(out, "num_kmers")
+    if "error" in hyperfine_res:
+        return {"pos_error": hyperfine_res["error"]}
+    out = hyperfine_res["stdout"] + hyperfine_res["stderr"]
+    num_kmers = _parse_report_field(out, "num_kmers")
     pos = _parse_report_field(out, "num_positive_kmers")
-    res = {"pos_query_s": round(hf["mean_s"], 4), "pos_rss_mb": hf["max_rss_mb"]}
-    if n:
-        res["pos_ns_per_kmer"] = round(hf["mean_s"] * 1e9 / n, 2)
-        res["pos_query_kmers"] = n
+    res = {"pos_query_s": round(hyperfine_res["mean_s"], 4), "pos_rss_mb": hyperfine_res["max_rss_mb"]}
+    if num_kmers:
+        res["pos_ns_per_kmer"] = round(hyperfine_res["mean_s"] * NS_PER_SECOND / num_kmers, 2)
+        res["pos_query_kmers"] = num_kmers
         if pos is not None:
-            res["pos_positive_frac"] = round(pos / n, 4)
+            res["pos_positive_frac"] = round(pos / num_kmers, 4)
             res["pos_positive"] = pos
     return res
 
 
-def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False):
+def _run_optik_build_query(dataset, ctx, subcommand, label="optik", sweep_build=False):
     """Benchmark one of optik's serialized indexes.
 
     The index is built with ``optik <subcommand>`` (``build-spss`` or ``build-fm``) and queried with ``optik query``, which recognizes the index format from its magic number.
@@ -133,29 +136,29 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
         def run(self):
             return {}
 
-    _h = _Helper(ds, ctx)
-    td = _h.tmpdir(label)
+    helper = _Helper(dataset, ctx)
+    tmp_dir = helper.tmpdir(label)
     try:
-        unitigs = ensure_uncompressed(ds["unitigs"], td)
-        queries = ensure_uncompressed(ds["queries"], td)
-        k = int(ds["k"])
+        unitigs = ensure_uncompressed(dataset["unitigs"], tmp_dir)
+        queries = ensure_uncompressed(dataset["queries"], tmp_dir)
+        kmer_len = int(dataset["k"])
         verbose = ctx.get("verbose", False)
 
         # optik query runs records in parallel on -t threads, and the index format is recognized from the file magic, so one command serves both FM and SPSS indexes.
         # The headline parity number is the query at the default thread count (threads_query, matching the single-threaded sshash query), and a thread sweep reports the scaling.
-        idx_path = f"{td}/optik.idx"
+        idx_path = f"{tmp_dir}/optik.idx"
         q_default = int(ctx.get("threads_query", 1))
 
         def query_cmd(threads):
             """optik query command, with -t when threads is positive."""
-            cmd = [optik_bin, "query", "-i", idx_path, "-q", queries, "-k", str(k)]
+            cmd = [optik_bin, "query", "-i", idx_path, "-q", queries, "-k", str(kmer_len)]
             if threads is not None and threads > 0:
                 cmd += ["-t", str(threads)]
             return cmd
 
         def build_cmd(threads):
             """optik build command for the subcommand, with -t when threads is positive."""
-            cmd = [optik_bin, subcommand, "-i", unitigs, "-k", str(k), "-o", idx_path]
+            cmd = [optik_bin, subcommand, "-i", unitigs, "-k", str(kmer_len), "-o", idx_path]
             if subcommand == "build-fm":
                 cmd += ["-c", "1"]
             # the same -t as SSHash's build, since both build in parallel
@@ -169,17 +172,17 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
 
         # One untimed build captures the TSV index metrics and leaves an index on disk for the query phase.
         # Its output is the same at any thread count.
-        ts = int(ctx.get("threads_build", 8)) if sweep_build else 1
-        proc, _ = run_cmd(build_cmd(ts), timeout=BUILD_TIMEOUT, verbose=verbose, cwd=td)
+        build_threads = int(ctx.get("threads_build", DEFAULT_BUILD_THREADS)) if sweep_build else 1
+        proc, _ = run_cmd(build_cmd(build_threads), timeout=BUILD_TIMEOUT, verbose=verbose, cwd=tmp_dir)
         if proc.returncode != 0:
-            return {"error": f"optik {subcommand} failed: {proc.stderr[:500]}"}
+            return {"error": f"optik {subcommand} failed: {proc.stderr[:DETAIL_CHARS]}"}
         build_tsv = _parse_tsv_report(proc.stdout + proc.stderr)
 
         gate_proc, _ = run_cmd(
-            query_cmd(q_default), timeout=QUERY_TIMEOUT, verbose=verbose, cwd=td
+            query_cmd(q_default), timeout=QUERY_TIMEOUT, verbose=verbose, cwd=tmp_dir
         )
         if gate_proc.returncode != 0:
-            return {"error": f"optik query gate failed: {gate_proc.stderr[:500]}"}
+            return {"error": f"optik query gate failed: {gate_proc.stderr[:DETAIL_CHARS]}"}
         try:
             gate_query_report(
                 gate_proc.stdout + gate_proc.stderr, "optik", f"{subcommand}+query"
@@ -190,20 +193,20 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
         # The build phase is a thread sweep (build-fm) or a single run (build-spss).
         sweep_flat = {}
         if sweep_build:
-            sweep_flat, _, hf_head, _hf_head_t = _h.run_sweep(
+            sweep_flat, _, hf_head, _hf_head_t = helper.run_sweep(
                 "build",
                 build_cmd,
-                gate=lambda p: p.returncode == 0,
+                gate=lambda proc: proc.returncode == 0,
                 timeout=BUILD_TIMEOUT,
             )
             if hf_head is not None:
                 hf_build = hf_head
             else:
-                hf_build = _h.run_hyperfine(
-                    build_cmd(int(ctx.get("threads_build", 8))), timeout=BUILD_TIMEOUT
+                hf_build = helper.run_hyperfine(
+                    build_cmd(int(ctx.get("threads_build", DEFAULT_BUILD_THREADS))), timeout=BUILD_TIMEOUT
                 )
         else:
-            hf_build = _h.run_hyperfine(build_cmd(None), timeout=BUILD_TIMEOUT)
+            hf_build = helper.run_hyperfine(build_cmd(None), timeout=BUILD_TIMEOUT)
         if "error" in hf_build:
             return {"error": f"optik {subcommand} hyperfine: {hf_build['error']}"}
 
@@ -217,12 +220,12 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
             # Index bytes on disk, the same basis as SSHash's file size.
             # The tool's own in-memory accounting is kept separately.
             "idx_mb": (
-                round(os.path.getsize(idx_path) / (1024 * 1024), 4)
+                round(os.path.getsize(idx_path) / BYTES_PER_MIB, 4)
                 if os.path.exists(idx_path)
                 else None
             ),
             "bits_per_kmer": (
-                round(os.path.getsize(idx_path) * 8 / build_tsv["distinct_kmers"], 2)
+                round(os.path.getsize(idx_path) * BITS_PER_BYTE / build_tsv["distinct_kmers"], 2)
                 if os.path.exists(idx_path) and build_tsv.get("distinct_kmers")
                 else None
             ),
@@ -236,11 +239,11 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
 
         # The streaming query runs a -t thread sweep like the build phase, after the correctness gate above.
         # The sweep's headline is the hyperfine run at the default thread count (threads_query), which gives the parity metric next to the single-threaded sshash query.
-        query_flat, _query_rows, hf_query, hf_query_t = _h.run_sweep(
+        query_flat, _query_rows, hf_query, hf_query_t = helper.run_sweep(
             "query", query_cmd, timeout=QUERY_TIMEOUT
         )
         if hf_query is None:
-            hf_query = _h.run_hyperfine(query_cmd(q_default), timeout=QUERY_TIMEOUT)
+            hf_query = helper.run_hyperfine(query_cmd(q_default), timeout=QUERY_TIMEOUT)
             hf_query_t = q_default
         if "error" in hf_query:
             result["error_query"] = hf_query["error"]
@@ -262,7 +265,7 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
         num_searches = _parse_report_field(q_out, "num_searches")
 
         if num_kmers:
-            result["ns_per_query"] = round((hf_query["mean_s"] * 1e9) / num_kmers, 2)
+            result["ns_per_query"] = round((hf_query["mean_s"] * NS_PER_SECOND) / num_kmers, 2)
             result["queries_s"] = round(num_kmers / hf_query["mean_s"], 2)
             result["query_kmers"] = num_kmers
         result["query_positive"] = num_positive
@@ -270,8 +273,8 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
         result["num_searches"] = num_searches
 
         # Throughput of random independent k-mer lookups, timed by hyperfine
-        rand_path = f"{td}/random_kmers.fa"
-        generate_random_kmers(rand_path, k, RANDOM_KMER_COUNT)
+        rand_path = f"{tmp_dir}/random_kmers.fa"
+        generate_random_kmers(rand_path, kmer_len, RANDOM_KMER_COUNT)
 
         def query_cmd_rand(threads):
             """optik query command over the random k-mer file."""
@@ -283,12 +286,12 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
                 "-q",
                 rand_path,
                 "-k",
-                str(k),
+                str(kmer_len),
             ] + (["-t", str(threads)] if threads and threads > 0 else [])
 
-        hf_rand = _h.run_hyperfine(query_cmd_rand(q_default), timeout=QUERY_TIMEOUT)
+        hf_rand = helper.run_hyperfine(query_cmd_rand(q_default), timeout=QUERY_TIMEOUT)
         if "error" not in hf_rand:
-            result["rand_ns"] = round((hf_rand["mean_s"] * 1e9) / RANDOM_KMER_COUNT, 2)
+            result["rand_ns"] = round((hf_rand["mean_s"] * NS_PER_SECOND) / RANDOM_KMER_COUNT, 2)
             result["rand_rss_mb"] = hf_rand["max_rss_mb"]
             rand_out = hf_rand["stdout"] + hf_rand["stderr"]
             result["rand_positive"] = _parse_report_field(
@@ -299,9 +302,9 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
             )
 
         # High-hit workload, made of reads sampled from the indexed sequences
-        pos_path = generate_positive_reads(unitigs, f"{td}/positive_reads.fa")
-        hf_pos = _h.run_hyperfine(
-            [optik_bin, "query", "-i", idx_path, "-q", pos_path, "-k", str(k)]
+        pos_path = generate_positive_reads(unitigs, f"{tmp_dir}/positive_reads.fa")
+        hf_pos = helper.run_hyperfine(
+            [optik_bin, "query", "-i", idx_path, "-q", pos_path, "-k", str(kmer_len)]
             + (["-t", str(q_default)] if q_default and q_default > 0 else []),
             timeout=QUERY_TIMEOUT,
         )
@@ -310,7 +313,7 @@ def _run_optik_build_query(ds, ctx, subcommand, label="optik", sweep_build=False
         return result
 
     finally:
-        _h.cleanup(td)
+        helper.cleanup(tmp_dir)
 
 
 class SshashRunner(ThreadSweepMixin, ToolRunner):
@@ -326,9 +329,9 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
 
     @classmethod
     def binary_path(cls):
-        p = PATHS.get("sshash")
-        if p and check_binary(p):
-            return str(p)
+        path = PATHS.get("sshash")
+        if path and check_binary(path):
+            return str(path)
         return None
 
     @property
@@ -337,22 +340,22 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
         return self.binary_path()
 
     def run(self):
-        td = self.tmpdir("sshash")
+        tmp_dir = self.tmpdir("sshash")
         try:
-            unitigs = ensure_uncompressed(self.ds["unitigs"], td)
-            queries = ensure_uncompressed(self.ds["queries"], td)
+            unitigs = ensure_uncompressed(self.dataset["unitigs"], tmp_dir)
+            queries = ensure_uncompressed(self.dataset["queries"], tmp_dir)
             # Without --multiline SSHash reads one sequence per line, so wrapped FASTA queries are unwrapped to one line per record.
             with open(queries) as _fh:
                 if _fh.read(1) == ">":
-                    queries = unwrap_fasta(queries, td)
-            k = int(self.ds["k"])
-            m = max(k // 2, 1)
+                    queries = unwrap_fasta(queries, tmp_dir)
+            kmer_len = int(self.dataset["k"])
+            minimizer_len = max(kmer_len // K_PER_MINIMIZER_LEN, 1)
             verbose = self.ctx.get("verbose", False)
 
-            idx_path = f"{td}/index.sshash"
-            default_t = int(self.ctx.get("threads_build", 8))
+            idx_path = f"{tmp_dir}/index.sshash"
+            default_t = int(self.ctx.get("threads_build", DEFAULT_BUILD_THREADS))
 
-            def build_cmd(t):
+            def build_cmd(threads):
                 """argv of sshash build with t threads."""
                 return [
                     self._sshash,
@@ -360,43 +363,43 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
                     "-i",
                     unitigs,
                     "-k",
-                    str(k),
+                    str(kmer_len),
                     "-m",
-                    str(m),
+                    str(minimizer_len),
                     "-o",
                     idx_path,
                     "-t",
-                    str(t if t else default_t),
+                    str(threads if threads else default_t),
                     "-d",
-                    td,  # scratch files go to the run directory, not the cwd
+                    tmp_dir,  # scratch files go to the run directory, not the cwd
                 ]
 
             # The build phase is the auto thread sweep.
             # Its first point runs once untimed as the gate, and that run is captured to parse the distinct k-mer count and to leave an index on disk for the queries.
             gate_out = {}
 
-            def gate(p):
+            def gate(proc):
                 """Keep the gate run's output and pass when it exited 0."""
-                if p.returncode == 0:
-                    gate_out["text"] = p.stdout + p.stderr
-                return p.returncode == 0
+                if proc.returncode == 0:
+                    gate_out["text"] = proc.stdout + proc.stderr
+                return proc.returncode == 0
 
             sweep_flat, _, hf_build, _hf_build_t = self.run_sweep(
                 "build", build_cmd, gate=gate, timeout=BUILD_TIMEOUT
             )
             if hf_build is None:
-                hf_build = self.run_hyperfine(build_cmd(default_t), cwd=td)
+                hf_build = self.run_hyperfine(build_cmd(default_t), cwd=tmp_dir)
             if "error" in hf_build:
                 return {"error": f"sshash build hyperfine: {hf_build['error']}"}
 
-            # The distinct k-mer count comes from one untimed --verbose build, kept out of the timed runs so that SSHash's timings carry no logging overhead.
-            pv, _ = run_cmd(
+            # The distinct k-mer count comes from one untimed --verbose build, kept out of the timed runs so that SSHash's timings include no logging overhead.
+            verbose_proc, _ = run_cmd(
                 build_cmd(default_t) + ["--verbose"],
                 timeout=BUILD_TIMEOUT,
                 verbose=verbose,
-                cwd=td,
+                cwd=tmp_dir,
             )
-            build_out = pv.stdout + pv.stderr
+            build_out = verbose_proc.stdout + verbose_proc.stderr
             distinct_kmers = None
             for line in build_out.split("\n"):
                 parts = line.split()
@@ -415,8 +418,9 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
                 "build_s_max": round(hf_build["max_s"], 4),
                 "build_runs": len(hf_build["times_s"]),
                 "build_rss_mb": hf_build["max_rss_mb"],
-                "idx_mb": round(idx_bytes / (1024 * 1024), 4) if idx_bytes else None,
-                "bits_per_kmer": round((idx_bytes * 8) / distinct_kmers, 2)
+                "idx_mb": round(idx_bytes / BYTES_PER_MIB, 4) if idx_bytes else None,
+                # Bits per k-mer count the whole index file, so every stored structure is included.
+                "bits_per_kmer": round((idx_bytes * BITS_PER_BYTE) / distinct_kmers, 2)
                 if (idx_bytes and distinct_kmers)
                 else None,
                 "distinct_kmers": distinct_kmers,
@@ -424,23 +428,24 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
             result.update(sweep_flat)
 
             bench_cmd = [self._sshash, "bench", "-i", idx_path]
-            t0 = time.time()
+            start = time.time()
             proc_b, _ = run_cmd(bench_cmd, timeout=BENCH_TIMEOUT, verbose=verbose)
-            result["warm_bench_s"] = round(time.time() - t0, 4)
+            result["warm_bench_s"] = round(time.time() - start, 4)
 
             bench_out = proc_b.stdout + proc_b.stderr
+            # SSHash's bench prints its timings as one JSON line near the end. The last such line is the one read.
             for line in reversed(bench_out.split("\n")):
                 line_s = line.strip()
                 if line_s.startswith("{") and line_s.endswith("}"):
                     try:
                         bench_json = json.loads(line_s)
                         for key, val in bench_json.items():
-                            kl = key.lower()
-                            if "positive lookup" in kl:
+                            key_lower = key.lower()
+                            if "positive lookup" in key_lower:
                                 result["warm_rand_bench_ns"] = round(float(val), 2)
-                            elif "negative lookup" in kl:
+                            elif "negative lookup" in key_lower:
                                 result["warm_rand_neg_bench_ns"] = round(float(val), 2)
-                            elif "access" in kl:
+                            elif "access" in key_lower:
                                 result["warm_access_bench_ns"] = round(float(val), 2)
                     except (json.JSONDecodeError, ValueError, TypeError):
                         pass
@@ -457,10 +462,10 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
             ]
             # Correctness gate, one untimed run whose report must add up (total == positive + negative) before hyperfine timing may run.
             gate_proc, _ = run_cmd(
-                query_cmd, timeout=QUERY_TIMEOUT, verbose=verbose, cwd=td
+                query_cmd, timeout=QUERY_TIMEOUT, verbose=verbose, cwd=tmp_dir
             )
             if gate_proc.returncode != 0:
-                return {"error": f"sshash query gate failed: {gate_proc.stderr[:500]}"}
+                return {"error": f"sshash query gate failed: {gate_proc.stderr[:DETAIL_CHARS]}"}
             try:
                 gate_query_report(
                     gate_proc.stdout + gate_proc.stderr, "sshash", "query"
@@ -487,7 +492,7 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
 
             if num_kmers:
                 result["ns_per_query"] = round(
-                    (hf_query["mean_s"] * 1e9) / num_kmers, 2
+                    (hf_query["mean_s"] * NS_PER_SECOND) / num_kmers, 2
                 )
                 result["queries_s"] = round(num_kmers / hf_query["mean_s"], 2)
                 result["query_kmers"] = num_kmers
@@ -496,8 +501,8 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
                 if num_searches is not None:
                     result["num_searches"] = num_searches
 
-            rand_path = f"{td}/random_kmers.fa"
-            generate_random_kmers(rand_path, k, RANDOM_KMER_COUNT)
+            rand_path = f"{tmp_dir}/random_kmers.fa"
+            generate_random_kmers(rand_path, kmer_len, RANDOM_KMER_COUNT)
 
             rand_cmd = [
                 self._sshash,
@@ -510,7 +515,7 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
             hf_rand = self.run_hyperfine(rand_cmd, timeout=QUERY_TIMEOUT)
             if "error" not in hf_rand:
                 result["rand_ns"] = round(
-                    (hf_rand["mean_s"] * 1e9) / RANDOM_KMER_COUNT, 2
+                    (hf_rand["mean_s"] * NS_PER_SECOND) / RANDOM_KMER_COUNT, 2
                 )
                 result["rand_rss_mb"] = hf_rand["max_rss_mb"]
                 rand_out = hf_rand["stdout"] + hf_rand["stderr"]
@@ -522,7 +527,7 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
                 )
 
             # High-hit workload, reads sampled from the indexed sequences
-            pos_path = generate_positive_reads(unitigs, f"{td}/positive_reads.fa")
+            pos_path = generate_positive_reads(unitigs, f"{tmp_dir}/positive_reads.fa")
             hf_pos = self.run_hyperfine(
                 [self._sshash, "query", "-i", idx_path, "-q", pos_path],
                 timeout=QUERY_TIMEOUT,
@@ -532,7 +537,7 @@ class SshashRunner(ThreadSweepMixin, ToolRunner):
             return result
 
         finally:
-            self.cleanup(td)
+            self.cleanup(tmp_dir)
 
 
 class OptikSpssRunner(ToolRunner):
@@ -547,14 +552,14 @@ class OptikSpssRunner(ToolRunner):
 
     @classmethod
     def binary_path(cls):
-        p = PATHS.get("optik")
-        if p and check_binary(p):
-            return str(p)
+        path = PATHS.get("optik")
+        if path and check_binary(path):
+            return str(path)
         return None
 
     def run(self):
         return _run_optik_build_query(
-            self.ds,
+            self.dataset,
             self.ctx,
             subcommand="build-spss",
             label="optik_spss",
@@ -575,12 +580,12 @@ class OptikFMRunner(ToolRunner):
 
     @classmethod
     def binary_path(cls):
-        p = PATHS.get("optik")
-        if p and check_binary(p):
-            return str(p)
+        path = PATHS.get("optik")
+        if path and check_binary(path):
+            return str(path)
         return None
 
     def run(self):
         return _run_optik_build_query(
-            self.ds, self.ctx, subcommand="build-fm", label="optik_fm", sweep_build=True
+            self.dataset, self.ctx, subcommand="build-fm", label="optik_fm", sweep_build=True
         )

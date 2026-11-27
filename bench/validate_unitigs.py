@@ -37,102 +37,145 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
+from diagnostics import DETAIL_CHARS
+from dna import read_fasta
+from sam_spec import (
+    KDBG_ABUNDANCE_BYTES,
+    KDBG_COUNT_OFFSET,
+    KDBG_HEADER_BYTES,
+    KDBG_IN_MASK_SHIFT,
+    KDBG_K_OFFSET,
+    KDBG_KEY_BYTES,
+    KDBG_MAGIC,
+    KDBG_NODE_BYTES,
+    SAM_TAG_NAME_LEN,
+    SAM_TAG_PREFIX_LEN,
+    GfaLinkCol,
+    GfaSegmentCol,
+)
+
+# defaults of the CLI and of validate()
+DEFAULT_K = 31
+DEFAULT_THREADS = 4
+# offending segment names listed per well-formedness failure, and tag mismatches shown (each cut to EXAMPLE_CHARS)
+MAX_LISTED = 5
+MAX_EXAMPLES = 3
+EXAMPLE_CHARS = 160
+# value of a missing LN or KC tag, which never matches
+MISSING_TAG = -1
+# km is written with 2 decimals, so it may differ from KC / k-mers by up to half the last digit (plus float slack)
+KM_TOLERANCE = 0.005
+FLOAT_SLACK = 1e-9
+
 ENC = {"A": 0, "C": 1, "G": 2, "T": 3}
+# Packed k-mers hold two bits per base, so BASE_MASK selects one base and BASE_MASK - code complements it.
+BITS_PER_BASE = 2
+BASE_MASK = (1 << BITS_PER_BASE) - 1
+NUM_BASES = 1 << BITS_PER_BASE
+# revcomp_packed() works on the 8 bytes of a packed word, four bases to a byte.
+BYTE_VALUES = 256
+KMER_WORD_BYTES = 8
+BASES_PER_BYTE = 8 // BITS_PER_BASE
+MAX_PACKED_K = KMER_WORD_BYTES * BASES_PER_BYTE
 
 
-def read_fasta(path):
-    """Yield FASTA or FASTQ records, plain or .gz, with the reader validate_dbg shares."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from validate_dbg import read_fasta as _read
-
-    return _read(path)
-
-
-def windows(seq, w):
-    """Yield the packed forward w-mers of seq, skipping any that contain a non-ACGT base."""
-    mask = (1 << (2 * w)) - 1
-    v = 0
+def windows(seq, kmer_len):
+    """Yield the packed forward k-mers of length `kmer_len` of seq, skipping any that contain a non-ACGT base."""
+    mask = (1 << (BITS_PER_BASE * kmer_len)) - 1
+    packed = 0
     valid = 0
-    for ch in seq.upper():
-        b = ENC.get(ch)
-        if b is None:
+    for char in seq.upper():
+        code = ENC.get(char)
+        if code is None:
             valid = 0
-            v = 0
+            packed = 0
             continue
-        v = ((v << 2) | b) & mask
+        packed = ((packed << BITS_PER_BASE) | code) & mask
         valid += 1
-        if valid >= w:
-            yield v
+        if valid >= kmer_len:
+            yield packed
 
 
 # _RC_BYTE[b] is byte b (four 2-bit bases) complemented, with its bases in reverse order.
-# rc() maps the 8 bytes of a packed w-mer (w <= 32) through it and reads them back in reverse byte order, which yields the whole reverse complement at C speed.
+# revcomp_packed() maps the 8 bytes of a packed w-mer (w <= 32) through it and reads them back in reverse byte order, which yields the whole reverse complement at C speed.
 # A loop per base made the oracle take minutes per genome.
 _RC_BYTE = bytes(
-    sum(((3 - ((b >> (2 * i)) & 3)) << (2 * (3 - i))) for i in range(4))
-    for b in range(256)
+    sum(((BASE_MASK - ((b >> (BITS_PER_BASE * i)) & BASE_MASK)) << (BITS_PER_BASE * (BASES_PER_BYTE - 1 - i))) for i in range(BASES_PER_BYTE))
+    for b in range(BYTE_VALUES)
 )
 
 
-def rc(v, w):
-    """Reverse complement of the packed w-mer v (2 bits per base, w <= 32).
+def revcomp_packed(packed, kmer_len):
+    """Reverse complement of the packed k-mer `packed` (2 bits per base, kmer_len <= 32).
 
-    The 32 - w unused high bases complement into the low end and are shifted out."""
-    return int.from_bytes(v.to_bytes(8, "little").translate(_RC_BYTE), "big") >> (
-        2 * (32 - w)
+    The 32 - kmer_len unused high bases complement into the low end and are shifted out."""
+    return int.from_bytes(packed.to_bytes(KMER_WORD_BYTES, "little").translate(_RC_BYTE), "big") >> (
+        BITS_PER_BASE * (MAX_PACKED_K - kmer_len)
     )
 
 
-def _rc_slow(v, w):
-    """Base-by-base reverse complement, the reference test_harness checks rc() against."""
-    r = 0
-    for _ in range(w):
-        r = (r << 2) | (3 - (v & 3))
-        v >>= 2
-    return r
+def _rc_slow(packed, kmer_len):
+    """Base-by-base reverse complement, the reference test_harness checks revcomp_packed() against."""
+    result = 0
+    for _ in range(kmer_len):
+        result = (result << BITS_PER_BASE) | (BASE_MASK - (packed & BASE_MASK))
+        packed >>= BITS_PER_BASE
+    return result
 
 
-def canon(v, w):
-    """Canonical form of the packed w-mer v, the smaller of v and its reverse complement."""
-    r = rc(v, w)
-    return min(r, v)
+def canon(packed, kmer_len):
+    """Canonical form of the packed k-mer `packed`, the smaller of it and its reverse complement."""
+    rev = revcomp_packed(packed, kmer_len)
+    return min(rev, packed)
 
 
 _DIGITS = str.maketrans("ACGT", "0123")
 
 
-def pack(s):
+def pack(seq):
     """Packed value of an ACGT string (A=0 to T=3), i.e. its base-4 number.
 
     Callers pass only ACGT strings, since segments are checked before packing."""
-    return int(s.translate(_DIGITS), 4) if s else 0
+    return int(seq.translate(_DIGITS), NUM_BASES) if seq else 0
 
 
-def _pack_slow(s):
+def _pack_slow(seq):
     """Base-by-base pack(), the reference test_harness checks pack() against."""
-    v = 0
-    for ch in s:
-        v = (v << 2) | ENC[ch]
-    return v
+    packed = 0
+    for char in seq:
+        packed = (packed << BITS_PER_BASE) | ENC[char]
+    return packed
 
 
 def parse_gfa(path):
     """Parse a GFA into segments {name: SEQ}, links, S-line tags {name: {tag: value}} and the names that occur on more than one S line."""
     segs, links, tags, dup_names = {}, [], {}, []
-    with open(path) as fh:
-        for line in fh:
-            t = line.rstrip("\n").split("\t")
-            if t[0] == "S":
-                if t[1] in segs:
-                    dup_names.append(t[1])
-                segs[t[1]] = t[2].upper()
-                tags[t[1]] = {f[:2]: f[5:] for f in t[3:] if len(f) > 5 and f[2] == ":"}
-            elif t[0] == "L":
-                links.append((t[1], t[2], t[3], t[4], t[5]))
+    with open(path) as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if fields[0] == "S":
+                if fields[GfaSegmentCol.NAME] in segs:
+                    dup_names.append(fields[GfaSegmentCol.NAME])
+                segs[fields[GfaSegmentCol.NAME]] = fields[GfaSegmentCol.SEQ].upper()
+                tags[fields[GfaSegmentCol.NAME]] = {
+                    field[:SAM_TAG_NAME_LEN]: field[SAM_TAG_PREFIX_LEN:]
+                    for field in fields[GfaSegmentCol.TAGS:]
+                    if len(field) > SAM_TAG_PREFIX_LEN and field[SAM_TAG_NAME_LEN] == ":"
+                }
+            elif fields[0] == "L":
+                links.append(
+                    (
+                        fields[GfaLinkCol.FROM],
+                        fields[GfaLinkCol.FROM_ORIENT],
+                        fields[GfaLinkCol.TO],
+                        fields[GfaLinkCol.TO_ORIENT],
+                        fields[GfaLinkCol.OVERLAP],
+                    )
+                )
     return segs, links, tags, dup_names
 
 
-def oracle(input_path, k, min_count=1):
+def oracle(input_path, kmer_len, min_count=1):
     """Independent edge-centric oracle built from the raw input.
 
     Returns (solid, kp1, linked, counts).
@@ -144,23 +187,23 @@ def oracle(input_path, k, min_count=1):
     kp1 = set()
     linked = set()
     for _, seq in read_fasta(input_path):
-        for v in windows(seq, k):
-            counts[canon(v, k)] += 1
-        for m in windows(seq, k + 1):
-            kp1.add(m)
-            linked.add(canon(m >> 2, k))
-            linked.add(canon(m & ((1 << (2 * k)) - 1), k))
-    solid = {c for c, n in counts.items() if n >= min_count}
+        for packed in windows(seq, kmer_len):
+            counts[canon(packed, kmer_len)] += 1
+        for edge in windows(seq, kmer_len + 1):
+            kp1.add(edge)
+            linked.add(canon(edge >> BITS_PER_BASE, kmer_len))
+            linked.add(canon(edge & ((1 << (BITS_PER_BASE * kmer_len)) - 1), kmer_len))
+    solid = {kmer for kmer, count in counts.items() if count >= min_count}
     return solid, kp1, linked, counts
 
 
 def validate(
     input_path,
     gfa_path,
-    k,
+    kmer_len,
     min_count=1,
     cuttlefish=None,
-    threads=4,
+    threads=DEFAULT_THREADS,
     orc=None,
     kdbg=None,
 ):
@@ -168,45 +211,45 @@ def validate(
     args = argparse.Namespace(
         input=input_path,
         gfa=gfa_path,
-        k=k,
+        k=kmer_len,
         min_count=min_count,
         cuttlefish=cuttlefish,
         threads=threads,
     )
-    kmask = (1 << (2 * k)) - 1
+    kmask = (1 << (BITS_PER_BASE * kmer_len)) - 1
 
     solid, kp1, linked, counts = (
-        orc if orc is not None else oracle(args.input, k, args.min_count)
+        orc if orc is not None else oracle(args.input, kmer_len, args.min_count)
     )
 
     def has_edge(cur, nxt):
         """True when oriented edge cur -> nxt, with nxt = cur[1:] + b, is in the edge-centric graph."""
-        m = (cur << 2) | (nxt & 3)
-        return (m in kp1 or rc(m, k + 1) in kp1) and canon(nxt, k) in solid
+        edge = (cur << BITS_PER_BASE) | (nxt & BASE_MASK)
+        return (edge in kp1 or revcomp_packed(edge, kmer_len + 1) in kp1) and canon(nxt, kmer_len) in solid
 
     def succs(cur):
         """Successor k-mers of cur along edges of the graph."""
         out = []
-        for b in range(4):
-            nxt = ((cur << 2) | b) & kmask
+        for b in range(NUM_BASES):
+            nxt = ((cur << BITS_PER_BASE) | b) & kmask
             if has_edge(cur, nxt):
                 out.append(nxt)
         return out
 
     def indeg(nxt):
         """In-degree of the k-mer nxt, counted as the successors of its reverse complement."""
-        return len(succs(rc(nxt, k)))
+        return len(succs(revcomp_packed(nxt, kmer_len)))
 
     def compactable(cur):
         """The k-mer cur compacts into (unique successor with in-degree 1), or None."""
-        s = succs(cur)
-        if len(s) != 1:
+        successors = succs(cur)
+        if len(successors) != 1:
             return None
-        nxt = s[0]
-        if canon(nxt, k) == canon(cur, k):
+        nxt = successors[0]
+        if canon(nxt, kmer_len) == canon(cur, kmer_len):
             return None
-        if cur == rc(cur, k) or nxt == rc(
-            nxt, k
+        if cur == revcomp_packed(cur, kmer_len) or nxt == revcomp_packed(
+            nxt, kmer_len
         ):  # palindromes, possible at even k, stay single
             return None
         return nxt if indeg(nxt) == 1 else None
@@ -215,11 +258,11 @@ def validate(
     checks = {}
 
     # Segment well-formedness, checked before anything indexes by name or k-mer
-    bad_seq = [sid for sid, s in segs.items() if len(s) < k or set(s) - set("ACGT")]
+    bad_seq = [sid for sid, seq in segs.items() if len(seq) < kmer_len or set(seq) - set("ACGT")]
     checks["segments_wellformed"] = {
         "pass": not dup_names and not bad_seq and bool(segs) == bool(solid),
-        "duplicate_names": dup_names[:5],
-        "short_or_non_acgt": bad_seq[:5],
+        "duplicate_names": dup_names[:MAX_LISTED],
+        "short_or_non_acgt": bad_seq[:MAX_LISTED],
         "segments": len(segs),
     }
     for sid in bad_seq:  # unparseable segments are excluded, having already failed
@@ -228,29 +271,29 @@ def validate(
     # Partition
     occ = Counter()
     seg_kmers = {}
-    for sid, s in segs.items():
-        ks = [pack(s[i : i + k]) for i in range(len(s) - k + 1)]
-        seg_kmers[sid] = ks
-        for v in ks:
-            occ[canon(v, k)] += 1
+    for sid, seq in segs.items():
+        seg_packed = [pack(seq[i : i + kmer_len]) for i in range(len(seq) - kmer_len + 1)]
+        seg_kmers[sid] = seg_packed
+        for packed in seg_packed:
+            occ[canon(packed, kmer_len)] += 1
 
     # Tags, where LN is the length, KC the summed true abundance and km is KC per k-mer
     tag_bad = []
-    for sid, ks in seg_kmers.items():
-        tg = tags.get(sid, {})
-        want_kc = sum(counts.get(canon(v, k), 0) for v in ks)
+    for sid, seg_packed in seg_kmers.items():
+        seg_tags = tags.get(sid, {})
+        want_kc = sum(counts.get(canon(packed, kmer_len), 0) for packed in seg_packed)
         try:
-            ln_ok = int(tg.get("LN", -1)) == len(segs[sid])
-            kc_ok = int(tg.get("KC", -1)) == want_kc
-            km_ok = abs(float(tg.get("km", "nan")) - want_kc / len(ks)) <= 0.005 + 1e-9
+            ln_ok = int(seg_tags.get("LN", MISSING_TAG)) == len(segs[sid])
+            kc_ok = int(seg_tags.get("KC", MISSING_TAG)) == want_kc
+            km_ok = abs(float(seg_tags.get("km", "nan")) - want_kc / len(seg_packed)) <= KM_TOLERANCE + FLOAT_SLACK
         except ValueError:
             ln_ok = kc_ok = km_ok = False
         if not (ln_ok and kc_ok and km_ok):
-            tag_bad.append((sid, tg, {"LN": len(segs[sid]), "KC": want_kc}))
+            tag_bad.append((sid, seg_tags, {"LN": len(segs[sid]), "KC": want_kc}))
     checks["tags_exact"] = {
         "pass": not tag_bad,
         "bad_segments": len(tag_bad),
-        "examples": [str(x)[:160] for x in tag_bad[:3]],
+        "examples": [str(bad)[:EXAMPLE_CHARS] for bad in tag_bad[:MAX_EXAMPLES]],
     }
     got = set(occ)
     checks["kmer_set_equal"] = {
@@ -258,54 +301,54 @@ def validate(
         "only_gfa": len(got - solid),
         "only_oracle": len(solid - got),
     }
-    dups = sum(1 for n in occ.values() if n > 1)
+    dups = sum(1 for count in occ.values() if count > 1)
     checks["no_duplicates"] = {"pass": dups == 0, "duplicated_kmers": dups}
 
     # Path validity, interior compaction and maximality
     bad_path = bad_interior = non_max = 0
-    for ks in seg_kmers.values():
-        for a, b in itertools.pairwise(ks):
-            if not has_edge(a, b):
+    for seg_packed in seg_kmers.values():
+        for left, right in itertools.pairwise(seg_packed):
+            if not has_edge(left, right):
                 bad_path += 1
-            elif compactable(a) != b:
+            elif compactable(left) != right:
                 bad_interior += 1
-        first, last = ks[0], ks[-1]
+        first, last = seg_packed[0], seg_packed[-1]
         # The right end is last -> nxt when compactable, unless nxt closes a cycle onto first.
         nxt = compactable(last)
-        if nxt is not None and canon(nxt, k) != canon(first, k):
+        if nxt is not None and canon(nxt, kmer_len) != canon(first, kmer_len):
             non_max += 1
         # The left end is rc(first) -> prv when compactable, unless it closes onto last.
-        prv = compactable(rc(first, k))
-        if prv is not None and canon(prv, k) != canon(last, k):
+        prv = compactable(revcomp_packed(first, kmer_len))
+        if prv is not None and canon(prv, kmer_len) != canon(last, kmer_len):
             non_max += 1
     checks["paths_valid"] = {"pass": bad_path == 0, "bad_edges": bad_path}
     checks["interior_compact"] = {"pass": bad_interior == 0, "violations": bad_interior}
     checks["maximal"] = {"pass": non_max == 0, "extendable_ends": non_max}
 
     # Links
-    def norm(a, oa, b, ob):
+    def norm(from_seg, from_orient, to_seg, to_orient):
         """Orientation-independent key of a link, the smaller of it and its reverse."""
-        fwd = ((a, oa), (b, ob))
+        fwd = ((from_seg, from_orient), (to_seg, to_orient))
         flip = {"+": "-", "-": "+"}
-        rev = ((b, flip[ob]), (a, flip[oa]))
+        rev = ((to_seg, flip[to_orient]), (from_seg, flip[from_orient]))
         return min(fwd, rev)
 
     entry = {}
-    for sid, ks in seg_kmers.items():
-        entry.setdefault(ks[0], []).append((sid, "+"))
-        entry.setdefault(rc(ks[-1], k), []).append((sid, "-"))
+    for sid, seg_packed in seg_kmers.items():
+        entry.setdefault(seg_packed[0], []).append((sid, "+"))
+        entry.setdefault(revcomp_packed(seg_packed[-1], kmer_len), []).append((sid, "-"))
     want = set()
-    for sid, ks in seg_kmers.items():
-        for o, cur in (("+", ks[-1]), ("-", rc(ks[0], k))):
+    for sid, seg_packed in seg_kmers.items():
+        for orient, cur in (("+", seg_packed[-1]), ("-", revcomp_packed(seg_packed[0], kmer_len))):
             for nxt in succs(cur):
-                for tid, to in entry.get(nxt, []):
-                    want.add(norm(sid, o, tid, to))
+                for tid, to_orient in entry.get(nxt, []):
+                    want.add(norm(sid, orient, tid, to_orient))
     have = set()
     bad_ovl = 0
-    for a, oa, b, ob, ovl in links:
-        if ovl != f"{k - 1}M":
+    for from_seg, from_orient, to_seg, to_orient, ovl in links:
+        if ovl != f"{kmer_len - 1}M":
             bad_ovl += 1
-        have.add(norm(a, oa, b, ob))
+        have.add(norm(from_seg, from_orient, to_seg, to_orient))
     checks["links_exact"] = {
         "pass": have == want and bad_ovl == 0,
         "n_links": len(have),
@@ -316,14 +359,14 @@ def validate(
 
     # Optional -s node table (OKKDBG)
     if kdbg:
-        checks["kdbg_exact"] = validate_kdbg(kdbg, k, solid, counts, has_edge)
+        checks["kdbg_exact"] = validate_kdbg(kdbg, kmer_len, solid, counts, has_edge)
 
     # Optional partition parity with Cuttlefish (--read).
     # Cuttlefish filters (k+1)-mer edges by count while optik filters k-mers, so the graphs coincide only at min_count 1.
     if args.cuttlefish and os.path.isfile(args.cuttlefish) and args.min_count == 1:
-        with tempfile.TemporaryDirectory() as td:
-            pref = os.path.join(td, "cf")
-            p = subprocess.run(
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pref = os.path.join(tmp_dir, "cf")
+            proc = subprocess.run(
                 [
                     args.cuttlefish,
                     "build",
@@ -331,7 +374,7 @@ def validate(
                     "-s",
                     args.input,
                     "-k",
-                    str(k),
+                    str(kmer_len),
                     "-c",
                     str(args.min_count),
                     "-o",
@@ -339,57 +382,58 @@ def validate(
                     "-t",
                     str(args.threads),
                     "-w",
-                    td,
+                    tmp_dir,
                 ],
                 capture_output=True,
                 check=False,
             )
-            cf = pref + ".fa"
-            if p.returncode != 0 or not os.path.isfile(cf):
+            cf_fa = pref + ".fa"
+            if proc.returncode != 0 or not os.path.isfile(cf_fa):
                 checks["cuttlefish_partition"] = {
                     "pass": False,
-                    "error": p.stderr.decode()[-400:],
+                    "error": proc.stderr.decode()[-DETAIL_CHARS:],
                 }
             else:
                 # Exact partition, each unitig taken as the set of its canonical k-mers
-                def sig(s):
-                    """Set of canonical k-mers of sequence s."""
+                def sig(seq):
+                    """Set of canonical k-mers of `seq`."""
                     return frozenset(
-                        canon(pack(s[i : i + k]), k) for i in range(len(s) - k + 1)
+                        canon(pack(seq[i : i + kmer_len]), kmer_len) for i in range(len(seq) - kmer_len + 1)
                     )
 
-                ours = Counter(sig(s) for s in segs.values())
-                cf_seqs = [s.upper() for _, s in read_fasta(cf)]
-                theirs = Counter(sig(s) for s in cf_seqs)
+                ours = Counter(sig(seq) for seq in segs.values())
+                cf_seqs = [seq.upper() for _, seq in read_fasta(cf_fa)]
+                theirs = Counter(sig(seq) for seq in cf_seqs)
                 only_o, only_c = ours - theirs, theirs - ours
                 # Every disagreement is settled with the independent oracle.
                 # A Cuttlefish-only unitig is Cuttlefish's error if one of its internal joins is not compactable in the read edge set, which makes it a merge across a branch.
                 # An optik-only unitig is explained if its k-mers are input k-mers Cuttlefish's output dropped, or if they lie inside such an invalid Cuttlefish unitig.
                 cf_bad_kmers, cf_branch_cross = set(), 0
                 cf_all = set()
-                for sq in cf_seqs:
-                    ks = [pack(sq[i : i + k]) for i in range(len(sq) - k + 1)]
-                    cks = frozenset(canon(v, k) for v in ks)
+                for cf_seq in cf_seqs:
+                    seg_packed = [pack(cf_seq[i : i + kmer_len]) for i in range(len(cf_seq) - kmer_len + 1)]
+                    cks = frozenset(canon(packed, kmer_len) for packed in seg_packed)
                     cf_all |= cks
                     if cks in only_c and any(
-                        compactable(a) != b for a, b in itertools.pairwise(ks)
+                        compactable(left) != right for left, right in itertools.pairwise(seg_packed)
                     ):
                         cf_branch_cross += 1
                         cf_bad_kmers |= cks
                 unexplained_c = sum(
-                    n for u, n in only_c.items() if not (u <= cf_bad_kmers)
+                    count for unitig, count in only_c.items() if not (unitig <= cf_bad_kmers)
                 )
                 dropped = solid - cf_all
                 # Only k-mers never linked to a neighbour (isolated runs of length k between non-ACGT characters) are an accepted Cuttlefish omission.
-                dropped_isolated = {x for x in dropped if x not in linked}
+                dropped_isolated = {kmer for kmer in dropped if kmer not in linked}
                 unexplained_o = sum(
-                    n
-                    for u, n in only_o.items()
-                    if not all(x in dropped_isolated or x in cf_bad_kmers for x in u)
+                    count
+                    for unitig, count in only_o.items()
+                    if not all(kmer in dropped_isolated or kmer in cf_bad_kmers for kmer in unitig)
                 )
+                # Explaining differences only means something once optik's own unitigs pass every structural check.
                 optik_ok = all(
-                    checks[c]["pass"]
-                    for c in (
+                    checks[name]["pass"]
+                    for name in (
                         "kmer_set_equal",
                         "no_duplicates",
                         "paths_valid",
@@ -399,7 +443,7 @@ def validate(
                 )
                 checks["cuttlefish_partition"] = {
                     "pass": optik_ok and unexplained_c == 0 and unexplained_o == 0,
-                    "cmd": f"cuttlefish build --read -s {args.input} -k {k} -c {args.min_count}",
+                    "cmd": f"cuttlefish build --read -s {args.input} -k {kmer_len} -c {args.min_count}",
                     "optik_unitigs": sum(ours.values()),
                     "cuttlefish_unitigs": sum(theirs.values()),
                     "identical_unitigs": sum((ours & theirs).values()),
@@ -417,43 +461,43 @@ def validate(
     return checks
 
 
-def validate_kdbg(path, k, solid, counts, has_edge):
+def validate_kdbg(path, kmer_len, solid, counts, has_edge):
     """Check the dbruijn -s node table against the oracle.
 
     The OKKDBG layout is little-endian, "OKKDBG" | u8 k | u64 n | n x u64 sorted canonical k-mers | n x u32 abundances | n x u8 masks (in<<4 | out)."""
     import struct
 
     data = Path(path).read_bytes()
-    if data[:6] != b"OKKDBG" or len(data) < 15:
-        return {"pass": False, "error": f"bad header {data[:7]!r}"}
-    kk, n = data[6], struct.unpack_from("<Q", data, 7)[0]
-    if kk != k or len(data) != 15 + 13 * n:
+    if data[:KDBG_K_OFFSET] != KDBG_MAGIC or len(data) < KDBG_HEADER_BYTES:
+        return {"pass": False, "error": f"bad header {data[:KDBG_COUNT_OFFSET]!r}"}
+    file_k, num_nodes = data[KDBG_K_OFFSET], struct.unpack_from("<Q", data, KDBG_COUNT_OFFSET)[0]
+    if file_k != kmer_len or len(data) != KDBG_HEADER_BYTES + KDBG_NODE_BYTES * num_nodes:
         return {
             "pass": False,
-            "error": f"k={kk} n={n} size={len(data)} (want k={k}, {15 + 13 * n} bytes)",
+            "error": f"k={file_k} n={num_nodes} size={len(data)} (want k={kmer_len}, {KDBG_HEADER_BYTES + KDBG_NODE_BYTES * num_nodes} bytes)",
         }
-    keys = struct.unpack_from(f"<{n}Q", data, 15)
-    ab = struct.unpack_from(f"<{n}I", data, 15 + 8 * n)
-    masks = data[15 + 12 * n :]
-    kmask = (1 << (2 * k)) - 1
-    sorted_ok = all(a < b for a, b in itertools.pairwise(keys))
-    canon_ok = all(canon(c, k) == c for c in keys)
+    keys = struct.unpack_from(f"<{num_nodes}Q", data, KDBG_HEADER_BYTES)
+    abundances = struct.unpack_from(f"<{num_nodes}I", data, KDBG_HEADER_BYTES + KDBG_KEY_BYTES * num_nodes)
+    masks = data[KDBG_HEADER_BYTES + (KDBG_KEY_BYTES + KDBG_ABUNDANCE_BYTES) * num_nodes :]
+    kmask = (1 << (BITS_PER_BASE * kmer_len)) - 1
+    sorted_ok = all(prev_key < next_key for prev_key, next_key in itertools.pairwise(keys))
+    canon_ok = all(canon(key, kmer_len) == key for key in keys)
     set_ok = set(keys) == solid
-    ab_bad = sum(1 for c, a in zip(keys, ab, strict=False) if counts.get(c, 0) != a)
+    ab_bad = sum(1 for key, abundance in zip(keys, abundances, strict=False) if counts.get(key, 0) != abundance)
     mask_bad = 0
-    for c, m in zip(keys, masks, strict=False):
-        out = sum(1 << b for b in range(4) if has_edge(c, ((c << 2) | b) & kmask))
+    for key, mask in zip(keys, masks, strict=False):
+        out = sum(1 << b for b in range(NUM_BASES) if has_edge(key, ((key << BITS_PER_BASE) | b) & kmask))
         # The in-edge P -> c is the out-edge rc(c) -> rc(P).
         # has_edge checks the target's solidity, so this also requires the predecessor P to be solid (with -c > 1, predecessors below the cutoff are not nodes).
         inn = sum(
             1 << b
-            for b in range(4)
-            if has_edge(rc(c, k), rc((b << (2 * (k - 1))) | (c >> 2), k))
+            for b in range(NUM_BASES)
+            if has_edge(revcomp_packed(key, kmer_len), revcomp_packed((b << (BITS_PER_BASE * (kmer_len - 1))) | (key >> BITS_PER_BASE), kmer_len))
         )
-        mask_bad += m != ((inn << 4) | out)
+        mask_bad += mask != ((inn << KDBG_IN_MASK_SHIFT) | out)
     return {
         "pass": sorted_ok and canon_ok and set_ok and ab_bad == 0 and mask_bad == 0,
-        "nodes": n,
+        "nodes": num_nodes,
         "sorted": sorted_ok,
         "canonical": canon_ok,
         "set_equal": set_ok,
@@ -464,17 +508,17 @@ def validate_kdbg(path, k, solid, counts, has_edge):
 
 def main():
     """Check one GFA against its input and print the result."""
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("-i", "--input", required=True)
-    ap.add_argument("-g", "--gfa", required=True)
-    ap.add_argument("-k", type=int, default=31)
-    ap.add_argument("-c", "--min-count", type=int, default=1)
-    ap.add_argument("--cuttlefish", default=None)
-    ap.add_argument("--kdbg", default=None, help="also validate the -s node table")
-    ap.add_argument("-t", "--threads", type=int, default=4)
-    args = ap.parse_args()
+    parser.add_argument("-i", "--input", required=True)
+    parser.add_argument("-g", "--gfa", required=True)
+    parser.add_argument("-k", type=int, default=DEFAULT_K)
+    parser.add_argument("-c", "--min-count", type=int, default=1)
+    parser.add_argument("--cuttlefish", default=None)
+    parser.add_argument("--kdbg", default=None, help="also validate the -s node table")
+    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS)
+    args = parser.parse_args()
     checks = validate(
         args.input,
         args.gfa,
@@ -485,7 +529,7 @@ def main():
         kdbg=args.kdbg,
     )
     print(json.dumps(checks, indent=2))
-    fails = [n for n, c in checks.items() if not c["pass"]]
+    fails = [name for name, check in checks.items() if not check["pass"]]
     print("RESULT:", "FAIL " + ",".join(fails) if fails else "PASS", file=sys.stderr)
     return 1 if fails else 0
 

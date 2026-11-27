@@ -20,46 +20,62 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from typing import NamedTuple
+
+from checklog import CheckLog
 from config import PATHS
+from diagnostics import DETAIL_CHARS
+from dna import read_fasta
 from sam_spec import (
-    SAM_FLAG_REVERSE,
-    SAM_FLAG_SUPPLEMENTARY,
-    SAM_FLAG_UNMAPPED,
-    SAM_FLAGS_NOT_PRIMARY,
+    SAM_TAG_NAME_LEN,
+    SAM_TAG_PREFIX_LEN,
+    SamCol,
+    SamFlag,
 )
 
-FAILS = []
+DEFAULT_THREADS = 4
+# problem records listed with a failed replay check, and QUAL characters shown per read in the bad-quality check
+MAX_EXAMPLES = 3
+# Short failure details quote this many examples.
+SHOWN_EXAMPLES = 2
+QUAL_PREVIEW_CHARS = 3
+# chimeric long reads: CHIMERAS reads joining CHIMERA_HALF_LEN bases from each half of the genome, starts kept CHIMERA_MARGIN bases from a half's end
+CHIMERA_SEED = 3
+CHIMERAS = 40
+CHIMERA_HALF_LEN = 3000
+CHIMERA_MARGIN = 4000
+# one short read in N_READ_EVERY gets an N at N_POS_MIN + (index mod N_POS_SPREAD)
+N_READ_EVERY = 50
+N_POS_MIN = 20
+N_POS_SPREAD = 100
+# Among the QUAL check reads, the first QUAL_SHORT_READS are QUAL_SHORT_LEN bp, then plain QUAL_LONG_LEN bp reads up to QUAL_PLAIN_READS, then chimeras of two CHIMERA_HALF_LEN halves
+QUAL_SEED = 6
+QUAL_READS = 2000
+QUAL_SHORT_READS = 1960
+QUAL_PLAIN_READS = 1980
+QUAL_SHORT_LEN = 150
+QUAL_LONG_LEN = 6000
+REVCOMP_PROB = 0.5
+# synthetic qualities cycle through QUAL_LEVELS Phred+33 characters with stride QUAL_STRIDE
+PHRED_OFFSET = 33
+QUAL_STRIDE = 7
+QUAL_LEVELS = 41
+
+check = CheckLog()
+FAILS = check.failed
 
 
-def check(name, ok, detail=""):
-    """Report one check, appending its name to FAILS on failure."""
-    print(
-        f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  {detail}" if detail else ""),
-        flush=True,
-    )
-    if not ok:
-        FAILS.append(name)
+class Column(NamedTuple):
+    """One aligned column, with its CIGAR op and the read and reference bases (None on the gapped side)."""
+
+    op: str
+    read: str | None
+    ref: str | None
 
 
-def read_fasta(path):
-    """(name, sequence) of each FASTA record."""
-    name, parts = None, []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line.startswith(">"):
-                if name is not None:
-                    yield name, "".join(parts)
-                name, parts = line[1:].split()[0], []
-            elif line:
-                parts.append(line)
-    if name is not None:
-        yield name, "".join(parts)
-
-
-def norm_ref(s):
+def norm_ref(seq):
     """Upper-case s with U read as T and every other non-ACGT base as N."""
-    return "".join(c if c in "ACGT" else ("T" if c == "U" else "N") for c in s.upper())
+    return "".join(base if base in "ACGT" else ("T" if base == "U" else "N") for base in seq.upper())
 
 
 CIG = re.compile(r"(\d+)([MIDNSHP=X])")
@@ -68,178 +84,183 @@ CIG = re.compile(r"(\d+)([MIDNSHP=X])")
 def replay(rec, ref):
     """Problems found when replaying one record's CIGAR, MD and cs against the reference and SEQ.
     An empty list means the record is consistent."""
-    f = rec.split("\t")
-    if int(f[1]) & SAM_FLAG_UNMAPPED:
+    fields = rec.split("\t")
+    if int(fields[SamCol.FLAG]) & SamFlag.UNMAPPED:
         return []
-    cig, seq, pos = f[5], f[9], int(f[3]) - 1
-    tags = {t[:2]: t[5:] for t in f[11:]}
-    r = ref[f[2]]
+    cig, seq, pos = fields[SamCol.CIGAR], fields[SamCol.SEQ], int(fields[SamCol.POS]) - 1
+    tags = {tag_field[:SAM_TAG_NAME_LEN]: tag_field[SAM_TAG_PREFIX_LEN:] for tag_field in fields[SamCol.TAGS:]}
+    ref_seq = ref[fields[SamCol.RNAME]]
     errs = []
     # Aligned columns from the CIGAR
-    cols = []  # op, query base or None, reference base or None
-    qi, ti = 0, pos
-    for n, op in CIG.findall(cig):
-        n = int(n)
-        if op == "S":
-            qi += n
-        elif op in "M=X":
-            for _ in range(n):
-                cols.append(("M", seq[qi], r[ti]))
-                qi += 1
-                ti += 1
-        elif op == "I":
-            for _ in range(n):
-                cols.append(("I", seq[qi], None))
-                qi += 1
-        elif op == "D":
-            for _ in range(n):
-                cols.append(("D", None, r[ti]))
-                ti += 1
+    cols = []
+    read_pos, ref_pos = 0, pos
+    for op_len, cigar_op in CIG.findall(cig):
+        op_len = int(op_len)
+        if cigar_op == "S":
+            read_pos += op_len
+        elif cigar_op in "M=X":
+            for _ in range(op_len):
+                cols.append(Column("M", seq[read_pos], ref_seq[ref_pos]))
+                read_pos += 1
+                ref_pos += 1
+        elif cigar_op == "I":
+            for _ in range(op_len):
+                cols.append(Column("I", seq[read_pos], None))
+                read_pos += 1
+        elif cigar_op == "D":
+            for _ in range(op_len):
+                cols.append(Column("D", None, ref_seq[ref_pos]))
+                ref_pos += 1
 
-    def same(q, t):
+    def same(read_base, ref_base):
         """True for a match of two ACGT bases."""
-        return q == t and t in "ACGT"
+        return read_base == ref_base and ref_base in "ACGT"
 
     # NM
-    nm = sum(1 for o, q, t in cols if o != "M" or not same(q, t))
-    if "NM" in tags and int(tags["NM"]) != nm:
-        errs.append(f"NM {tags['NM']} != {nm}")
+    nm_count = sum(1 for col_op, read_base, ref_base in cols if col_op != "M" or not same(read_base, ref_base))
+    if "NM" in tags and int(tags["NM"]) != nm_count:
+        errs.append(f"NM {tags['NM']} != {nm_count}")
     # MD, the expected string in SAM spec form built from the columns
     want, run = [], 0
-    for i, (o, q, t) in enumerate(cols):
-        if o == "M":
-            if same(q, t):
+    for i, (col_op, read_base, ref_base) in enumerate(cols):
+        if col_op == "M":
+            if same(read_base, ref_base):
                 run += 1
             else:
                 want.append(str(run))
-                want.append(t)
+                want.append(ref_base)
                 run = 0
-        elif o == "D":
-            if i == 0 or cols[i - 1][0] != "D":
+        elif col_op == "D":
+            if i == 0 or cols[i - 1].op != "D":
                 want.append(str(run))
                 want.append("^")
                 run = 0
-            want.append(t)
+            want.append(ref_base)
     want.append(str(run))
     want = "".join(want)
     if tags.get("MD") != want:
         errs.append(f"MD {tags.get('MD')} != {want}")
     # cs, replayed against the columns
     if "cs" in tags:
-        cs = tags["cs"]
-        toks = re.findall(r"(:[0-9]+|=[A-Za-z]+|\*[a-z][a-z]|[-+][a-z]+)", cs)
-        if "".join(toks) != cs:
-            errs.append(f"cs unparseable: {cs}")
+        cs_tag = tags["cs"]
+        # The tag must split into tokens with nothing left over, so a malformed cs fails here instead of being half-checked.
+        toks = re.findall(r"(:[0-9]+|=[A-Za-z]+|\*[a-z][a-z]|[-+][a-z]+)", cs_tag)
+        if "".join(toks) != cs_tag:
+            errs.append(f"cs unparseable: {cs_tag}")
         else:
-            c = 0
-            for tk in toks:
-                kind, body = tk[0], tk[1:]
+            # Each token then consumes alignment columns and has to match what those columns hold.
+            col_idx = 0
+            for token in toks:
+                kind, body = token[0], token[1:]
+                # Short-form :N gives only a length, and each of those N columns has to be an identical M column.
                 if kind == ":":
                     for _ in range(int(body)):
                         if (
-                            c >= len(cols)
-                            or cols[c][0] != "M"
-                            or not same(cols[c][1], cols[c][2])
+                            col_idx >= len(cols)
+                            or cols[col_idx].op != "M"
+                            or not same(cols[col_idx].read, cols[col_idx].ref)
                         ):
-                            errs.append(f"cs {tk} not identical at col {c}")
+                            errs.append(f"cs {token} not identical at col {col_idx}")
                             break
-                        c += 1
+                        col_idx += 1
                 elif kind == "=":
-                    for b in body:
+                    for base in body:
                         if (
-                            c >= len(cols)
-                            or cols[c][0] != "M"
-                            or not same(cols[c][1], cols[c][2])
-                            or cols[c][1] != b
+                            col_idx >= len(cols)
+                            or cols[col_idx].op != "M"
+                            or not same(cols[col_idx].read, cols[col_idx].ref)
+                            or cols[col_idx].read != base
                         ):
-                            errs.append(f"cs {tk} mismatch at col {c}")
+                            errs.append(f"cs {token} mismatch at col {col_idx}")
                             break
-                        c += 1
+                        col_idx += 1
+                # A substitution is one column, given as reference base then read base.
                 elif kind == "*":
                     if (
-                        c >= len(cols)
-                        or cols[c][0] != "M"
-                        or cols[c][2].lower() != body[0]
-                        or cols[c][1].lower() != body[1]
+                        col_idx >= len(cols)
+                        or cols[col_idx].op != "M"
+                        or cols[col_idx].ref.lower() != body[0]
+                        or cols[col_idx].read.lower() != body[1]
                     ):
-                        errs.append(f"cs {tk} wrong at col {c}")
-                    c += 1
+                        errs.append(f"cs {token} wrong at col {col_idx}")
+                    col_idx += 1
                 elif kind == "+":
-                    for b in body:
+                    for base in body:
                         if (
-                            c >= len(cols)
-                            or cols[c][0] != "I"
-                            or cols[c][1].lower() != b
+                            col_idx >= len(cols)
+                            or cols[col_idx].op != "I"
+                            or cols[col_idx].read.lower() != base
                         ):
-                            errs.append(f"cs {tk} wrong at col {c}")
+                            errs.append(f"cs {token} wrong at col {col_idx}")
                             break
-                        c += 1
+                        col_idx += 1
                 elif kind == "-":
-                    for b in body:
+                    for base in body:
                         if (
-                            c >= len(cols)
-                            or cols[c][0] != "D"
-                            or cols[c][2].lower() != b
+                            col_idx >= len(cols)
+                            or cols[col_idx].op != "D"
+                            or cols[col_idx].ref.lower() != base
                         ):
-                            errs.append(f"cs {tk} wrong at col {c}")
+                            errs.append(f"cs {token} wrong at col {col_idx}")
                             break
-                        c += 1
-            if c != len(cols):
-                errs.append(f"cs covers {c} of {len(cols)} columns")
+                        col_idx += 1
+            # Tokens must account for every column, so a truncated cs tag fails too.
+            if col_idx != len(cols):
+                errs.append(f"cs covers {col_idx} of {len(cols)} columns")
     return errs
 
 
-def run(cmd, **kw):
-    p = subprocess.run([str(c) for c in cmd], capture_output=True, **kw, check=False)
-    if p.returncode != 0:
+def run(cmd, **kwargs):
+    proc = subprocess.run([str(arg) for arg in cmd], capture_output=True, **kwargs, check=False)
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"failed: {' '.join(map(str, cmd))}\n{p.stderr.decode()[-500:]}"
+            f"failed: {' '.join(map(str, cmd))}\n{proc.stderr.decode()[-DETAIL_CHARS:]}"
         )
-    return p
+    return proc
 
 
 def _m_columns(cigar, seq):
     """Read index of every aligned (M, = or X) column, in order."""
-    cols, q = [], 0
-    for n, op in re.findall(r"(\d+)([MIDNSHP=X])", cigar):
-        n = int(n)
-        if op in "M=X":
-            cols.extend(range(q, q + n))
-            q += n
-        elif op in "IS":
-            q += n
+    cols, read_pos = [], 0
+    for op_len, cigar_op in re.findall(r"(\d+)([MIDNSHP=X])", cigar):
+        op_len = int(op_len)
+        if cigar_op in "M=X":
+            cols.extend(range(read_pos, read_pos + op_len))
+            read_pos += op_len
+        elif cigar_op in "IS":
+            read_pos += op_len
     return cols
 
 
-def heal_nn(tag, v, cigar, seq):
+def heal_nn(tag, value, cigar, seq):
     """The tag with every column of a reference N or read N written as a match, minimap2's convention, as by_key explains."""
     cols = _m_columns(cigar, seq)
 
-    def isn(j):
+    def isn(col):
         """True when aligned column j holds an N in the read."""
-        return j < len(cols) and cols[j] < len(seq) and seq[cols[j]] in "Nn"
+        return col < len(cols) and cols[col] < len(seq) and seq[cols[col]] in "Nn"
 
     if tag == "MD":
-        out, run, j = [], 0, 0
-        for tok in re.findall(r"\d+|\^[A-Za-z]+|[A-Za-z]", v):
+        out, run, col_idx = [], 0, 0
+        for tok in re.findall(r"\d+|\^[A-Za-z]+|[A-Za-z]", value):
             if tok.isdigit():
                 run += int(tok)
-                j += int(tok)
+                col_idx += int(tok)
             elif tok[0] == "^":
                 out.append(f"{run}{tok}")
                 run = 0
-            elif tok.upper() == "N" and isn(j):
+            elif tok.upper() == "N" and isn(col_idx):
                 run += 1
-                j += 1
+                col_idx += 1
             else:
                 out.append(f"{run}{tok}")
                 run = 0
-                j += 1
+                col_idx += 1
         return "".join(out) + str(run)
     # cs in short (":n") or long ("=ACGT") form
-    long_form = "=" in v
-    ops = re.findall(r"(:\d+|=[A-Za-z]+|\*[a-z][a-z]|\+[a-z]+|-[a-z]+)", v)
-    out, j = [], 0
+    long_form = "=" in value
+    ops = re.findall(r"(:\d+|=[A-Za-z]+|\*[a-z][a-z]|\+[a-z]+|-[a-z]+)", value)
+    out, col_idx = [], 0
 
     def push_match(base):
         """Append one matching base to the cs string being built, merging runs."""
@@ -254,48 +275,51 @@ def heal_nn(tag, v, cigar, seq):
             else:
                 out.append(":1")
 
-    for op in ops:
-        if op[0] == ":":
-            n = int(op[1:])
+    for cs_op in ops:
+        if cs_op[0] == ":":
+            run_len = int(cs_op[1:])
             if out and out[-1][0] == ":":
-                out[-1] = ":" + str(int(out[-1][1:]) + n)
+                out[-1] = ":" + str(int(out[-1][1:]) + run_len)
             else:
-                out.append(op)
-            j += n
-        elif op[0] == "=":
-            for b in op[1:]:
-                push_match(b)
-            j += len(op) - 1
-        elif op[0] == "*":
-            if op[1] == "n" and op[2] == "n" and isn(j):
+                out.append(cs_op)
+            col_idx += run_len
+        elif cs_op[0] == "=":
+            for base in cs_op[1:]:
+                push_match(base)
+            col_idx += len(cs_op) - 1
+        elif cs_op[0] == "*":
+            _, ref_char, read_char = cs_op
+            if ref_char == "n" and read_char == "n" and isn(col_idx):
                 push_match("N")
             else:
-                out.append(op)
-            j += 1
+                out.append(cs_op)
+            col_idx += 1
         else:
-            out.append(op)
+            out.append(cs_op)
     return "".join(out)
 
 
 def main():
     """Map the read sets and run every tag and QUAL check."""
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--ref", required=True)
-    ap.add_argument("--workdir", required=True)
-    ap.add_argument("--samtools", default=shutil.which("samtools"))
-    ap.add_argument("--minimap2", default=str(PATHS["minimap2"]))
-    ap.add_argument("--threads", type=int, default=4)
-    a = ap.parse_args()
-    wd = Path(a.workdir)
-    wd.mkdir(parents=True, exist_ok=True)
+    parser.add_argument("--ref", required=True)
+    parser.add_argument("--workdir", required=True)
+    parser.add_argument("--samtools", default=shutil.which("samtools"))
+    parser.add_argument("--minimap2", default=str(PATHS["minimap2"]))
+    parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
+    opts = parser.parse_args()
+    work_dir = Path(opts.workdir)
+    work_dir.mkdir(parents=True, exist_ok=True)
     optik = PATHS["optik"]
-    ref = {n: norm_ref(s) for n, s in read_fasta(a.ref)}
-    refp = wd / "ref.fa"
-    with open(refp, "w") as fh:
-        fh.writelines(f">{n}\n{s}\n" for n, s in ref.items())
+    # The reference is normalised and rewritten, so optik and the replay check see identical bases.
+    ref = {name: norm_ref(seq) for name, seq in read_fasta(opts.ref)}
+    refp = work_dir / "ref.fa"
+    with open(refp, "w") as handle:
+        handle.writelines(f">{name}\n{seq}\n" for name, seq in ref.items())
     gen = HERE / "gen_reads.py"
+    # The --ins and --del rates put gap operations into cs and MD, not only substitutions.
     sets = {
         "short": [
             "-n",
@@ -329,28 +353,30 @@ def main():
         ],
     }
     for name, args in sets.items():
-        reads = wd / f"{name}.fa"
+        reads = work_dir / f"{name}.fa"
         run([sys.executable, gen, "-r", refp, "-o", reads] + args)
         if name == "long":  # chimeras, which produce supplementary records
-            g = next(iter(ref.values()))
-            import random as _r
+            genome_seq = next(iter(ref.values()))
+            import random as random_mod
 
-            rr = _r.Random(3)
-            with open(reads, "a") as fh:
-                for i in range(40):
-                    a0 = rr.randrange(0, len(g) // 2 - 4000)
-                    b0 = rr.randrange(len(g) // 2, len(g) - 4000)
-                    fh.write(f">chim{i}\n{g[a0 : a0 + 3000]}{g[b0 : b0 + 3000]}\n")
+            rng = random_mod.Random(CHIMERA_SEED)
+            with open(reads, "a") as handle:
+                for i in range(CHIMERAS):
+                    left_start = rng.randrange(0, len(genome_seq) // 2 - CHIMERA_MARGIN)
+                    right_start = rng.randrange(len(genome_seq) // 2, len(genome_seq) - CHIMERA_MARGIN)
+                    handle.write(f">chim{i}\n{genome_seq[left_start : left_start + CHIMERA_HALF_LEN]}{genome_seq[right_start : right_start + CHIMERA_HALF_LEN]}\n")
         if name == "short":  # reads with N
             recs = list(read_fasta(reads))
-            with open(reads, "w") as fh:
-                for i, (n, s) in enumerate(recs):
-                    if i % 50 == 0:
-                        p = 20 + i % 100
-                        s = s[:p] + "N" + s[p + 1 :]
-                    fh.write(f">{n}\n{s}\n")
+            with open(reads, "w") as handle:
+                for i, (rec_name, rec_seq) in enumerate(recs):
+                    # Every N_READ_EVERY-th short read gets one N, which MD and cs must report as a mismatch.
+                    if i % N_READ_EVERY == 0:
+                        n_pos = N_POS_MIN + i % N_POS_SPREAD
+                        rec_seq = rec_seq[:n_pos] + "N" + rec_seq[n_pos + 1 :]
+                    handle.write(f">{rec_name}\n{rec_seq}\n")
+        # --cs writes identical runs as :N while --cs=long spells the bases out with =, and both forms are replayed.
         for mode in ("--cs", "--cs=long"):
-            sam = wd / f"{name}{mode.replace('=', '_')}.sam"
+            sam = work_dir / f"{name}{mode.replace('=', '_')}.sam"
             run(
                 [
                     optik,
@@ -360,21 +386,22 @@ def main():
                     "-q",
                     reads,
                     "-t",
-                    a.threads,
+                    opts.threads,
                     "-o",
                     sam,
                     mode,
                 ]
             )
-            with open(sam) as fh:
-                recs = [line.rstrip("\n") for line in fh if not line.startswith("@")]
+            with open(sam) as handle:
+                recs = [line.rstrip("\n") for line in handle if not line.startswith("@")]
             mapped = [
                 line
                 for line in recs
-                if not int(line.split("\t")[1]) & SAM_FLAG_UNMAPPED
+                if not int(line.split("\t")[SamCol.FLAG]) & SamFlag.UNMAPPED
             ]
+            # Replaying rebuilds each record's alignment from its tags and compares it with the reference and SEQ.
             bad = [
-                (line.split("\t")[0], e) for line in mapped for e in replay(line, ref)
+                (line.split("\t")[SamCol.QNAME], problem) for line in mapped for problem in replay(line, ref)
             ]
             have = sum(1 for line in mapped if "\tMD:Z:" in line and "\tcs:Z:" in line)
             check(
@@ -385,30 +412,32 @@ def main():
             check(
                 f"{name} {mode}: MD, cs and NM replay exactly against reference and SEQ",
                 not bad,
-                f"records={len(mapped)} problems={len(bad)} {bad[:3]}",
+                f"records={len(mapped)} problems={len(bad)} {bad[:MAX_EXAMPLES]}",
             )
+            # samtools calmd recomputes MD and NM from the reference, giving a second opinion on optik's tags.
             if mode == "--cs":
-                p = subprocess.run(
-                    [a.samtools, "calmd", "-b", sam, refp],
+                proc = subprocess.run(
+                    [opts.samtools, "calmd", "-b", sam, refp],
                     capture_output=True,
                     check=False,
                 )
+                # calmd warns about every record whose MD or NM differs from its own recomputation.
                 warn = [
                     line
-                    for line in p.stderr.decode().splitlines()
+                    for line in proc.stderr.decode().splitlines()
                     if "different" in line.lower()
                 ]
                 check(
                     f"{name}: samtools calmd recomputes the same MD and NM for every record",
-                    p.returncode == 0 and not warn,
-                    f"warnings={len(warn)} {warn[:2]}",
+                    proc.returncode == 0 and not warn,
+                    f"warnings={len(warn)} {warn[:SHOWN_EXAMPLES]}",
                 )
                 supp = sum(
                     1
                     for line in mapped
-                    if int(line.split("\t")[1]) & SAM_FLAG_SUPPLEMENTARY
+                    if int(line.split("\t")[SamCol.FLAG]) & SamFlag.SUPPLEMENTARY
                 )
-                clip = sum(1 for line in mapped if "S" in line.split("\t")[5])
+                clip = sum(1 for line in mapped if "S" in line.split("\t")[SamCol.CIGAR])
                 print(
                     f"    ({len(mapped)} mapped records; {supp} supplementary, {clip} with soft clips)"
                 )
@@ -423,18 +452,18 @@ def main():
             minimap2 counts it as a match.
             Only that kind of column is healed, so any other difference still fails."""
             out = {}
-            with open(path) as fh:
-                for line in fh:
+            with open(path) as handle:
+                for line in handle:
                     if line.startswith("@"):
                         continue
-                    f = line.rstrip("\n").split("\t")
-                    if int(f[1]) & (4 | 256):
+                    fields = line.rstrip("\n").split("\t")
+                    if int(fields[SamCol.FLAG]) & (SamFlag.UNMAPPED | SamFlag.SECONDARY):
                         continue
-                    t = {x[:2]: x[5:] for x in f[11:]}
-                    v = t.get(tag)
-                    if heal and v is not None:
-                        v = heal_nn(tag, v, f[5], f[9])
-                    out[(f[0], f[2], f[3], f[5])] = v
+                    tags = {tag_field[:SAM_TAG_NAME_LEN]: tag_field[SAM_TAG_PREFIX_LEN:] for tag_field in fields[SamCol.TAGS:]}
+                    value = tags.get(tag)
+                    if heal and value is not None:
+                        value = heal_nn(tag, value, fields[SamCol.CIGAR], fields[SamCol.SEQ])
+                    out[(fields[SamCol.QNAME], fields[SamCol.RNAME], fields[SamCol.POS], fields[SamCol.CIGAR])] = value
             return out
 
         for tag, mmopt, ours in (
@@ -442,83 +471,83 @@ def main():
             ("cs", "--cs", "--cs"),
             ("cs", "--cs=long", "--cs_long"),
         ):
-            mm = wd / f"{name}.mm{mmopt.replace('=', '_')}.sam"
-            with open(mm, "wb") as fh:
+            mm_sam = work_dir / f"{name}.mm{mmopt.replace('=', '_')}.sam"
+            with open(mm_sam, "wb") as handle:
                 subprocess.run(
                     [
-                        str(a.minimap2),
+                        str(opts.minimap2),
                         "-ax",
                         preset,
                         mmopt,
                         "-t",
-                        str(a.threads),
+                        str(opts.threads),
                         str(refp),
                         str(reads),
                     ],
-                    stdout=fh,
+                    stdout=handle,
                     stderr=subprocess.DEVNULL,
                     check=True,
                 )
-            ko, km = by_key(wd / f"{name}{ours}.sam", tag, heal=True), by_key(mm, tag)
-            common = [k for k in set(ko) & set(km) if km[k] is not None]
-            diff = [k for k in common if ko[k] != km[k]]
+            ours_tags, mm_tags = by_key(work_dir / f"{name}{ours}.sam", tag, heal=True), by_key(mm_sam, tag)
+            common = [key for key in set(ours_tags) & set(mm_tags) if mm_tags[key] is not None]
+            diff = [key for key in common if ours_tags[key] != mm_tags[key]]
             check(
                 f"{name}: {tag} ({mmopt}) equals minimap2's wherever position and CIGAR agree",
                 len(common) > 0 and not diff,
-                f"same alignments={len(common)} differing={len(diff)} {[(k, ko[k], km[k]) for k in diff[:2]]}",
+                f"same alignments={len(common)} differing={len(diff)} {[(key, ours_tags[key], mm_tags[key]) for key in diff[:SHOWN_EXAMPLES]]}",
             )
-    # QUAL carries the FASTQ base qualities into SAM, reversed on reverse-strand records and cut by the hard clips on supplementary ones, while FASTA reads keep '*'.
-    fq = wd / "qual.fq"
+    # QUAL copies the FASTQ base qualities into SAM, reversed on reverse-strand records and cut by the hard clips on supplementary ones, while FASTA reads keep '*'.
+    fq_path = work_dir / "qual.fq"
     comp = str.maketrans("ACGT", "TGCA")
-    import random as _r
+    import random as random_mod
 
-    rr = _r.Random(6)
-    g = next(iter(ref.values()))
+    rng = random_mod.Random(QUAL_SEED)
+    genome_seq = next(iter(ref.values()))
     quals = {}
-    with open(fq, "w") as fh:
-        for i in range(2000):
-            read_len = 150 if i < 1960 else 6000
-            st = rr.randrange(len(g) - 2 * read_len)
+    with open(fq_path, "w") as handle:
+        for i in range(QUAL_READS):
+            read_len = QUAL_SHORT_LEN if i < QUAL_SHORT_READS else QUAL_LONG_LEN
+            start = rng.randrange(len(genome_seq) - 2 * read_len)
             seq_ = (
-                g[st : st + read_len]
-                if i < 1980
-                else g[st : st + 3000]
-                + g[(st + len(g) // 2) % (len(g) - 4000) :][:3000]
+                genome_seq[start : start + read_len]
+                if i < QUAL_PLAIN_READS
+                else genome_seq[start : start + CHIMERA_HALF_LEN]
+                + genome_seq[(start + len(genome_seq) // 2) % (len(genome_seq) - CHIMERA_MARGIN) :][:CHIMERA_HALF_LEN]
             )
-            if rr.random() < 0.5:
+            if rng.random() < REVCOMP_PROB:
                 seq_ = seq_.translate(comp)[::-1]
-            q = "".join(chr(33 + ((j * 7 + i) % 41)) for j in range(len(seq_)))
-            quals[f"q{i}"] = q
-            fh.write(f"@q{i}\n{seq_}\n+\n{q}\n")
-    osam = wd / "qual.sam"
-    run([optik, "map", "-r", refp, "-q", fq, "-t", a.threads, "-o", osam])
-    bad = n = 0
-    with open(osam) as fh:
-        for line in fh:
+            qual = "".join(chr(PHRED_OFFSET + ((j * QUAL_STRIDE + i) % QUAL_LEVELS)) for j in range(len(seq_)))
+            quals[f"q{i}"] = qual
+            handle.write(f"@q{i}\n{seq_}\n+\n{qual}\n")
+    osam = work_dir / "qual.sam"
+    run([optik, "map", "-r", refp, "-q", fq_path, "-t", opts.threads, "-o", osam])
+    bad = rec_name = 0
+    with open(osam) as handle:
+        for line in handle:
             if line.startswith("@"):
                 continue
-            f = line.rstrip("\n").split("\t")
-            if int(f[1]) & SAM_FLAG_UNMAPPED:
+            fields = line.rstrip("\n").split("\t")
+            if int(fields[SamCol.FLAG]) & SamFlag.UNMAPPED:
                 continue
-            n += 1
-            want = quals[f[0]][::-1] if int(f[1]) & SAM_FLAG_REVERSE else quals[f[0]]
+            rec_name += 1
+            want = quals[fields[SamCol.QNAME]][::-1] if int(fields[SamCol.FLAG]) & SamFlag.REVERSE else quals[fields[SamCol.QNAME]]
             # Hard-clipped (supplementary) records cut QUAL as SEQ is cut, by the CIGAR's H.
-            m = re.match(r"^(\d+)H", f[5])
-            lead = int(m.group(1)) if m else 0
-            m = re.search(r"(\d+)H$", f[5])
-            trail = int(m.group(1)) if m else 0
+            clip_match = re.match(r"^(\d+)H", fields[SamCol.CIGAR])
+            lead = int(clip_match.group(1)) if clip_match else 0
+            clip_match = re.search(r"(\d+)H$", fields[SamCol.CIGAR])
+            trail = int(clip_match.group(1)) if clip_match else 0
             want = want[lead : len(want) - trail]
-            bad += f[10] != want or len(f[10]) != len(f[9])
+            bad += fields[SamCol.QUAL] != want or len(fields[SamCol.QUAL]) != len(fields[SamCol.SEQ])
     check(
         "FASTQ qualities are written to QUAL (reversed on reverse-strand, cut by hard clips on supplementary records)",
-        n > 0 and bad == 0,
-        f"records={n} wrong={bad}",
+        rec_name > 0 and bad == 0,
+        f"records={rec_name} wrong={bad}",
     )
-    mm = wd / "qual.mm.sam"
-    with open(mm, "wb") as fh:
+    mm_sam = work_dir / "qual.mm.sam"
+    with open(mm_sam, "wb") as handle:
         subprocess.run(
-            [str(a.minimap2), "-ax", "sr", "-t", str(a.threads), str(refp), str(fq)],
-            stdout=fh,
+            [str(opts.minimap2), "-ax", "sr", "-t", str(opts.threads), str(refp), str(fq_path)],
+            stdout=handle,
             stderr=subprocess.DEVNULL,
             check=True,
         )
@@ -526,57 +555,59 @@ def main():
     def prim(path):
         """Map (read, strand) of each primary record to its QUAL."""
         out = {}
-        with open(path) as fh:
-            for line in fh:
+        with open(path) as handle:
+            for line in handle:
                 if line.startswith("@"):
                     continue
-                f = line.rstrip("\n").split("\t")
-                if not int(f[1]) & SAM_FLAGS_NOT_PRIMARY:
-                    out[(f[0], int(f[1]) & SAM_FLAG_REVERSE)] = f[10]
+                fields = line.rstrip("\n").split("\t")
+                if not int(fields[SamCol.FLAG]) & SamFlag.NOT_PRIMARY:
+                    out[(fields[SamCol.QNAME], int(fields[SamCol.FLAG]) & SamFlag.REVERSE)] = fields[SamCol.QUAL]
         return out
 
-    po, pm = prim(osam), prim(mm)
-    common = set(po) & set(pm)
+    optik_quals, mm_quals = prim(osam), prim(mm_sam)
+    # minimap2 reverses QUAL on reverse records too. Equal strings for the same read and strand prove the same orientation rule.
+    common = set(optik_quals) & set(mm_quals)
     check(
         "QUAL equals minimap2's for the same read and strand",
-        len(common) > 0 and all(po[k] == pm[k] for k in common),
+        len(common) > 0 and all(optik_quals[key] == mm_quals[key] for key in common),
         f"compared={len(common)}",
     )
     # Unusable qualities (wrong length, or a byte outside Phred+33 '!'..'~') give QUAL '*' and a warning, never a SAM record that samtools rejects.
-    badq = wd / "badqual.fq"
-    s0 = g[1000:1150]
-    with open(badq, "w") as fh:
-        fh.write(
-            f"@len\n{s0}\n+\n{'I' * 149}\n@byte\n{s0}\n+\n{'I' * 70}\x7f{'I' * 79}\n"
-            f"@good\n{s0}\n+\n{'I' * 150}\n"
+    badq = work_dir / "badqual.fq"
+    base_seq = genome_seq[1000:1150]
+    with open(badq, "w") as handle:
+        handle.write(
+            f"@len\n{base_seq}\n+\n{'I' * 149}\n@byte\n{base_seq}\n+\n{'I' * 70}\x7f{'I' * 79}\n"
+            f"@good\n{base_seq}\n+\n{'I' * 150}\n"
         )
-    bsam = wd / "badqual.sam"
-    p = subprocess.run(
+    bsam = work_dir / "badqual.sam"
+    proc = subprocess.run(
         [str(optik), "map", "-r", str(refp), "-q", str(badq), "-o", str(bsam)],
         capture_output=True,
         text=True,
         check=False,
     )
-    with open(bsam) as fh:
+    with open(bsam) as handle:
         got = {
-            f[0]: f[10]
-            for f in (line.rstrip("\n").split("\t") for line in fh)
-            if f[0][0] != "@"
+            fields[SamCol.QNAME]: fields[SamCol.QUAL]
+            for fields in (line.rstrip("\n").split("\t") for line in handle)
+            if fields[SamCol.QNAME][0] != "@"
         }
-    v = subprocess.run(
-        [str(a.samtools), "view", "-c", str(bsam)],
+    # samtools must count all three records, so no QUAL broke the SAM.
+    view_proc = subprocess.run(
+        [str(opts.samtools), "view", "-c", str(bsam)],
         capture_output=True,
         text=True,
         check=False,
     )
     check(
         "unusable FASTQ qualities give QUAL '*' with a warning; samtools reads the SAM",
-        p.returncode == 0
+        proc.returncode == 0
         and got == {"len": "*", "byte": "*", "good": "I" * 150}
-        and "2 FASTQ records had unusable qualities" in p.stderr
-        and v.returncode == 0
-        and v.stdout.strip() == "3",
-        f"qual={ {k: x[:3] for k, x in got.items()} } samtools={v.returncode}",
+        and "2 FASTQ records had unusable qualities" in proc.stderr
+        and view_proc.returncode == 0
+        and view_proc.stdout.strip() == "3",
+        f"qual={ {name: qual[:QUAL_PREVIEW_CHARS] for name, qual in got.items()} } samtools={view_proc.returncode}",
     )
     print(
         f"\nvalidate_tags: {'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED'}"

@@ -1,0 +1,21 @@
+# Toolchain for optik's Lean proofs, kept inside lean/ so nothing is installed globally.
+# conda-forge's lean4 provides lean and lake at the exact version Mathlib's tag in lakefile.toml was built for.
+# lake clones Mathlib with git and fetches its prebuilt cache with curl, so both come from here as well.
+
+[workspace]
+name = "optik-proofs"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+lean4 = "==4.33.0"
+git = "*"
+curl = "*"
+
+[tasks]
+# First run, or after changing the Mathlib pin, fetches Mathlib and its prebuilt .olean files instead of compiling them.
+setup = "lake update && lake exe cache get"
+build = "lake build"
+vectors = "lake exe optik-vectors"
+# Fails on any sorry, admit, project axiom or unexpected axiom behind a theorem.
+audit = "python3 audit.py"

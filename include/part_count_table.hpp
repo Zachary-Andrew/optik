@@ -1,36 +1,43 @@
 #pragma once
-/*
- * part_count_table.hpp - one thread's k-mer counting table for one minimizer partition at a time (the counting passes of src/kmer_count.cpp).
+/**
+ * @file
+ * @brief The k-mer counting table one thread uses for one minimizer partition at a time.
+ * The counting passes in src/kmer_count.cpp are its only users.
  *
- * Lines.
+ * @par Lines
  * 64 bytes = 5 keys | 5 node words | u8 fill | u8 overflow | pad.
- * A node word is count << 8 | edge mask (in << 4 | out), the DbgGraph line layout (dbg_graph.hpp), so a probe reads a line of keys and their counts at once.
+ * A node word is count << 8 | edge mask (in << 4 | out), the same layout DbgGraph uses (dbg_graph.hpp).
+ * As a result, one probe reads a line of keys together with their counts.
  *
- * Placement.
- * Within a level, a key goes to the first line with room in a window of kWindowLines lines starting at its home line, which is chosen by Fibonacci hashing (Knuth, TAOCP vol. 3, 6.4).
- * Lines fill in order and nothing is deleted, so a line with room ends a search, and the common insert or lookup reads one line.
+ * @par Placement
+ * A key lands in the first line with room inside a window of kWindowLines lines that starts at its home line.
+ * Fibonacci hashing picks the home line (Knuth, TAOCP vol. 3, 6.4).
+ * Because lines fill in order and nothing is ever deleted, a line with room ends the search, so most operations read a single line.
  *
- * Levels.
- * When a key's whole window is full it sets its home line's overflow flag and moves one level down, and a lookup descends only past a full window whose home line is flagged.
- * This is the level structure of DeltaOA (delta_oa.hpp), after Farach-Colton, Krapivin and Kuszmaul (FOCS 2024).
- * Keys never move.
+ * @par Levels
+ * When a key's whole window is full, it flags its home line as overflowed and moves one level down.
+ * Lookups therefore descend only past a full window whose home line has that flag set.
+ * The scheme comes from DeltaOA (delta_oa.hpp), which in turn follows Farach-Colton, Krapivin and Kuszmaul (FOCS 2024), and keys never move.
  *
- * Growth is the change made for counting.
- * DeltaOA's levels are fixed and shrink geometrically, whereas here a full table appends a level as large as all levels before it, so capacity doubles without rehashing or moving a key.
- * A partition dominated by one heavy minimizer (adapter read-through, poly-A) grows without a doubling table's rehash passes and copy.
+ * @par Growth
+ * DeltaOA's levels are fixed and shrink geometrically.
+ * Here, instead, a full table appends a level as large as everything before it, so capacity doubles without rehashing.
+ * That helps partitions dominated by one heavy minimizer (adapter read-through, poly-A), which would otherwise pay for repeated rehash-and-copy passes.
  *
- * Sizing.
- * The caller sizes level 0 per partition from an estimate of its distinct k-mers (src/kmer_count.cpp uses a HyperLogLog pre-pass on large partitions, else the median distinct share of recent partitions), so nearly every partition stays in level 0.
+ * @par Sizing
+ * The caller sizes level 0 from an estimate of the partition's distinct k-mers, so nearly every partition stays in level 0.
+ * For large partitions src/kmer_count.cpp estimates with a HyperLogLog pre-pass, and otherwise uses the median distinct share of recent partitions.
  *
- * Reuse.
- * Storage is kept across partitions, where only used lines are cleared, and released past a size cap.
- * Cuttlefish 3 (Khan et al. 2025) also reuses worker-local maps across subgraphs and grows them from observed insertions.
- * The line layout, bounded line-linear placement, levels and append-only growth are this table's own.
+ * @par Reuse
+ * Storage is reused across partitions, with only the used lines cleared, until it passes a size cap.
+ * Cuttlefish 3 (Khan et al. 2025) similarly reuses worker-local maps and grows them from observed insertions.
+ * The line layout, bounded placement, levels and append-only growth are specific to this table, though.
  *
- * Counts.
- * The node word holds 24 bits, and a key whose count reaches kCountSat keeps the excess in an exact side map, and totals saturate at 2^32 - 1 as the counter's always have.
+ * @par Counts
+ * A node word holds 24 bits of count, so anything past kCountSat goes to an exact side map.
+ * Totals still saturate at 2^32 - 1, matching the counter's long-standing behaviour.
  *
- * The table is single-threaded, since one thread owns a partition, so DeltaOA's seqlocks are not needed.
+ * One thread owns a partition, which is why none of DeltaOA's seqlocks are needed.
  */
 
 #include <algorithm>
@@ -41,24 +48,35 @@
 #include <unordered_map>
 #include <vector>
 
+#include "bits.hpp"
+#include "wyhash.hpp"
+
 namespace tpoptoa {
 
 class PartCountTable {
 public:
-    static constexpr unsigned kSlots = 5;              // keys per 64-byte line
-    static constexpr std::size_t kWindowLines = 8;          // lines probed per level
+    static constexpr std::size_t kCacheLineBytes = 64;   // x86-64, the unit one probe reads
+    static constexpr unsigned kSlots = 5;                // keys per line
+    /// Explicit padding after the two flag bytes, so a line's fields end on a 4-byte boundary.
+    static constexpr std::size_t kLinePadBytes = 2;
+    static constexpr std::size_t kWindowLines = 8;       // lines probed per level
     static constexpr uint32_t kNotFound = ~uint32_t(0);
     static constexpr unsigned kCountShift = 8;        // node word = count << 8 | edge mask
     static constexpr uint32_t kEdgeMask = 0xFFu;
     static constexpr uint32_t kCountSat = (uint32_t(1) << 24) - 1;
-    static constexpr uint64_t kFibonacciMultiplier = 0x9E3779B97F4A7C15ULL;   // 2^64 / golden ratio
     static constexpr unsigned kLevelRotation = 13;    // hash bits rotated per level
+    /// Level 0 is sized for a load factor of about kLoadNum / kLoadDen.
+    static constexpr std::size_t kLoadNum = 3, kLoadDen = 4;
+    static constexpr int kNoSlot = -1;                // slot_of() for a key the line doesn't hold
 
-    /// begin() - start a partition expected to hold about @est_distinct keys, with level 0 sized for a load factor of about 3/4.
+    /// Starts a partition expected to hold about @p est_distinct keys.
     void begin(std::size_t est_distinct) {
-        const std::size_t want = (est_distinct * 4 + 2 * kSlots) / (3 * kSlots) + 1;
+        constexpr std::size_t kRoundUpSlots = 2 * kSlots;   // pads the division so a partly filled line still counts
+        const std::size_t want = (est_distinct * kLoadDen + kRoundUpSlots) / (kLoadNum * kSlots) + 1;
         std::size_t lines = kWindowLines;
+
         while (lines < want) lines <<= 1;
+
         nlevels_ = 0;
         add_level(lines);
         size_ = 0;
@@ -66,91 +84,111 @@ public:
         excess_counts_.clear();
     }
 
-    /// hash() - Fibonacci hash of @key, whose top bits a level takes.
-    ///
-    /// The caller hashes keys ahead and prefetches their home lines (group prefetching, Slotin, Algorithms for Modern Hardware), so the cache misses of a large partition overlap.
-    static constexpr uint64_t hash(uint64_t key) noexcept { return key * kFibonacciMultiplier; }
-    /// prefetch() - prefetch the level-0 home line of hash @h for writing.
-    void prefetch(uint64_t h) const noexcept {
-        const Level& L = levels_[0];
-        __builtin_prefetch(&L.lines[home(h, 0, L.log2_lines)], 1);
+    /// Fibonacci hash, of which each level takes the top bits.
+    /// Callers hash ahead and prefetch the home lines (group prefetching, Slotin), so a large partition's cache misses overlap.
+    static constexpr uint64_t hash(uint64_t key) noexcept { return key * kGoldenRatio64; }
+
+    void prefetch(uint64_t hash_val) const noexcept {
+        const Level& level = levels_[0];
+
+        prefetch_write(&level.lines[home(hash_val, 0, level.log2_lines)]);
     }
 
-    /// add() - count @n occurrences of @key, OR-ing in edge bits @bits.
-    void add(uint64_t key, uint8_t bits, uint32_t n = 1) { add_hashed(key, hash(key), bits, n); }
-    /// add_hashed() - add() with the key's hash() already computed.
-    void add_hashed(uint64_t key, uint64_t h, uint8_t bits, uint32_t n = 1) {
+    /// Adds @p occurrences to @p key's count and ORs in edge bits @p bits.
+    void add(uint64_t key, uint8_t bits, uint32_t occurrences = 1) { add_hashed(key, hash(key), bits, occurrences); }
+
+    /// Same as add(), for callers that already computed hash().
+    void add_hashed(uint64_t key, uint64_t hash_val, uint8_t bits, uint32_t occurrences = 1) {
         for (unsigned i = 0;; ++i) {
-            if (i == nlevels_) add_level(total_lines_);          // append, which doubles capacity
-            Level& L = levels_[i];
-            const std::size_t h0 = home(h, i, L.log2_lines), line_mask = L.n - 1;
+            if (i == nlevels_) add_level(total_lines_);          // appending doubles capacity
+
+            Level& level = levels_[i];
+            const std::size_t home_line = home(hash_val, i, level.log2_lines), line_mask = level.used_lines - 1;
+
             for (std::size_t w = 0; w < kWindowLines; ++w) {
-                Line& l = L.lines[(h0 + w) & line_mask];
-                const int s = slot_of(l, key);
-                if (s >= 0) { bump(l, s, key, bits, n); return; }
-                if (l.fill < kSlots) {                         // room here means the key is nowhere further
-                    l.key[l.fill] = key;
-                    l.node[l.fill] = bits;
-                    bump(l, l.fill, key, 0, n);
-                    ++l.fill;
+                Line& line = level.lines[(home_line + w) & line_mask];
+                const int slot = slot_of(line, key);
+
+                if (slot >= 0) { bump(line, slot, key, bits, occurrences); return; }
+
+                if (line.fill < kSlots) {                         // lines fill in order, so the key can't be further on
+                    line.key[line.fill] = key;
+                    line.node[line.fill] = bits;
+                    bump(line, line.fill, key, 0, occurrences);
+                    ++line.fill;
                     ++size_;
+
                     if (i) ++deep_keys_;
+
                     return;
                 }
             }
-            L.lines[h0].overflow = 1;                              // window full, so go one level down
+
+            level.lines[home_line].overflow = 1;                              // window full, so the key drops a level
         }
     }
 
-    /// find() - the count of @key including the side map, or kNotFound.
+    /// Includes any excess held in the side map.
     uint32_t find(uint64_t key) const {
-        const uint64_t h = hash(key);
+        const uint64_t hash_val = hash(key);
+
         for (unsigned i = 0; i < nlevels_; ++i) {
-            const Level& L = levels_[i];
-            const std::size_t h0 = home(h, i, L.log2_lines), line_mask = L.n - 1;
+            const Level& level = levels_[i];
+            const std::size_t home_line = home(hash_val, i, level.log2_lines), line_mask = level.used_lines - 1;
+
             for (std::size_t w = 0; w < kWindowLines; ++w) {
-                const Line& l = L.lines[(h0 + w) & line_mask];
-                const int s = slot_of(l, key);
-                if (s >= 0) return count(key, l.node[s]);
-                if (l.fill < kSlots) return kNotFound;
+                const Line& line = level.lines[(home_line + w) & line_mask];
+                const int slot = slot_of(line, key);
+
+                if (slot >= 0) return count(key, line.node[slot]);
+
+                if (line.fill < kSlots) return kNotFound;
             }
-            if (!L.lines[h0].overflow) return kNotFound;
+
+            if (!level.lines[home_line].overflow) return kNotFound;
         }
+
         return kNotFound;
     }
 
-    /// for_each() - f(key, count, edge mask) for every key, in storage order.
+    /// Calls f(key, count, edge mask) in storage order.
     template <typename F>
-    void for_each(F&& f) const {
+    void for_each(F&& func) const {
         for (unsigned i = 0; i < nlevels_; ++i) {
-            const Level& L = levels_[i];
-            for (std::size_t j = 0; j < L.n; ++j) {
-                const Line& l = L.lines[j];
-                for (unsigned s = 0; s < l.fill; ++s)
-                    f(l.key[s], count(l.key[s], l.node[s]), static_cast<uint8_t>(l.node[s] & kEdgeMask));
+            const Level& level = levels_[i];
+
+            for (std::size_t j = 0; j < level.used_lines; ++j) {
+                const Line& line = level.lines[j];
+
+                for (unsigned s = 0; s < line.fill; ++s)
+                    func(line.key[s], count(line.key[s], line.node[s]), static_cast<uint8_t>(line.node[s] & kEdgeMask));
             }
         }
     }
 
     std::size_t size() const noexcept { return size_; }
-    /// deep() and levels() - for profiling, the keys placed below level 0 and the levels in use.
+    /// Reports how many keys sit below level 0 and how many levels exist, for profiling.
     std::size_t deep() const noexcept { return deep_keys_; }
     unsigned levels() const noexcept { return nlevels_; }
-    /// bytes() - line storage held by all levels, used or kept for reuse.
+
+    /// Counts storage kept for reuse as well as lines in use.
     std::size_t bytes() const noexcept {
-        std::size_t b = 0;
-        for (const auto& L : levels_) b += L.cap * sizeof(Line);
-        return b;
+        std::size_t total = 0;
+
+        for (const auto& level : levels_) total += level.cap * sizeof(Line);
+
+        return total;
     }
 
-    /// finish() - clear the partition's lines and keep the storage, or free it all if it exceeds @cap_bytes.
+    /// Clears the partition's lines but keeps the storage, unless it exceeds @p cap_bytes.
     void finish(std::size_t cap_bytes) {
         if (bytes() > cap_bytes) {
             levels_.clear();
         } else {
             for (unsigned i = 0; i < nlevels_; ++i)
-                std::memset(static_cast<void*>(levels_[i].lines), 0, levels_[i].n * sizeof(Line));
+                std::memset(static_cast<void*>(levels_[i].lines), 0, levels_[i].used_lines * sizeof(Line));
         }
+
         nlevels_ = 0;
         total_lines_ = 0;
         size_ = 0;
@@ -159,68 +197,84 @@ public:
     }
 
 private:
-    struct alignas(64) Line {
+    struct alignas(kCacheLineBytes) Line {
         uint64_t key[kSlots];
         uint32_t node[kSlots];
-        uint8_t fill, overflow;         // filled slots and the overflow flag of a home line
-        uint8_t pad[2];
+        uint8_t fill, overflow;         // overflow is only meaningful on a home line
+        uint8_t pad[kLinePadBytes];
     };
-    static_assert(sizeof(Line) == 64, "one cache line");
+    static_assert(sizeof(Line) == kCacheLineBytes, "one cache line");
 
     struct Level {
         std::unique_ptr<Line[]> store;
         Line* lines = nullptr;
-        std::size_t n = 0, cap = 0;       // lines in use / allocated
-        unsigned log2_lines = 0;                  // log2(n)
+        std::size_t used_lines = 0, cap = 0;       // lines in use / allocated
+        unsigned log2_lines = 0;
     };
 
-    /// add_level() - append level nlevels_ with @lines lines (a power of two >= kWindowLines), reusing that level's storage from an earlier partition.
+    /// Appends a level of @p lines lines, a power of two no smaller than kWindowLines.
+    /// Storage left over from an earlier partition at that depth gets reused.
     void add_level(std::size_t lines) {
         if (levels_.size() <= nlevels_) levels_.emplace_back();
-        Level& L = levels_[nlevels_];
-        if (L.cap < lines) {
-            L.store.reset(new Line[lines]);
-            L.cap = lines;
-            std::memset(static_cast<void*>(L.store.get()), 0, lines * sizeof(Line));
+
+        Level& level = levels_[nlevels_];
+
+        if (level.cap < lines) {
+            level.store.reset(new Line[lines]);
+            level.cap = lines;
+            std::memset(static_cast<void*>(level.store.get()), 0, lines * sizeof(Line));
         }
-        L.lines = L.store.get();
-        L.n = lines;
-        L.log2_lines = 0;
-        while ((std::size_t(1) << L.log2_lines) < lines) ++L.log2_lines;
+
+        level.lines = level.store.get();
+        level.used_lines = lines;
+        level.log2_lines = 0;
+
+        while ((std::size_t(1) << level.log2_lines) < lines) ++level.log2_lines;
+
         total_lines_ += lines;
         ++nlevels_;
     }
 
-    /// home() - home line of hash @h on level @i: the top @log2_lines bits of the hash rotated left by kLevelRotation * i bits, so a key's home lines on different levels are independent.
-    static constexpr std::size_t home(uint64_t h, unsigned i, unsigned log2_lines) noexcept {
-        if (i) h = (h << (i * kLevelRotation & 63)) | (h >> ((64 - (i * kLevelRotation & 63)) & 63));
-        return static_cast<std::size_t>(h >> (64 - log2_lines));
+    /// Takes the top @p log2_lines bits after rotating the hash by kLevelRotation per level.
+    /// The rotation keeps a key's home lines on different levels independent of each other.
+    static constexpr std::size_t home(uint64_t hash_val, unsigned level_idx, unsigned log2_lines) noexcept {
+        hash_val = rotate_left(hash_val, level_idx * kLevelRotation);
+
+        return static_cast<std::size_t>(hash_val >> (kWordBits - log2_lines));
     }
-    /// slot_of() - index of @key among the line's filled slots, or -1.
-    /// All kSlots keys are compared without branches and the result is masked by the fill.
-    static int slot_of(const Line& l, uint64_t key) noexcept {
-        unsigned m = 0;
-        for (unsigned s = 0; s < kSlots; ++s) m |= unsigned(l.key[s] == key) << s;
-        m &= (1u << l.fill) - 1u;
-        return m ? __builtin_ctz(m) : -1;
+    /// Compares all kSlots keys without branches, then masks the result by the fill count.
+    static int slot_of(const Line& line, uint64_t key) noexcept {
+        unsigned match_mask = 0;
+
+        for (unsigned s = 0; s < kSlots; ++s) match_mask |= unsigned(line.key[s] == key) << s;
+
+        match_mask &= (1u << line.fill) - 1u;
+        return match_mask ? __builtin_ctz(match_mask) : kNoSlot;
     }
-    /// bump() - @n more occurrences of the key in slot @s, OR-ing in edge bits @bits.
-    /// Past kCountSat the excess goes to the side map, which saturates at a total of 2^32 - 1.
-    void bump(Line& l, int s, uint64_t key, uint8_t bits, uint32_t n) {
-        uint32_t& node = l.node[s];
+    /// Past kCountSat the excess moves to the side map, which itself saturates at a total of 2^32 - 1.
+    void bump(Line& line, int slot, uint64_t key, uint8_t bits, uint32_t occurrences) {
+        uint32_t& node = line.node[slot];
+
         node |= bits;
         const uint32_t room = kCountSat - (node >> kCountShift);
-        if (n <= room) { node += n << kCountShift; return; }
+
+        // Most counts fit in the 24-bit field, and excess_counts_ is touched only by k-mers past kCountSat.
+        if (occurrences <= room) { node += occurrences << kCountShift; return; }
+
         node += room << kCountShift;
         uint64_t& excess = excess_counts_[key];
-        excess = std::min<uint64_t>(excess + (n - room), uint64_t(UINT32_MAX) - kCountSat);
+
+        excess = std::min<uint64_t>(excess + (occurrences - room), uint64_t(UINT32_MAX) - kCountSat);
     }
-    /// count() - total count of @key whose node word is @node.
     uint32_t count(uint64_t key, uint32_t node) const {
-        const uint32_t c = node >> kCountShift;
-        if (c < kCountSat) return c;
-        auto it = excess_counts_.find(key);
-        return it == excess_counts_.end() ? c : static_cast<uint32_t>(std::min<uint64_t>(UINT32_MAX, kCountSat + it->second));
+        const uint32_t stored = node >> kCountShift;
+
+        if (stored < kCountSat) return stored;
+
+        // A saturated field defers to the side map for the rest of the count.
+        auto found = excess_counts_.find(key);
+
+        return found == excess_counts_.end() ? stored : static_cast<uint32_t>(std::min<uint64_t>(UINT32_MAX, kCountSat + found->second));
     }
 
     std::vector<Level> levels_;

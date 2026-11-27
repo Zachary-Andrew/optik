@@ -105,14 +105,21 @@ INT_KEY_BEFORE = "  int endsfree_k = score/(-penalties->match);"
 INT_KEY_AFTER = "  int endsfree_k = wavefront_compute_endsfree_key(penalties,score);"
 
 
+# Exit status for a wrong command line, as getopt-style tools use.
+EXIT_USAGE = 2
+# The const-key expression occurs twice in the source and the int-key expression once.
+CONST_KEY_SITES = 2
+INT_KEY_SITES = 1
+
+
 def main() -> int:
     """Patch the file named on the command line, returning the exit status."""
-    if len(sys.argv) != 2:
+    if len(sys.argv[1:]) != 1:
         print("usage: " + __doc__.split("Usage:")[1].strip(), file=sys.stderr)
-        return 2
+        return EXIT_USAGE
     path = sys.argv[1]
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
 
     if MARKER in text:
         print(f"{path}: already patched (marker {MARKER!r} present), no-op")
@@ -129,11 +136,11 @@ def main() -> int:
 
     new_text = text.replace(REQUIRED_BEFORE, REQUIRED_AFTER)
     # The const-key expression appears twice, in endsfree_limits and endsfree_allocate_null, and the int-key once, in endsfree_init.
-    ck = new_text.count(CONST_KEY_BEFORE)
-    ik = new_text.count(INT_KEY_BEFORE)
-    if ck != 2 or ik != 1:
+    const_key_count = new_text.count(CONST_KEY_BEFORE)
+    int_key_count = new_text.count(INT_KEY_BEFORE)
+    if const_key_count != CONST_KEY_SITES or int_key_count != INT_KEY_SITES:
         print(
-            f"{path}: key-expression anchors shifted (const={ck} int={ik}); "
+            f"{path}: key-expression anchors shifted (const={const_key_count} int={int_key_count}); "
             "upstream drift? no changes made",
             file=sys.stderr,
         )
@@ -149,8 +156,8 @@ def main() -> int:
         )
         return 1
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_text)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(new_text)
     print(f"{path}: patched (edit/indel ends-free boundary key)")
     return 0
 

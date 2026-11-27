@@ -1,4 +1,7 @@
-// reader_stress.cpp - corner cases of the FASTA/FASTQ reader (fasta_reader.hpp), namely whitespace and CRLF line ends, blank lines, '@' quality lines, multi-line FASTQ, gzip (by suffix, by magic bytes, multi-member, quoted paths), and truncated gzip, which must throw instead of yielding a prefix of the input.
+// reader_stress.cpp - corner cases of the FASTA/FASTQ reader (fasta_reader.hpp).
+// It feeds whitespace and CRLF line ends, blank lines, '@' quality lines and multi-line FASTQ.
+// Gzip input is opened by suffix, by magic bytes, as several members and through quoted paths.
+// Truncated gzip must throw instead of yielding a prefix of the input.
 // base_encode must also read RNA U as T.
 #include <cstdio>
 #include <cstdlib>
@@ -17,35 +20,35 @@ static int g_failures = 0;
 
 static std::string g_dir;
 static std::string put(const std::string& name, const std::string& data) {
-    const std::string p = g_dir + "/" + name;
-    std::FILE* f = std::fopen(p.c_str(), "wb");
-    std::fwrite(data.data(), 1, data.size(), f);
-    std::fclose(f);
-    return p;
+    const std::string path = g_dir + "/" + name;
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    std::fwrite(data.data(), 1, data.size(), file);
+    std::fclose(file);
+    return path;
 }
-static std::string slurp(const std::string& p) {
-    std::string s; char buf[65536]; std::size_t n;
-    std::FILE* f = std::fopen(p.c_str(), "rb");
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
-    std::fclose(f);
-    return s;
+static std::string slurp(const std::string& path) {
+    std::string data; char buf[65536]; std::size_t got;
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    while ((got = std::fread(buf, 1, sizeof buf, file)) > 0) data.append(buf, got);
+    std::fclose(file);
+    return data;
 }
-static std::string gz(const std::string& name, const std::string& data) {
-    const std::string p = put(name, data);
-    const std::string cmd = "gzip -nf '" + p + "'";
+static std::string write_gz(const std::string& name, const std::string& data) {
+    const std::string path = put(name, data);
+    const std::string cmd = "gzip -nf '" + path + "'";
     if (std::system(cmd.c_str()) != 0) return "";
-    return p + ".gz";
+    return path + ".gz";
 }
 using Recs = std::vector<std::pair<std::string, std::string>>;
-static Recs read_all(const std::string& p, bool* threw = nullptr) {
-    Recs r;
+static Recs read_all(const std::string& path, bool* threw = nullptr) {
+    Recs recs;
     try {
-        iterate_sequences(p.c_str(), [&](const SeqRecord& x) { r.push_back({x.name, x.seq}); });
+        iterate_sequences(path.c_str(), [&](const SeqRecord& rec) { recs.push_back({rec.name, rec.seq}); });
         if (threw) *threw = false;
     } catch (const std::exception&) {
         if (threw) *threw = true;
     }
-    return r;
+    return recs;
 }
 
 int main() {
@@ -62,24 +65,24 @@ int main() {
           "multi-line FASTQ with '@'/'>' leading quality lines");
 
     const std::string big = [] {
-        std::string s;
-        for (int i = 0; i < 20000; ++i) s += ">r" + std::to_string(i) + "\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n";
-        return s;
+        std::string text;
+        for (int i = 0; i < 20000; ++i) text += ">r" + std::to_string(i) + "\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n";
+        return text;
     }();
-    const std::string g1 = gz("big.fa", big);
-    CHECK(!g1.empty(), "gzip available");
-    if (!g1.empty()) {
+    const std::string gz_path = write_gz("big.fa", big);
+    CHECK(!gz_path.empty(), "gzip available");
+    if (!gz_path.empty()) {
         bool threw = true;
-        CHECK(read_all(g1, &threw).size() == 20000 && !threw, "gzip by suffix");
-        const std::string raw = slurp(g1);
+        CHECK(read_all(gz_path, &threw).size() == 20000 && !threw, "gzip by suffix");
+        const std::string raw = slurp(gz_path);
         CHECK(read_all(put("noext.fa", raw)).size() == 20000, "gzip detected by magic bytes");
-        const std::string mm = put("mm.fa.gz", raw + raw);
-        CHECK(read_all(mm).size() == 40000, "multi-member gzip");
-        const std::string q = put("it's here.fa.gz", raw);
-        CHECK(read_all(q, &threw).size() == 20000 && !threw, "path with a quote and a space");
+        const std::string multi_member = put("mm.fa.gz", raw + raw);
+        CHECK(read_all(multi_member).size() == 40000, "multi-member gzip");
+        const std::string quoted = put("it's here.fa.gz", raw);
+        CHECK(read_all(quoted, &threw).size() == 20000 && !threw, "path with a quote and a space");
         for (double frac : {0.1, 0.5, 0.95}) {
-            const std::string t = put("trunc.fa.gz", raw.substr(0, std::size_t(raw.size() * frac)));
-            read_all(t, &threw);
+            const std::string truncated = put("trunc.fa.gz", raw.substr(0, std::size_t(raw.size() * frac)));
+            read_all(truncated, &threw);
             CHECK(threw, "truncated gzip (%.0f%%) must throw", frac * 100);
         }
         bool missing_threw = false;
@@ -91,8 +94,8 @@ int main() {
           "U encodes as T");
     CHECK(base_encode('N') == 0xFF && base_encode(' ') == 0xFF, "N / space invalid");
 
-    std::error_code ec;
-    std::filesystem::remove_all(g_dir, ec);  // a leftover scratch directory is not a test failure
+    std::error_code err_code;
+    std::filesystem::remove_all(g_dir, err_code);  // a leftover scratch directory is not a test failure
     std::printf(g_failures ? "reader_stress: %d FAILURE(S)\n" : "reader_stress: ALL PASS\n", g_failures);
     return g_failures != 0;
 }

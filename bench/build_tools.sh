@@ -50,7 +50,7 @@ if [[ ${#SELECTED_TOOLS[@]} -eq 0 ]]; then
 fi
 # Download retries of curl.
 readonly CURL_RETRIES=3
-# Salmonella LT2 (NC_003197.1): bytes of its header line prefix checked, and its length in bases.
+# The Salmonella LT2 check (NC_003197.1) compares this many bytes of the header line, then the genome length in bases.
 readonly SALMONELLA_HEADER_BYTES=13
 readonly SALMONELLA_LEN=4857432
 # Primary chromosomes of hg38 (chr1-22, X, Y and M).
@@ -108,7 +108,7 @@ info "tools will be built into $TOOLS_DIR"
 # KMC's Makefile sets CC = g++, so its nested `cd 3rd_party/cloudflare; ./configure; make libz.a` sees CC=g++, configures zlib with g++, and the K&R C then fails to compile as C++.
 # With the variables unset, each Makefile's own choice stays private to it and nested ./configure scripts fall back to cc/gcc, which the Nix gcc wrapper provides.
 # This is harmless on other systems, where these variables are normally unset anyway.
-# Settings that a tool really needs are passed as arguments, e.g. clean_make -C dir CXXFLAGS=..., which still work.
+# Settings that a tool requires are passed as arguments, e.g. clean_make -C dir CXXFLAGS=..., which still work.
 clean_make() {
     env -u CC -u CXX -u CPP make "$@"
 }
@@ -388,10 +388,9 @@ build_picard() {
 }
 
 # wfmash  (https://github.com/waveygang/wfmash)
-#   Long-read pairwise aligner, the successor of the pangenome MashMap pipeline.  It
-#   vendors minimap2, htslib and WFA2-lib as submodules and needs Boost (system,
-#   iostreams, program_options), zlib and bzip2 at configure time.  It is a benchmark
-#   baseline only and never linked into the optik crate.
+#   Long-read pairwise aligner, the successor of the pangenome MashMap pipeline.
+#   It vendors minimap2, htslib and WFA2-lib as submodules and needs Boost (system, iostreams, program_options), zlib and bzip2 at configure time.
+#   It serves only as a benchmark baseline and is never linked into the optik crate.
 #
 #   Where the dev headers are not on the default include path, as on NixOS, pass
 #   CMake cache variables through WFMASH_CMAKE_ARGS, as in
@@ -432,12 +431,10 @@ build_wfmash() {
     ok "wfmash -> $src/build/bin/wfmash"
 }
 
-# salmonella  NCBI RefSeq NC_003197.1, the S.
-# Typhimurium LT2 chromosome
-#   Second-genome reference for run_validations.sh step 7, the long-read suite of 50 kb
-#   and more with the wfmash baseline, and step 9, the official map suite, both skipped
-#   without it.  It is fetched from NCBI E-utilities, checked by accession and its exact
-#   length of 4,857,432 bp, and written atomically.
+# salmonella  NCBI RefSeq NC_003197.1, the S. Typhimurium LT2 chromosome
+#   Second-genome reference for run_validations.sh step 7 (the 50 kb+ long-read suite with the wfmash baseline) and step 9 (the official map suite).
+#   Both steps are skipped without it.
+#   It is fetched from NCBI E-utilities, checked by accession and its exact length of 4,857,432 bp, and written atomically.
 fetch_salmonella() {
     check_dep curl
     local out="$TOOLS_DIR/salmonella_LT2.fa"
@@ -463,12 +460,11 @@ fetch_salmonella() {
 }
 
 # scaling  UCSC hg38 chr21 and chr1 from the GRCh38 primary assembly
-#   Inputs of bench/scaling_bench.py, the large-genome comparison.  Each chromosome is
-#   checked against its GRCh38 length, N bases included.
+#   Inputs of bench/scaling_bench.py, the large-genome comparison.
+#   Each chromosome is checked against its GRCh38 length, N bases included.
 # hg38  (UCSC hg38, primary chromosomes chr1-22, X, Y and M, 3.1 Gbp)
-#   The whole-genome graph test (the README's human genome with 2.5e9 31-mers, built
-#   compact, its unitigs checked against Cuttlefish's with bench/cpp/unitig_digest.cpp).
-#   About 1 GB to download.
+#   The whole-genome graph test builds the README's human genome (2.5e9 31-mers) compact and checks its unitigs against Cuttlefish's with bench/cpp/unitig_digest.cpp.
+#   It is about 1 GB to download.
 fetch_hg38() {
     check_dep curl
     check_dep gunzip
@@ -557,7 +553,7 @@ build_wfa2() {
     # Build the core library and the align_benchmark tool, skipping the examples.
     # WFA2-lib's Makefile does not order lib_wfa before the tools that link lib/libwfa.a, so a single -j build races with "No rule to make target '../../lib/libwfa.a'".
     # The library is therefore built in parallel first and the tools serially afterwards.
-    # Both go through the default `all` target, which carries -O3 -march=native as a target-specific variable.
+    # Both go through the default `all` target, which sets -O3 -march=native as a target-specific variable.
     clean_make -C "$src" setup
     clean_make -C "$src" -j "$JOBS" BUILD_TOOLS=0 BUILD_EXAMPLES=0
     clean_make -C "$src" BUILD_TOOLS=1 BUILD_EXAMPLES=0
@@ -601,9 +597,9 @@ build_zlib_ng() {
 }
 
 # rtg  (RTG Tools, https://github.com/RealTimeGenomics/rtg-tools)
-#   vcfeval, the haplotype-aware VCF comparison inside GIAB's hap.py, which
-#   bench/real_reads.py variants uses.  The latest release's Linux build bundles its
-#   own JRE, so no system Java is needed.  Installed as temp/rtg/rtg.
+#   vcfeval, the haplotype-aware VCF comparison inside GIAB's hap.py, which bench/real_reads.py variants uses.
+#   The latest release's Linux build bundles its own JRE, so no system Java is needed.
+#   It is installed as temp/rtg/rtg.
 build_rtg() {
     local dest="$TOOLS_DIR/rtg" tag zip
     tag="$(curl -fsSL https://api.github.com/repos/RealTimeGenomics/rtg-tools/releases/latest \
@@ -617,7 +613,7 @@ build_rtg() {
     # It drops the permission bits, which are restored from the archive so the launcher and the bundled JRE stay executable.
     python3 - "$zip" "$TOOLS_DIR" <<'PY'
 import os, sys, zipfile
-# The unix mode of a zip entry sits in the high 16 bits of external_attr; only its permission bits are restored.
+# The unix mode of a zip entry sits in the high 16 bits of external_attr, and only its permission bits are restored.
 ZIP_UNIX_MODE_SHIFT = 16
 PERMISSION_BITS = 0o777
 z = zipfile.ZipFile(sys.argv[1])

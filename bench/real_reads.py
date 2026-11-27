@@ -13,8 +13,7 @@ Real reads carry no placement truth, so the truth comes from the reads' own stru
              The per-bin test is the Poisson test of mapq_calibration.py.
 
   variants   Germline small-variant calling against a GIAB benchmark (such as HG002 v4.2.1).
-             Each tool's paired SAM goes through samtools sort, bcftools mpileup | call -mv and a QUAL >= 20, DP >= 5 filter, is normalized (bcftools norm -m -both -f REF) and is compared with the normalized truth inside the benchmark BED by RTG vcfeval (--rtg).
-             vcfeval is haplotype- and genotype-aware and is the engine of GIAB's hap.py, so an indel written differently but giving the same haplotype counts as found.
+             Each tool's paired SAM goes through samtools sort, bcftools mpileup | call -mv and a QUAL >= 20, DP >= 5 filter, is normalized (bcftools norm -m -both -f REF) and is compared with the normalized truth inside the benchmark BED by RTG vcfeval (--rtg). vcfeval is haplotype- and genotype-aware and is the engine of GIAB's hap.py, so an indel written differently but giving the same haplotype counts as found.
              Without RTG, calls are matched allele by allele, which is stricter, since one haplotype written two ways counts as an FP and an FN.
              Precision and recall are reported for SNPs and indels.
 
@@ -41,22 +40,61 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+from typing import NamedTuple
+
 import hw
 import memcap
 import report as results_file
-from mapq_calibration import BINS, poisson_tail
+from diagnostics import LOG_TAIL_CHARS
+from fastq import FASTQ_LINES_PER_RECORD
+from mapq_calibration import (
+    BINS,
+    OVERCONFIDENT_P,
+    overconfident,
+    poisson_tail,
+)
 from sam_spec import (
     HIGH_MAPQ,
-    SAM_FLAG_PROPER_PAIR,
-    SAM_FLAG_READ1,
-    SAM_FLAG_REVERSE,
-    SAM_FLAG_UNMAPPED,
-    SAM_FLAGS_SECONDARY_SUPPLEMENTARY,
+    PHRED_SCALE,
+    SamCol,
+    SamFlag,
+    VcfCol,
 )
+
+# variants mode results per tool and type: (TP, FP, FN, precision, recall, F1)
+VARIANT_F1 = 5
+# SAM lines are split only as far as needed: primaries() reads QNAME..CIGAR and longreads() QNAME..RNEXT.
+# Everything after that stays one field.
+SAM_SPLIT_PRIMARIES = SamCol.RNEXT
+SAM_SPLIT_LONGREADS = SamCol.PNEXT
+# mates are numbered 1 and 2, so a mate's partner is MATE_NUMBER_SUM minus its number
+MATE_NUMBER_SUM = 3
+# anchored mode: a partner anchors its mate when it is a proper pair at this MAPQ or more in every tool, and placements agree within ANCHOR_TOL bp
+ANCHOR_MIN_MAPQ = 50
+ANCHOR_TOL = 20
+# variants mode: the denominator floor of F1, and how far optik's F1 may trail another mapper's
+F1_EPS = 1e-9
+F1_TOLERANCE = 0.005
+# In longreads mode, indels at least BIG_INDEL_LEN long are compared.
+# Two primaries agree when they lie within LOCUS_TOL bp of each other.
+BIG_INDEL_LEN = 50
+LOCUS_TOL = 50
+# two large indels are the same when within INDEL_POS_TOL bp and their lengths within max(INDEL_MIN_LEN_TOL, INDEL_LEN_TOL_FRAC x length)
+INDEL_POS_TOL = 100
+INDEL_MIN_LEN_TOL = 10
+INDEL_LEN_TOL_FRAC = 0.2
 
 MEM_CAP = (
     None  # set from --mem-cap, so every tool runs under its own resident-memory cap
 )
+
+
+# Mates are numbered as in their /1 and /2 name suffixes.
+MATE1, MATE2 = 1, 2
+# A MAPQ bin counts its placements, its wrong ones and the errors its MAPQs imply, in this order.
+BIN_TOTAL, BIN_WRONG, BIN_IMPLIED = 0, 1, 2
+# F1 is the harmonic mean of precision and recall, 2PR / (P + R).
+F1_HARMONIC_FACTOR = 2
 
 
 def cap_bytes():
@@ -66,92 +104,114 @@ def cap_bytes():
     return memcap.parse_size(MEM_CAP)
 
 
-def sh(cmd, out=None, env=None):
+def run_shell(cmd, out=None, env=None):
     """Run cmd under the memory cap, writing stdout to `out` when given, and stop on failure."""
-    with open(out, "w") if out else open(os.devnull, "w") as fh:
-        p = memcap.run(
-            [str(c) for c in cmd],
+    with open(out, "w") if out else open(os.devnull, "w") as handle:
+        proc = memcap.run(
+            [str(arg) for arg in cmd],
             cap_bytes(),
-            stdout=fh if out else subprocess.PIPE,
+            stdout=handle if out else subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=env,
         )
-    if p.returncode != 0:
+    if proc.returncode != 0:
         sys.exit(
-            f"command failed ({p.returncode}): {' '.join(map(str, cmd))}\n{p.stderr[-1500:]}"
+            f"command failed ({proc.returncode}): {' '.join(map(str, cmd))}\n{proc.stderr[-LOG_TAIL_CHARS:]}"
         )
-    return p
+    return proc
 
 
-def head_fastq(src, dst, n):
+def head_fastq(src, dst, num_reads):
     """Link or copy the first n records of a FASTQ.
     n = 0 means all of them, given as a symlink."""
     if os.path.exists(dst):
         return dst
-    if n <= 0:
+    if num_reads <= 0:
         os.symlink(os.path.abspath(src), dst)
         return dst
-    with open(src) as f, open(dst, "w") as o:
-        for i, line in enumerate(f):
-            if i >= 4 * n:
+    with open(src) as in_handle, open(dst, "w") as out_handle:
+        for i, line in enumerate(in_handle):
+            if i >= FASTQ_LINES_PER_RECORD * num_reads:
                 break
-            o.write(line)
+            out_handle.write(line)
     return dst
 
 
-def origin(f):
+def origin(fields):
     """(ref, strand, origin) of a record, where origin is the leftmost aligned base minus a leading clip."""
-    ops = re.findall(r"(\d+)([MIDNSHP=X])", f[5])
+    ops = re.findall(r"(\d+)([MIDNSHP=X])", fields[SamCol.CIGAR])
     lead = int(ops[0][0]) if ops and ops[0][1] in "SH" else 0
-    return f[2], "-" if int(f[1]) & SAM_FLAG_REVERSE else "+", int(f[3]) - 1 - lead
+    return fields[SamCol.RNAME], "-" if int(fields[SamCol.FLAG]) & SamFlag.REVERSE else "+", int(fields[SamCol.POS]) - 1 - lead
+
+
+class Placement(NamedTuple):
+    """Records where a read lies, by reference, strand and origin."""
+
+    ref: str
+    strand: str
+    origin: int
+
+
+class Primary(NamedTuple):
+    """A read's primary alignment, as primaries() reports it."""
+
+    ref: str
+    strand: str
+    origin: int
+    mapq: int
+    flag: int
+
+    @property
+    def placement(self):
+        return Placement(self.ref, self.strand, self.origin)
 
 
 def primaries(sam, paired):
     """Map name (or name/mate) to (ref, strand, origin, mapq, flag) of each primary."""
     out = {}
-    with open(sam) as fh:
-        for line in fh:
+    with open(sam) as handle:
+        for line in handle:
             if line[0] == "@":
                 continue
-            f = line.split("\t", 6)
-            flag = int(f[1])
-            if flag & SAM_FLAGS_SECONDARY_SUPPLEMENTARY:
+            fields = line.split("\t", SAM_SPLIT_PRIMARIES)
+            flag = int(fields[SamCol.FLAG])
+            if flag & SamFlag.SECONDARY_SUPPLEMENTARY:
                 continue
-            name = f[0]
+            name = fields[SamCol.QNAME]
             if paired:
-                name = f"{name}/{1 if flag & SAM_FLAG_READ1 else 2}"
+                name = f"{name}/{MATE1 if flag & SamFlag.READ1 else MATE2}"
             elif name.endswith(("/1", "/2")):
                 pass
-            if flag & SAM_FLAG_UNMAPPED:
+            if flag & SamFlag.UNMAPPED:
                 out[name] = None
             else:
-                r, s, o = origin(f)
-                out[name] = (r, s, o, int(f[4]), flag)
+                ref_name, strand, origin_pos = origin(fields)
+                out[name] = Primary(ref_name, strand, origin_pos, int(fields[SamCol.MAPQ]), flag)
     return out
 
 
-def map_cmds(a, ref, r1, r2=None, se_tag=None):
+def map_cmds(args, ref, reads1, reads2=None, se_tag=None):
     """{tool: argv} for paired mapping when r2 is given, else for single-end mapping."""
-    reads = [r1] + ([r2] if r2 else [])
+    reads = [reads1] + ([reads2] if reads2 else [])
     cmds = {
-        "optik": [a.optik, "map", "-r", ref, "-t", a.threads]
-        + [a for r in reads for a in ("-q", r)],
-        "minimap2": [a.minimap2, "-ax", "sr", "-t", a.threads, ref] + reads,
+        "optik": [args.optik, "map", "-r", ref, "-t", args.threads]
+        + [arg for read_path in reads for arg in ("-q", read_path)],
+        "minimap2": [args.minimap2, "-ax", "sr", "-t", args.threads, ref] + reads,
     }
-    if a.bwa_index:
-        cmds["bwa"] = [a.bwa, "mem", "-t", a.threads, a.bwa_index] + reads
+    if args.bwa_index:
+        cmds["bwa"] = [args.bwa, "mem", "-t", args.threads, args.bwa_index] + reads
     return cmds
 
 
-def run_maps(a, tag, ref, r1, r2=None):
+def run_maps(args, tag, ref, reads1, reads2=None):
     """Map with every tool, reusing a non-empty SAM from an earlier run, and return {tool: SAM path}."""
     sams = {}
-    for tool, cmd in map_cmds(a, ref, r1, r2).items():
-        sam = os.path.join(a.out, f"{tool}_{tag}.sam")
+    for tool, cmd in map_cmds(args, ref, reads1, reads2).items():
+        sam = os.path.join(args.out, f"{tool}_{tag}.sam")
         if not os.path.exists(sam) or os.path.getsize(sam) == 0:
             print(f"  mapping {tag} with {tool}", flush=True)
-            sh(cmd, out=sam + ".part")
+            run_shell(cmd, out=sam + ".part")
             os.replace(sam + ".part", sam)
         sams[tool] = sam
     return sams
@@ -159,118 +219,123 @@ def run_maps(a, tag, ref, r1, r2=None):
 
 def calib_line(label, rows):
     """Print a MAPQ calibration line for (mapq, correct) rows and return (over-confident bins, MAPQ>=30, wrong)."""
-    bins = {b: [0, 0, 0.0] for b in BINS}
-    for q, ok in rows:
-        for b in BINS:
-            if b[0] <= q <= b[1]:
-                x = bins[b]
-                x[0] += 1
-                x[1] += not ok
-                x[2] += 10 ** (-q / 10)
+    bins = {bin_range: [0, 0, 0.0] for bin_range in BINS}
+    for mapq, correct in rows:
+        for bin_range in BINS:
+            if bin_range[0] <= mapq <= bin_range[1]:
+                bin_counts = bins[bin_range]
+                bin_counts[BIN_TOTAL] += 1
+                bin_counts[BIN_WRONG] += not correct
+                bin_counts[BIN_IMPLIED] += PHRED_SCALE ** (-mapq / PHRED_SCALE)
                 break
-    hq = sum(x[0] for b, x in bins.items() if b[0] >= HIGH_MAPQ)
-    hqw = sum(x[1] for b, x in bins.items() if b[0] >= HIGH_MAPQ)
+    hq_total = sum(bin_counts[BIN_TOTAL] for bin_range, bin_counts in bins.items() if bin_range[0] >= HIGH_MAPQ)
+    hqw = sum(bin_counts[BIN_WRONG] for bin_range, bin_counts in bins.items() if bin_range[0] >= HIGH_MAPQ)
     cells, over = [], []
-    for (lo, hi), (n, w, lam) in bins.items():
-        if not n:
+    for (bin_lo, bin_hi), (count, wrong, lam) in bins.items():
+        if not count:
             continue
-        cells.append(f"{lo}-{hi}:{w}/{lam:.1f}" if lo else f"0:{w}/{n}")
-        if lo > 0 and w > 2 * lam + 3 and poisson_tail(w, lam) < 1e-3:
-            over.append(f"MAPQ {lo}-{hi}: {w} wrong vs {lam:.1f} implied")
+        cells.append(f"{bin_lo}-{bin_hi}:{wrong}/{lam:.1f}" if bin_lo else f"0:{wrong}/{count}")
+        # A bin is flagged only when its excess errors are also unlikely by chance under a Poisson count.
+        if bin_lo > 0 and overconfident(wrong, lam) and poisson_tail(wrong, lam) < OVERCONFIDENT_P:
+            over.append(f"MAPQ {bin_lo}-{bin_hi}: {wrong} wrong vs {lam:.1f} implied")
     print(
-        f"  {label:10} mapped {len(rows):8}  MAPQ>=30 {hq:8} wrong {hqw:4} | wrong/implied: "
+        f"  {label:10} mapped {len(rows):8}  MAPQ>=30 {hq_total:8} wrong {hqw:4} | wrong/implied: "
         + "  ".join(cells)
     )
     ROWS.append(
         {
             "tool": label,
             "mapped": len(rows),
-            "mapq30": hq,
+            "mapq30": hq_total,
             "mapq30_wrong": hqw,
             "wrong/implied by MAPQ bin": "  ".join(cells),
         }
     )
-    return over, hq, hqw
+    return over, hq_total, hqw
 
 
-def anchored(a):
+def anchored(args):
     """Anchored mode, which judges single-end MAPQ against loci fixed by uniquely placed partners."""
-    r1 = head_fastq(a.r1, os.path.join(a.out, "a_R1.fq"), a.pairs)
-    r2 = head_fastq(a.r2, os.path.join(a.out, "a_R2.fq"), a.pairs)
-    pe = {t: primaries(s, True) for t, s in run_maps(a, "pe", a.ref, r1, r2).items()}
-    tools = list(pe)
+    reads1 = head_fastq(args.r1, os.path.join(args.out, "a_R1.fq"), args.pairs)
+    reads2 = head_fastq(args.r2, os.path.join(args.out, "a_R2.fq"), args.pairs)
+    paired_recs = {tool: primaries(sam, True) for tool, sam in run_maps(args, "pe", args.ref, reads1, reads2).items()}
+    tools = list(paired_recs)
     truth, left_out = {}, collections.Counter()
-    names = set().union(*[set(d) for d in pe.values()])
-    for nm in names:
-        base, m = nm.rsplit("/", 1)
-        partner = f"{base}/{3 - int(m)}"
-        recs = [pe[t].get(nm) for t in tools]
-        precs = [pe[t].get(partner) for t in tools]
-        if any(x is None for x in recs + precs):
+    names = set().union(*[set(recs_by_name) for recs_by_name in paired_recs.values()])
+    for read_name in names:
+        base, mate_str = read_name.rsplit("/", 1)
+        partner = f"{base}/{MATE_NUMBER_SUM - int(mate_str)}"
+        recs = [paired_recs[tool].get(read_name) for tool in tools]
+        precs = [paired_recs[tool].get(partner) for tool in tools]
+        if any(rec is None for rec in recs + precs):
             left_out["a mate unmapped by some tool"] += 1
             continue
-        if not all(p[3] >= 50 and p[4] & SAM_FLAG_PROPER_PAIR for p in precs):
+        if not all(partner_rec.mapq >= ANCHOR_MIN_MAPQ and partner_rec.flag & SamFlag.PROPER_PAIR for partner_rec in precs):
             left_out["partner not MAPQ>=50 proper in every tool"] += 1
             continue
 
-        def same(xs):
+        def same(placements):
             """True when all placements share reference and strand and lie within 20 bp."""
             return all(
-                x[0] == xs[0][0] and x[1] == xs[0][1] and abs(x[2] - xs[0][2]) <= 20
-                for x in xs
+                place.ref == placements[0].ref
+                and place.strand == placements[0].strand
+                and abs(place.origin - placements[0].origin) <= ANCHOR_TOL
+                for place in placements
             )
 
         if not same(precs) or not same(recs):
             left_out["tools place the pair differently"] += 1
             continue
-        truth[nm] = recs[0][:3]
+        truth[read_name] = recs[0].placement
     print(f"anchored mates: {len(truth)} of {len(names)} ({dict(left_out)})")
     with open(
-        os.path.join(a.out, "anchored_truth.tsv"), "w"
-    ) as fo:  # kept for offline MAPQ studies
-        for nm, (r, s, o) in truth.items():
-            fo.write(f"{nm}\t{r}\t{s}\t{o}\n")
+        os.path.join(args.out, "anchored_truth.tsv"), "w"
+    ) as handle:  # kept for offline MAPQ studies
+        for read_name, (ref_name, strand, origin_pos) in truth.items():
+            handle.write(f"{read_name}\t{ref_name}\t{strand}\t{origin_pos}\n")
     rep = {}
     failed = []
-    for mate, fq in ((1, r1), (2, r2)):
-        for t, s in run_maps(a, f"se{mate}", a.ref, fq).items():
-            for nm, rec in primaries(s, False).items():
-                key = nm if nm.endswith(("/1", "/2")) else f"{nm}/{mate}"
+    for mate, fq_path in ((MATE1, reads1), (MATE2, reads2)):
+        for tool, sam in run_maps(args, f"se{mate}", args.ref, fq_path).items():
+            for read_name, rec in primaries(sam, False).items():
+                # Mappers differ in whether they keep the /1 /2 suffix, so names are normalised to include it.
+                key = read_name if read_name.endswith(("/1", "/2")) else f"{read_name}/{mate}"
                 if key in truth:
-                    rep.setdefault(t, []).append(
+                    rep.setdefault(tool, []).append(
                         rec
                         and (
-                            rec[3],
-                            rec[0] == truth[key][0]
-                            and rec[1] == truth[key][1]
-                            and abs(rec[2] - truth[key][2]) <= 20,
+                            rec.mapq,
+                            rec.ref == truth[key].ref
+                            and rec.strand == truth[key].strand
+                            and abs(rec.origin - truth[key].origin) <= ANCHOR_TOL,
                         )
                     )
     print("single-end MAPQ of anchored mates (wrong / implied by MAPQ, per bin):")
     summary = {}
-    for t in tools:
-        rows = [x for x in rep.get(t, []) if x]
-        unm = sum(1 for x in rep.get(t, []) if not x)
-        over, hq, hqw = calib_line(t, rows)
+    for tool in tools:
+        # Unmapped mates are recorded as None and counted separately from the MAPQ bins.
+        rows = [row for row in rep.get(tool, []) if row]
+        unm = sum(1 for row in rep.get(tool, []) if not row)
+        over, hq_total, hqw = calib_line(tool, rows)
         print(f"  {'':10} unmapped {unm}")
         ROWS[-1]["unmapped"] = unm
-        summary[t] = (hq, hqw, over)
-        if t == "optik":
+        summary[tool] = (hq_total, hqw, over)
+        if tool == "optik":
             failed += over
     return failed
 
 
-def norm_vcf(a, vcf, out, region, bed=None):
+def norm_vcf(args, vcf, out, region, bed=None):
     """Normalize a VCF to `region` and return its {snp, indel} allele keys, inside `bed` when given."""
     # -r needs an index, which is always rebuilt, because the filtered VCF is rewritten on each run and a stale index from an earlier run makes norm return nothing.
-    sh([a.bcftools, "index", "-f", vcf])
+    run_shell([args.bcftools, "index", "-f", vcf])
     cmd = [
-        a.bcftools,
+        args.bcftools,
         "norm",
         "-m",
         "-both",
         "-f",
-        a.ref,
+        args.ref,
         "-r",
         region,
         "-Oz",
@@ -278,40 +343,42 @@ def norm_vcf(a, vcf, out, region, bed=None):
         out,
         vcf,
     ]
-    sh(cmd)
-    sh([a.bcftools, "index", "-f", out])
+    run_shell(cmd)
+    run_shell([args.bcftools, "index", "-f", out])
     keys = {"snp": set(), "indel": set()}
-    view = [a.bcftools, "view", "-H"] + (["-T", bed] if bed else []) + [out]
-    p = subprocess.run(
-        [str(c) for c in view], capture_output=True, text=True, check=True
+    view = [args.bcftools, "view", "-H"] + (["-T", bed] if bed else []) + [out]
+    proc = subprocess.run(
+        [str(arg) for arg in view], capture_output=True, text=True, check=True
     )
-    for line in p.stdout.splitlines():
-        f = line.split("\t")
-        ref, alt = f[3], f[4]
+    for line in proc.stdout.splitlines():
+        fields = line.split("\t")
+        ref, alt = fields[VcfCol.REF], fields[VcfCol.ALT]
         if alt in ("*", ".") or "<" in alt:
             continue
         kind = "snp" if len(ref) == len(alt) == 1 else "indel"
-        keys[kind].add((f[0], int(f[1]), ref, alt))
+        keys[kind].add((fields[VcfCol.CHROM], int(fields[VcfCol.POS]), ref, alt))
     return keys
 
 
-def vcfeval(a, truth_vcf, calls_vcf, bed, out):
+def vcfeval(args, truth_vcf, calls_vcf, bed, out):
     """Compare calls with the truth by RTG vcfeval, haplotype- and genotype-aware.
 
     vcfeval is the engine of GIAB's hap.py, so an indel or SNP written differently but giving the same haplotypes counts as a match.
     Returns (TP, FP, FN) per type, with recall taken from the baseline side and precision from the call side."""
-    sdf = os.path.join(a.out, f"{a.region}.sdf")
+    # vcfeval reads the reference as an RTG SDF, which is built once per region and then reused.
+    sdf = os.path.join(args.out, f"{args.region}.sdf")
     if not os.path.isdir(sdf):
-        fa = os.path.join(a.out, f"{a.region}.fa")
-        sh([a.samtools, "faidx", a.ref, a.region], out=fa)
-        sh([a.rtg, "format", "-o", sdf, fa])
-    for v in (truth_vcf, calls_vcf):
-        sh([a.bcftools, "index", "-t", "-f", v])
+        ref_fa = os.path.join(args.out, f"{args.region}.fa")
+        run_shell([args.samtools, "faidx", args.ref, args.region], out=ref_fa)
+        run_shell([args.rtg, "format", "-o", sdf, ref_fa])
+    for vcf in (truth_vcf, calls_vcf):
+        run_shell([args.bcftools, "index", "-t", "-f", vcf])
+    # vcfeval refuses to write into an existing directory, so the previous run's output is removed first.
     shutil.rmtree(out, ignore_errors=True)
     env = dict(os.environ, RTG_MEM=os.environ.get("RTG_MEM", "6g"))
-    sh(
+    run_shell(
         [
-            a.rtg,
+            args.rtg,
             "vcfeval",
             "-b",
             truth_vcf,
@@ -324,68 +391,71 @@ def vcfeval(a, truth_vcf, calls_vcf, bed, out):
             "-o",
             out,
             "--threads",
-            a.threads,
+            args.threads,
         ],
         env=env,
     )
 
     def count(name):
         """SNP and indel counts of one vcfeval output VCF."""
-        c = {"snp": 0, "indel": 0}
-        p = subprocess.run(
-            [str(a.bcftools), "view", "-H", os.path.join(out, name)],
+        counts = {"snp": 0, "indel": 0}
+        proc = subprocess.run(
+            [str(args.bcftools), "view", "-H", os.path.join(out, name)],
             capture_output=True,
             text=True,
             check=True,
         )
-        for line in p.stdout.splitlines():
-            f = line.split("\t")
-            ref, alts = f[3], [x for x in f[4].split(",") if x not in ("*", ".")]
-            c[
+        for line in proc.stdout.splitlines():
+            fields = line.split("\t")
+            ref, alts = fields[VcfCol.REF], [alt for alt in fields[VcfCol.ALT].split(",") if alt not in ("*", ".")]
+            counts[
                 "snp"
-                if alts and all(len(ref) == len(x) == 1 for x in alts)
+                if alts and all(len(ref) == len(alt) == 1 for alt in alts)
                 else "indel"
             ] += 1
-        return c
+        return counts
 
-    tpb, tpc, fp, fn = (
-        count(n) for n in ("tp-baseline.vcf.gz", "tp.vcf.gz", "fp.vcf.gz", "fn.vcf.gz")
+    # True positives come in the baseline representation for recall and in the call representation for precision.
+    tpb, tpc, false_pos, false_neg = (
+        count(vcf_name) for vcf_name in ("tp-baseline.vcf.gz", "tp.vcf.gz", "fp.vcf.gz", "fn.vcf.gz")
     )
-    return {k: (tpb[k], tpc[k], fp[k], fn[k]) for k in ("snp", "indel")}
+    return {kind: (tpb[kind], tpc[kind], false_pos[kind], false_neg[kind]) for kind in ("snp", "indel")}
 
 
-def variants(a):
+def variants(args):
     """Variants mode, which calls germline variants from each tool's mapping and scores them against GIAB."""
-    bed = os.path.join(a.out, "truth_region.bed")
-    with open(a.truth_bed) as f, open(bed, "w") as o:
-        for line in f:
-            if line.split("\t")[0] == a.region:
-                o.write(line)
+    bed = os.path.join(args.out, "truth_region.bed")
+    # The truth regions are cut to the chromosome being called, so every tool is scored on the same intervals.
+    with open(args.truth_bed) as in_handle, open(bed, "w") as out_handle:
+        for line in in_handle:
+            if line.split("\t")[0] == args.region:
+                out_handle.write(line)
     truth = norm_vcf(
-        a, a.truth_vcf, os.path.join(a.out, "truth.norm.vcf.gz"), a.region, bed
+        args, args.truth_vcf, os.path.join(args.out, "truth.norm.vcf.gz"), args.region, bed
     )
     print(
-        f"truth in {a.region} benchmark regions: {len(truth['snp'])} SNPs, {len(truth['indel'])} indels; "
-        f"scored by {'rtg vcfeval (haplotype- and genotype-aware)' if a.rtg else 'exact allele match'}"
+        f"truth in {args.region} benchmark regions: {len(truth['snp'])} SNPs, {len(truth['indel'])} indels; "
+        f"scored by {'rtg vcfeval (haplotype- and genotype-aware)' if args.rtg else 'exact allele match'}"
     )
     failed, res = [], {}
-    for t, sam in run_maps(a, "var", a.ref, a.r1, a.r2).items():
-        bam = os.path.join(a.out, f"{t}.bam")
+    for tool, sam in run_maps(args, "var", args.ref, args.r1, args.r2).items():
+        bam = os.path.join(args.out, f"{tool}.bam")
+        # Sorted BAMs and calls left by an earlier run are reused, because a rerun only needs to score them again.
         if not os.path.exists(bam + ".bai"):
-            sh([a.samtools, "sort", "-@", a.threads, "-m", "1G", "-o", bam, sam])
-            sh([a.samtools, "index", bam])
-        raw = os.path.join(a.out, f"{t}.calls.vcf.gz")
+            run_shell([args.samtools, "sort", "-@", args.threads, "-m", "1G", "-o", bam, sam])
+            run_shell([args.samtools, "index", bam])
+        raw = os.path.join(args.out, f"{tool}.calls.vcf.gz")
         if not os.path.exists(raw):
-            mp = memcap.popen(
+            mpileup_proc = memcap.popen(
                 [
-                    str(x)
-                    for x in (
-                        a.bcftools,
+                    str(arg)
+                    for arg in (
+                        args.bcftools,
                         "mpileup",
                         "-f",
-                        a.ref,
+                        args.ref,
                         "-r",
-                        a.region,
+                        args.region,
                         "-a",
                         "AD,DP",
                         "-Ou",
@@ -395,126 +465,137 @@ def variants(a):
                 cap_bytes(),
                 stdout=subprocess.PIPE,
             )
-            cl = subprocess.run(
-                [str(a.bcftools), "call", "-mv", "-Oz", "-o", raw],
-                stdin=mp.stdout,
+            call_proc = subprocess.run(
+                [str(args.bcftools), "call", "-mv", "-Oz", "-o", raw],
+                stdin=mpileup_proc.stdout,
                 check=False,
             )
-            mp.wait()
-            if cl.returncode or mp.returncode:
-                sys.exit(f"bcftools failed for {t}")
-        filt = os.path.join(a.out, f"{t}.filt.vcf.gz")
-        sh([a.bcftools, "view", "-i", "QUAL>=20 && INFO/DP>=5", "-Oz", "-o", filt, raw])
+            mpileup_proc.wait()
+            if call_proc.returncode or mpileup_proc.returncode:
+                sys.exit(f"bcftools failed for {tool}")
+        filt = os.path.join(args.out, f"{tool}.filt.vcf.gz")
+        # Calls below QUAL 20 or depth 5 are dropped before scoring.
+        run_shell([args.bcftools, "view", "-i", "QUAL>=20 && INFO/DP>=5", "-Oz", "-o", filt, raw])
         calls = norm_vcf(
-            a, filt, os.path.join(a.out, f"{t}.norm.vcf.gz"), a.region, bed
+            args, filt, os.path.join(args.out, f"{tool}.norm.vcf.gz"), args.region, bed
         )
+        # A tool with no SNP calls at all points to a broken pipeline, so the run stops instead of scoring it as zero recall.
         if not calls["snp"]:
             sys.exit(
-                f"{t}: no calls in {a.region} after filtering -- pipeline error, not a result"
+                f"{tool}: no calls in {args.region} after filtering -- pipeline error, not a result"
             )
-        res[t] = {}
-        ve = (
+        res[tool] = {}
+        eval_res = (
             vcfeval(
-                a,
-                os.path.join(a.out, "truth.norm.vcf.gz"),
-                os.path.join(a.out, f"{t}.norm.vcf.gz"),
+                args,
+                os.path.join(args.out, "truth.norm.vcf.gz"),
+                os.path.join(args.out, f"{tool}.norm.vcf.gz"),
                 bed,
-                os.path.join(a.out, f"vcfeval_{t}"),
+                os.path.join(args.out, f"vcfeval_{tool}"),
             )
-            if a.rtg
+            if args.rtg
             else None
         )
         for kind in ("snp", "indel"):
-            if ve:
-                tp, tpc, fp, fn = ve[kind]
-                prec = tpc / max(1, tpc + fp)
+            if eval_res:
+                true_pos, tpc, false_pos, false_neg = eval_res[kind]
+                prec = tpc / max(1, tpc + false_pos)
             else:
                 # Without RTG, exact allele match after bcftools norm, which is stricter, because equivalent representations of one haplotype count as an FP and an FN.
-                tp = len(calls[kind] & truth[kind])
-                fp = len(calls[kind] - truth[kind])
-                prec = tp / max(1, tp + fp)
-                fn = len(truth[kind] - calls[kind])
-            rec = tp / max(1, tp + fn)
-            f1 = 2 * prec * rec / max(1e-9, prec + rec)
-            res[t][kind] = (tp, fp, fn, prec, rec, f1)
+                true_pos = len(calls[kind] & truth[kind])
+                false_pos = len(calls[kind] - truth[kind])
+                prec = true_pos / max(1, true_pos + false_pos)
+                false_neg = len(truth[kind] - calls[kind])
+            # max(1, ...) guards against an empty call or truth set.
+            rec = true_pos / max(1, true_pos + false_neg)
+            f1_score = F1_HARMONIC_FACTOR * prec * rec / max(F1_EPS, prec + rec)
+            res[tool][kind] = (true_pos, false_pos, false_neg, prec, rec, f1_score)
             ROWS.append(
                 {
-                    "tool": t,
+                    "tool": tool,
                     "type": kind,
-                    "TP": tp,
-                    "FP": fp,
-                    "FN": fn,
+                    "TP": true_pos,
+                    "FP": false_pos,
+                    "FN": false_neg,
                     "precision": round(prec, 4),
                     "recall": round(rec, 4),
-                    "F1": round(f1, 4),
+                    "F1": round(f1_score, 4),
                 }
             )
             print(
-                f"  {t:9} {kind:5} TP {tp:6} FP {fp:5} FN {fn:5}  precision {prec:.4f}  recall {rec:.4f}  F1 {f1:.4f}"
+                f"  {tool:9} {kind:5} TP {true_pos:6} FP {false_pos:5} FN {false_neg:5}  precision {prec:.4f}  recall {rec:.4f}  F1 {f1_score:.4f}"
             )
     if "optik" in res:
         for other in res:
             if other == "optik":
                 continue
             for kind in ("snp", "indel"):
-                if res["optik"][kind][5] < res[other][kind][5] - 0.005:
+                # optik fails only when it trails another mapper by more than the tolerance. Small F1 noise is accepted.
+                if res["optik"][kind][VARIANT_F1] < res[other][kind][VARIANT_F1] - F1_TOLERANCE:
                     failed.append(
-                        f"{kind} F1: optik {res['optik'][kind][5]:.4f} < {other} {res[other][kind][5]:.4f} - 0.005"
+                        f"{kind} F1: optik {res['optik'][kind][VARIANT_F1]:.4f} < {other} {res[other][kind][VARIANT_F1]:.4f} - {F1_TOLERANCE}"
                     )
     return failed
 
 
-def longreads(a):
+def longreads(args):
     """Longreads mode, which compares optik's and minimap2's primaries and large indels on real long reads."""
     sams = {}
-    for t, cmd in (
-        ("optik", [a.optik, "map", "-r", a.ref, "-q", a.reads, "-t", a.threads]),
-        ("minimap2", [a.minimap2, "-ax", a.preset, "-t", a.threads, a.ref, a.reads]),
+    for tool, cmd in (
+        ("optik", [args.optik, "map", "-r", args.ref, "-q", args.reads, "-t", args.threads]),
+        ("minimap2", [args.minimap2, "-ax", args.preset, "-t", args.threads, args.ref, args.reads]),
     ):
-        sam = os.path.join(a.out, f"{t}_long.sam")
+        sam = os.path.join(args.out, f"{tool}_long.sam")
         if not os.path.exists(sam) or os.path.getsize(sam) == 0:
-            print(f"  mapping long reads with {t}", flush=True)
-            sh(cmd, out=sam + ".part")
+            print(f"  mapping long reads with {tool}", flush=True)
+            # Writing to .part and renaming means an interrupted run never leaves a SAM that looks complete.
+            run_shell(cmd, out=sam + ".part")
             os.replace(sam + ".part", sam)
-        sams[t] = sam
+        sams[tool] = sam
     recs, big = {}, {}
-    for t, sam in sams.items():
-        d, b = {}, []
-        with open(sam) as fh:
-            for line in fh:
+    for tool, sam in sams.items():
+        by_name, indels = {}, []
+        with open(sam) as handle:
+            for line in handle:
                 if line[0] == "@":
                     continue
-                f = line.split("\t", 7)
-                flag = int(f[1])
-                if flag & SAM_FLAGS_SECONDARY_SUPPLEMENTARY:
+                fields = line.split("\t", SAM_SPLIT_LONGREADS)
+                flag = int(fields[SamCol.FLAG])
+                if flag & SamFlag.SECONDARY_SUPPLEMENTARY:
                     continue
-                if flag & SAM_FLAG_UNMAPPED:
-                    d[f[0]] = None
+                if flag & SamFlag.UNMAPPED:
+                    by_name[fields[SamCol.QNAME]] = None
                     continue
-                r, s, o = origin(f)
-                d[f[0]] = (r, s, o, int(f[4]))
-                pos = int(f[3]) - 1
-                for n, op in re.findall(r"(\d+)([MIDNSHP=X])", f[5]):
-                    n = int(n)
-                    if op in "ID" and n >= 50:
-                        b.append((r, pos, op, n, f[0]))
-                    if op in "MDN=X":
-                        pos += n
-        recs[t], big[t] = d, b
+                ref_name, strand, origin_pos = origin(fields)
+                by_name[fields[SamCol.QNAME]] = Primary(ref_name, strand, origin_pos, int(fields[SamCol.MAPQ]), flag)
+                pos = int(fields[SamCol.POS]) - 1
+                for op_len, cigar_op in re.findall(r"(\d+)([MIDNSHP=X])", fields[SamCol.CIGAR]):
+                    op_len = int(op_len)
+                    if cigar_op in "ID" and op_len >= BIG_INDEL_LEN:
+                        indels.append((ref_name, pos, cigar_op, op_len, fields[SamCol.QNAME]))
+                    # Only reference-consuming ops move pos, so each indel gets its reference coordinate.
+                    if cigar_op in "MDN=X":
+                        pos += op_len
+        recs[tool], big[tool] = by_name, indels
+    # A disagreement where either side reports MAPQ >= 30 means one mapper is confidently wrong, which is what dis_hq_o and dis_hq_m count.
     names = set(recs["optik"]) | set(recs["minimap2"])
     agree = dis = dis_hq_o = dis_hq_m = un_o = un_m = 0
-    for nm in names:
-        o, m = recs["optik"].get(nm), recs["minimap2"].get(nm)
-        un_o += o is None
-        un_m += m is None
-        if o is None or m is None:
+    for read_name in names:
+        optik_rec, mm_rec = recs["optik"].get(read_name), recs["minimap2"].get(read_name)
+        un_o += optik_rec is None
+        un_m += mm_rec is None
+        if optik_rec is None or mm_rec is None:
             continue
-        if o[0] == m[0] and o[1] == m[1] and abs(o[2] - m[2]) <= max(50, 0):
+        if (
+            optik_rec.ref == mm_rec.ref
+            and optik_rec.strand == mm_rec.strand
+            and abs(optik_rec.origin - mm_rec.origin) <= max(LOCUS_TOL, 0)
+        ):
             agree += 1
         else:
             dis += 1
-            dis_hq_o += o[3] >= HIGH_MAPQ
-            dis_hq_m += m[3] >= HIGH_MAPQ
+            dis_hq_o += optik_rec.mapq >= HIGH_MAPQ
+            dis_hq_m += mm_rec.mapq >= HIGH_MAPQ
     print(
         f"  reads {len(names)}: unmapped optik {un_o}, minimap2 {un_m}; same primary locus {agree}, "
         f"different {dis} (MAPQ>=30 there: optik {dis_hq_o}, minimap2 {dis_hq_m})"
@@ -522,39 +603,39 @@ def longreads(a):
 
     # Large indels are either shared (same read, position within 100 bp, same operation, length within 20%) or tool-only.
 
-    by_read = {t: collections.defaultdict(list) for t in big}
-    for t, b in big.items():
-        for r, p, op, n, nm in b:
-            by_read[t][nm].append((r, p, op, n))
+    by_read = {tool: collections.defaultdict(list) for tool in big}
+    for tool, indels in big.items():
+        for ref_name, indel_pos, cigar_op, op_len, read_name in indels:
+            by_read[tool][read_name].append((ref_name, indel_pos, cigar_op, op_len))
     only = {}
-    for t, u in (("optik", "minimap2"), ("minimap2", "optik")):
-        c = 0
-        for nm, evs in by_read[t].items():
-            for r, p, op, n in evs:
+    for tool, other in (("optik", "minimap2"), ("minimap2", "optik")):
+        only_count = 0
+        for read_name, evs in by_read[tool].items():
+            for ref_name, indel_pos, cigar_op, op_len in evs:
                 if not any(
-                    r == r2
-                    and op == op2
-                    and abs(p - p2) <= 100
-                    and abs(n - n2) <= max(10, 0.2 * n)
-                    for r2, p2, op2, n2 in by_read[u].get(nm, [])
+                    ref_name == other_ref
+                    and cigar_op == op2
+                    and abs(indel_pos - other_pos) <= INDEL_POS_TOL
+                    and abs(op_len - other_len) <= max(INDEL_MIN_LEN_TOL, INDEL_LEN_TOL_FRAC * op_len)
+                    for other_ref, other_pos, op2, other_len in by_read[other].get(read_name, [])
                 ):
-                    c += 1
-        only[t] = c
+                    only_count += 1
+        only[tool] = only_count
     print(
         f"  >= 50 bp indels in primaries: optik {len(big['optik'])} ({only['optik']} not in minimap2's record "
         f"of the same read), minimap2 {len(big['minimap2'])} ({only['minimap2']} not in optik's)"
     )
-    for t, u in (("optik", "minimap2"), ("minimap2", "optik")):
+    for tool, other in (("optik", "minimap2"), ("minimap2", "optik")):
         ROWS.append(
             {
-                "tool": t,
+                "tool": tool,
                 "reads": len(names),
-                "unmapped": un_o if t == "optik" else un_m,
+                "unmapped": un_o if tool == "optik" else un_m,
                 "same_primary_locus": agree,
                 "different_locus": dis,
-                "mapq30_at_different": dis_hq_o if t == "optik" else dis_hq_m,
-                "indels_50bp": len(big[t]),
-                f"indels_50bp_not_in_{u}": only[t],
+                "mapq30_at_different": dis_hq_o if tool == "optik" else dis_hq_m,
+                "indels_50bp": len(big[tool]),
+                f"indels_50bp_not_in_{other}": only[tool],
             }
         )
     return []
@@ -572,47 +653,49 @@ MODE_TITLES = {
 
 def main():
     """Run the anchored, variants or longreads mode."""
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("mode", choices=("anchored", "variants", "longreads"))
-    ap.add_argument("--ref", required=True)
-    ap.add_argument("--r1")
-    ap.add_argument("--r2")
-    ap.add_argument("--reads")
-    ap.add_argument("--preset", default="map-hifi")
-    ap.add_argument(
+    # Each mode reads its own inputs, so --r1/--r2 serve anchored and variants while --reads serves longreads.
+    parser.add_argument("mode", choices=("anchored", "variants", "longreads"))
+    parser.add_argument("--ref", required=True)
+    parser.add_argument("--r1")
+    parser.add_argument("--r2")
+    parser.add_argument("--reads")
+    parser.add_argument("--preset", default="map-hifi")
+    parser.add_argument(
         "--pairs", type=int, default=0, help="anchored: use the first N pairs (0 = all)"
     )
-    ap.add_argument("--truth-vcf")
-    ap.add_argument("--truth-bed")
-    ap.add_argument("--region", default="chr20")
-    ap.add_argument("--out", required=True)
-    ap.add_argument(
+    parser.add_argument("--truth-vcf")
+    parser.add_argument("--truth-bed")
+    parser.add_argument("--region", default="chr20")
+    parser.add_argument("--out", required=True)
+    parser.add_argument(
         "--threads",
         default=str(hw.cpus()),
         help="threads of every tool (default: the usable CPUs)",
     )
-    ap.add_argument("--optik", default=os.path.join(ROOT, "target/release/optik"))
-    ap.add_argument("--minimap2", default=os.path.join(ROOT, "temp/minimap2/minimap2"))
-    ap.add_argument(
+    parser.add_argument("--optik", default=os.path.join(ROOT, "target/release/optik"))
+    parser.add_argument("--minimap2", default=os.path.join(ROOT, "temp/minimap2/minimap2"))
+    # Tool paths fall back from PATH to the copies bench/build_tools.sh puts under temp/, then to the Nix GC roots.
+    parser.add_argument(
         "--bwa",
         default=shutil.which("bwa")
         or next(
             (
-                p
-                for p in (
+                path
+                for path in (
                     os.path.join(ROOT, "temp/bwa/bwa"),
                     os.path.join(ROOT, "temp/gcroots/bwa/bin/bwa"),
                 )
-                if os.path.exists(p)
+                if os.path.exists(path)
             ),
             os.path.join(ROOT, "temp/bwa/bwa"),
         ),
     )
-    ap.add_argument("--bwa-index", help="BWA index prefix (adds BWA-MEM as a baseline)")
-    ap.add_argument("--samtools", default=shutil.which("samtools"))
-    ap.add_argument(
+    parser.add_argument("--bwa-index", help="BWA index prefix (adds BWA-MEM as a baseline)")
+    parser.add_argument("--samtools", default=shutil.which("samtools"))
+    parser.add_argument(
         "--bcftools",
         default=os.environ.get("BCFTOOLS_BIN")
         or shutil.which("bcftools")
@@ -622,50 +705,52 @@ def main():
             else os.path.join(ROOT, "temp/gcroots/bcftools/bin/bcftools")
         ),
     )
-    ap.add_argument(
+    parser.add_argument(
         "--rtg",
         default=shutil.which("rtg")
         or next(
             (
-                p
-                for p in (
+                path
+                for path in (
                     os.path.join(ROOT, "temp/rtg/rtg"),
                     os.path.join(ROOT, "temp/gcroots/rtg/bin/rtg"),
                 )
-                if os.path.exists(p)
+                if os.path.exists(path)
             ),
             None,
         ),
         help="RTG Tools rtg (vcfeval: haplotype-aware comparison, as GIAB hap.py); "
         "without it calls are matched allele by allele",
     )
-    ap.add_argument("--gate", action="store_true")
-    ap.add_argument(
+    parser.add_argument("--gate", action="store_true")
+    parser.add_argument(
         "--mem-cap",
         default=hw.default_cap_str(),
         help="resident-memory cap of each tool ('' = uncapped; default: usable memory less 2 GiB)",
     )
-    results_file.add_argument(ap)
-    a = ap.parse_args()
+    results_file.add_argument(parser)
+    args = parser.parse_args()
     global MEM_CAP
-    MEM_CAP = a.mem_cap or None
-    os.makedirs(a.out, exist_ok=True)
+    # An empty --mem-cap means no cap, which the runners take as None.
+    MEM_CAP = args.mem_cap or None
+    os.makedirs(args.out, exist_ok=True)
+    # Each mode returns its list of failures, and an empty list is a pass.
     failed = {"anchored": anchored, "variants": variants, "longreads": longreads}[
-        a.mode
-    ](a)
-    for x in failed:
-        print("  [FAIL]", x)
-    print(f"real_reads {a.mode}: " + ("FAILED" if failed else "PASS"))
+        args.mode
+    ](args)
+    for failure in failed:
+        print("  [FAIL]", failure)
+    print(f"real_reads {args.mode}: " + ("FAILED" if failed else "PASS"))
     results_file.write_section(
-        a.report,
-        f"real_{a.mode}",
-        MODE_TITLES[a.mode] + f" (reference {os.path.basename(a.ref)})",
+        args.report,
+        f"real_{args.mode}",
+        MODE_TITLES[args.mode] + f" (reference {os.path.basename(args.ref)})",
         [("", ROWS)],
-        optik=a.optik,
-        notes=[f"- FAIL {x}" for x in failed]
-        + [f"SAMs and logs: `{os.path.relpath(a.out, ROOT)}`"],
+        optik=args.optik,
+        notes=[f"- FAIL {failure}" for failure in failed]
+        + [f"SAMs and logs: `{os.path.relpath(args.out, ROOT)}`"],
     )
-    return 1 if failed and a.gate else 0
+    return 1 if failed and args.gate else 0
 
 
 if __name__ == "__main__":
