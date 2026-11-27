@@ -1,8 +1,10 @@
-/*
- * ffi_spss.cpp - C ABI of the SPSS index (build-spss, spss-update, query), with okspss_* for the static index, okdyn_* for its dynamic form.
+/**
+ * @file
+ * @brief C ABI of the SPSS index behind build-spss, spss-update and query.
+ * okspss_* functions cover the static index, and okdyn_* its editable form.
  *
- * The index file holds the 8-byte magic "OKSPSS", the SpssCore::save() blob and an 8-byte checksum trailer.
- * The 8-byte magic keeps every array of the blob 8-byte aligned when the file is mapped, so the arrays are used in place.
+ * An index file is the 8-byte magic "OKSPSS", the SpssCore::save() blob and an 8-byte checksum trailer.
+ * Padding the magic to 8 bytes keeps every array in the blob 8-byte aligned, so a mapped file can be used in place.
  */
 #include <cstdio>
 #include <cstring>
@@ -31,49 +33,64 @@
 using tpoptoa::ffi::set_error;
 
 namespace {
-// The 8-byte magic, padded with zeros so the blob after it stays 8-byte aligned.
 constexpr std::size_t kMagicBytes = 8;
+
+using tpoptoa::ffi::kStatusFailed;
+using tpoptoa::ffi::kStatusOk;
+/// okspss_ids result for a window that is absent or contains a non-ACGT base.
+constexpr int64_t kAbsentId = -1;
 constexpr std::size_t kChecksumBytes = 8;
 constexpr char kSpssMagic[kMagicBytes] = {'O', 'K', 'S', 'P', 'S', 'S', 0, 0};
 
-/// blob_checksum() - corruption checksum of @n bytes at @p.
+/// Detects bit rot and truncation, with no cryptographic claim.
 ///
-/// 1 MiB blocks are hashed in parallel (wymix() 128-bit multiply-fold per 16 bytes, wyhash.hpp) and the block hashes folded in order.
-/// Not cryptographic, and it detects bit rot and truncation.
-/// It is part of the file format, so it must not change.
-uint64_t blob_checksum(const uint8_t* p, std::size_t n) {
-    constexpr std::size_t kBlock = std::size_t(1) << 20;
-    const std::size_t nb = (n + kBlock - 1) / kBlock;
-    std::vector<uint64_t> block_hash(nb);
-    const uint64_t* S = tpoptoa::kWyhashDefaultSecret;
+/// Blocks are hashed in parallel, folding 16 bytes per wymix() step, and the block hashes are then folded in order.
+/// Since it's part of the file format, changing it would invalidate every saved index.
+uint64_t blob_checksum(const uint8_t* data, std::size_t num_bytes) {
+    constexpr std::size_t kStepBytes = 2 * sizeof(uint64_t);   // two words per wymix()
+    constexpr std::size_t kBlock = std::size_t(1) << 20;       // 1 MiB, the unit of parallel work
+    const std::size_t num_blocks = (num_bytes + kBlock - 1) / kBlock;
+    std::vector<uint64_t> block_hash(num_blocks);
+    const uint64_t* secret = tpoptoa::kWyhashDefaultSecret;
+
     #pragma omp parallel for schedule(static)
-    for (std::size_t b = 0; b < nb; ++b) {
-        const uint8_t* q = p + b * kBlock;
-        const std::size_t len = std::min(kBlock, n - b * kBlock);
-        uint64_t h = S[0] ^ b, w0, w1;
-        std::size_t i = 0;
-        for (; i + 16 <= len; i += 16) {
-            std::memcpy(&w0, q + i, 8); std::memcpy(&w1, q + i + 8, 8);
-            h = tpoptoa::wymix(w0 ^ S[1] ^ h, w1 ^ S[2]);
+    for (std::size_t b = 0; b < num_blocks; ++b) {
+        const uint8_t* block_data = data + b * kBlock;
+        const std::size_t len = std::min(kBlock, num_bytes - b * kBlock);
+        // The block index seeds each digest, tying it to its position.
+        uint64_t hash = secret[0] ^ b, lo_word, hi_word;
+        std::size_t pos = 0;
+
+        for (; pos + kStepBytes <= len; pos += kStepBytes) {
+            std::memcpy(&lo_word, block_data + pos, sizeof(uint64_t)); std::memcpy(&hi_word, block_data + pos + sizeof(uint64_t), sizeof(uint64_t));
+            hash = tpoptoa::wymix(lo_word ^ secret[1] ^ hash, hi_word ^ secret[2]);
         }
-        uint8_t tail[16] = {0};
-        std::memcpy(tail, q + i, len - i);
-        std::memcpy(&w0, tail, 8); std::memcpy(&w1, tail + 8, 8);
-        block_hash[b] = tpoptoa::wymix(w0 ^ S[1] ^ h, w1 ^ S[3] ^ len);
+
+        // The tail is zero-padded to a full word, and folding in its length keeps a short block from colliding with one ending in zero bytes.
+        uint8_t tail[kStepBytes] = {0};
+
+        std::memcpy(tail, block_data + pos, len - pos);
+        std::memcpy(&lo_word, tail, sizeof(uint64_t)); std::memcpy(&hi_word, tail + sizeof(uint64_t), sizeof(uint64_t));
+        block_hash[b] = tpoptoa::wymix(lo_word ^ secret[1] ^ hash, hi_word ^ secret[3] ^ len);
     }
-    uint64_t h = S[0] ^ n;
-    for (uint64_t x : block_hash) h = tpoptoa::wymix(h ^ S[1], x ^ S[2]);
-    return h;
+
+    uint64_t hash = secret[0] ^ num_bytes;
+
+    // Block order makes the checksum independent of thread count.
+    for (uint64_t block_digest : block_hash) hash = tpoptoa::wymix(hash ^ secret[1], block_digest ^ secret[2]);
+
+    return hash;
 }
 
-/// write_index() - append the checksum to @blob, the magic followed by the SpssCore blob, and write it to @path atomically through atomic_file.hpp.
-/// An interrupted write then never leaves a truncated index, and an in-place update with -i X -o X never truncates the mapped input.
+/// Appends the checksum and writes the file through atomic_file.hpp.
+/// That way an interrupted write never leaves a truncated index, and -i X -o X never truncates the mapped input.
 bool write_index(const char* path, std::vector<uint8_t>& blob) {
-    const uint64_t cs = blob_checksum(blob.data() + kMagicBytes, blob.size() - kMagicBytes);
-    uint8_t b[8]; std::memcpy(b, &cs, 8);
-    blob.insert(blob.end(), b, b + 8);
-    return tpoptoa::atomic_write(path, [&](std::ofstream& os) {
-        os.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
+    const uint64_t checksum = blob_checksum(blob.data() + kMagicBytes, blob.size() - kMagicBytes);
+    uint8_t bytes[sizeof(uint64_t)]; std::memcpy(bytes, &checksum, sizeof(uint64_t));
+
+    blob.insert(blob.end(), bytes, bytes + sizeof(uint64_t));
+    return tpoptoa::atomic_write(path, [&](std::ofstream& out) {
+        out.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
     });
 }
 
@@ -81,239 +98,288 @@ bool write_index(const char* path, std::vector<uint8_t>& blob) {
 
 extern "C" {
 
-/// OkSpss - a static index, built in memory or mapped from a file.
 struct OkSpss {
     tpoptoa::SpssCore core;
-    void* map = nullptr;          // zero-copy mapping backing core's arrays
+    void* map = nullptr;          // when set, core's arrays point into this mapping
     std::size_t map_len = 0;
+
     ~OkSpss() { if (map) ::munmap(map, map_len); }
 };
 
-/// okspss_build_from_fasta() - build from a FASTA/FASTQ.
-/// With @compact == 0 the input sequences are indexed as given, which is exact for any input and size-optimal when the input is already an SPSS such as unitigs.
-/// With compact != 0 the k-mers are counted under the min_count filter and compacted into maximal unitigs first.
-OkSpss* okspss_build_from_fasta(const char* path, uint64_t k, uint64_t m,
+/// With @p compact == 0 the input sequences are indexed as given.
+/// That is exact for any input and already size-optimal when the input is an SPSS such as unitigs.
+/// Otherwise the k-mers are counted under min_count and compacted into maximal unitigs first.
+OkSpss* okspss_build_from_fasta(const char* path, uint64_t kmer_len, uint64_t minimizer_len,
                                 int compact, uint64_t min_count, unsigned nthreads,
                                 char* errbuf, uint64_t errbuf_len) {
     auto fail = [&](const char* msg) -> OkSpss* {
         set_error(errbuf, errbuf_len, msg);
         return nullptr;
     };
+
     try {
-        tpoptoa::PhaseTimer pt;                         // OPTIK_TIMING=1
+        tpoptoa::PhaseTimer timer;
         std::vector<std::string> seqs;
+
         if (compact) {
-            tpoptoa::DbgGraph g(static_cast<unsigned>(k));
-            std::unique_ptr<tpoptoa::DbgGraphEF> ef;       // when the node table exceeds the limit
-            std::unique_ptr<tpoptoa::PartUnitigs> pu;      // partitioned compaction
-            tpoptoa::detail::count_into_graph(path, k, static_cast<uint32_t>(min_count),
-                                              nthreads, g, &ef,
-                                              tpoptoa::part_mode_wanted(static_cast<unsigned>(k)) ? &pu : nullptr);
-            if ((pu ? pu->core_size() : ef ? ef->core_size() : g.core_size()) == 0)
+            tpoptoa::DbgGraph graph(static_cast<unsigned>(kmer_len));
+            std::unique_ptr<tpoptoa::DbgGraphEF> ef_graph;       // set if the plain table won't fit
+            std::unique_ptr<tpoptoa::PartUnitigs> part_unitigs;
+
+            tpoptoa::detail::count_into_graph(path, kmer_len, static_cast<uint32_t>(min_count),
+                                              nthreads, graph, &ef_graph,
+                                              tpoptoa::part_mode_wanted(static_cast<unsigned>(kmer_len)) ? &part_unitigs : nullptr);
+            if ((part_unitigs ? part_unitigs->core_size() : ef_graph ? ef_graph->core_size() : graph.core_size()) == 0)
                 return fail("no k-mers extracted from input");
-            auto add = [&](const uint8_t* s, uint32_t len, uint64_t) {
-                seqs.emplace_back(reinterpret_cast<const char*>(s), len);
+
+            auto add = [&](const uint8_t* seq, uint32_t len, uint64_t) {
+                seqs.emplace_back(reinterpret_cast<const char*>(seq), len);
             };
-            if (pu) pu->unitigs(add, nthreads);
-            else if (ef) ef->unitigs(add, nthreads);
-            else g.unitigs(add, nthreads);
+
+            if (part_unitigs) part_unitigs->unitigs(add, nthreads);
+            else if (ef_graph) ef_graph->unitigs(add, nthreads);
+            else graph.unitigs(add, nthreads);
         } else {
             tpoptoa::iterate_inputs(path, [&](const tpoptoa::SeqRecord& rec) {
                 seqs.push_back(rec.seq);
             });
         }
-        pt.lap("spss: read input");
-        // m = 0 lets SpssCore::choose_m pick it from the input, exact at any m
-        if (m == 0) m = tpoptoa::SpssCore::choose_m(seqs, static_cast<unsigned>(k));
-        pt.lap("spss: choose m");
-        auto* h = new OkSpss();
-        if (!h->core.build(seqs, static_cast<unsigned>(k), static_cast<unsigned>(m), nthreads, &seqs)) {
-            delete h;
+
+        timer.lap("spss: read input");
+
+        // m = 0 lets SpssCore::choose_m pick a value from the input, and any m gives an exact index.
+        // m = 0 asks for the estimate-driven choice.
+        if (minimizer_len == 0) minimizer_len = tpoptoa::SpssCore::choose_m(seqs, static_cast<unsigned>(kmer_len));
+
+        timer.lap("spss: choose m");
+        auto* handle = new OkSpss();
+
+        if (!handle->core.build(seqs, static_cast<unsigned>(kmer_len), static_cast<unsigned>(minimizer_len), nthreads, &seqs)) {
+            delete handle;
             return fail("SPSS build failed (check 1 <= m < k <= 32)");
         }
-        return h;
-    } catch (const std::exception& e) {
-        return fail(e.what());
+
+        return handle;
+    } catch (const std::exception& err) {
+        return fail(err.what());
     }
 }
 
-void okspss_free(OkSpss* h) { delete h; }
+void okspss_free(OkSpss* handle) { delete handle; }
 
-/// okspss_save() - write the index in the current format, returning 0 on success.
-int okspss_save(const OkSpss* h, const char* path) {
+int okspss_save(const OkSpss* handle, const char* path) {
     try {
         std::vector<uint8_t> blob(kSpssMagic, kSpssMagic + kMagicBytes);
-        h->core.save(blob);
-        return write_index(path, blob) ? 0 : -1;
+
+        handle->core.save(blob);
+        return write_index(path, blob) ? kStatusOk : kStatusFailed;
     } catch (...) {
-        return -1;
+        return kStatusFailed;
     }
 }
 
-/// okspss_load() - map an index file and use its big arrays in place, without a read loop or copy, so opening an index costs page-table setup plus the pages queries touch.
-/// @verify != 0 first checks the checksum, which reads the whole file once.
+/// Maps the file and uses its big arrays in place, so opening costs only page-table setup plus whatever pages queries touch.
+/// Passing @p verify != 0 checks the checksum first, which reads the whole file once.
 OkSpss* okspss_load(const char* path, int verify, char* errbuf, uint64_t errbuf_len) {
     auto fail = [&](const char* msg) -> OkSpss* {
         set_error(errbuf, errbuf_len, msg);
         return nullptr;
     };
-    const int fd = ::open(path, O_RDONLY);
-    if (fd < 0) return fail("cannot open SPSS index");
-    struct stat st;
-    if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(kMagicBytes)) { ::close(fd); return fail("not an SPSS index"); }
-    const std::size_t len = static_cast<std::size_t>(st.st_size);
-    void* m = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED) return fail("mmap failed");
-    tpoptoa::advise_huge(m, len);   // file THP where the kernel supports it
-    const auto* p = static_cast<const uint8_t*>(m);
-    if (std::memcmp(p, kSpssMagic, kMagicBytes) != 0) {
-        ::munmap(m, len);
+    const int file_desc = ::open(path, O_RDONLY);
+
+    if (file_desc < 0) return fail("cannot open SPSS index");
+
+    struct stat info;
+
+    if (::fstat(file_desc, &info) != 0 || info.st_size < static_cast<off_t>(kMagicBytes)) { ::close(file_desc); return fail("not an SPSS index"); }
+
+    const std::size_t len = static_cast<std::size_t>(info.st_size);
+    void* mapping = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, file_desc, 0);
+
+    ::close(file_desc);
+
+    if (mapping == MAP_FAILED) return fail("mmap failed");
+
+    tpoptoa::advise_huge(mapping, len);   // file-backed THP, where the kernel supports it
+    const auto* bytes = static_cast<const uint8_t*>(mapping);
+
+    if (std::memcmp(bytes, kSpssMagic, kMagicBytes) != 0) {
+        ::munmap(mapping, len);
         return fail("not an optik SPSS index (bad magic); rebuild it with build-spss");
     }
-    if (len < kMagicBytes + kChecksumBytes) { ::munmap(m, len); return fail("corrupt SPSS index (truncated)"); }
-    const std::size_t body = len - kMagicBytes - kChecksumBytes;   // blob bytes after the magic
+
+    // The 8-byte checksum follows the body. A file shorter than magic plus checksum cannot hold one and is rejected as truncated.
+    if (len < kMagicBytes + kChecksumBytes) { ::munmap(mapping, len); return fail("corrupt SPSS index (truncated)"); }
+
+    const std::size_t body = len - kMagicBytes - kChecksumBytes;
+
     if (verify) {
-        uint64_t want; std::memcpy(&want, p + len - kChecksumBytes, kChecksumBytes);
-        if (blob_checksum(p + kMagicBytes, body) != want) {
-            ::munmap(m, len);
+        uint64_t want; std::memcpy(&want, bytes + len - kChecksumBytes, kChecksumBytes);
+
+        if (blob_checksum(bytes + kMagicBytes, body) != want) {
+            ::munmap(mapping, len);
             return fail("corrupt SPSS index (checksum mismatch: truncated or modified file)");
         }
     }
-    auto* h = new OkSpss();
-    h->map = m; h->map_len = len;
-    if (h->core.load(p + kMagicBytes, body, /*borrow=*/true) != body) {
-        delete h;
+
+    auto* handle = new OkSpss();
+
+    // SpssCore borrows its arrays from the mapping, which okspss_free() unmaps together with the handle.
+    handle->map = mapping; handle->map_len = len;
+
+    if (handle->core.load(bytes + kMagicBytes, body, /*borrow=*/true) != body) {
+        delete handle;
         return fail("corrupt SPSS index");
     }
-    return h;
+
+    return handle;
 }
 
-uint64_t okspss_kmers(const OkSpss* h) { return h->core.stats().kmers; }
-uint64_t okspss_bytes(const OkSpss* h) { return h->core.bytes(); }
-uint32_t okspss_k(const OkSpss* h) { return h->core.k(); }
-uint32_t okspss_m(const OkSpss* h) { return h->core.m(); }
-uint64_t okspss_superkmers(const OkSpss* h) { return h->core.stats().superkmers; }
+uint64_t okspss_kmers(const OkSpss* handle) { return handle->core.stats().kmers; }
+uint64_t okspss_bytes(const OkSpss* handle) { return handle->core.bytes(); }
+uint32_t okspss_k(const OkSpss* handle) { return handle->core.kmer_len(); }
+uint32_t okspss_m(const OkSpss* handle) { return handle->core.minimizer_len(); }
+uint64_t okspss_superkmers(const OkSpss* handle) { return handle->core.stats().superkmers; }
 
-/// okspss_distinct() - distinct canonical k-mers.
-/// okspss_kmers counts k-mer positions in the
-/// spectrum-preserving string set, which repeats a k-mer when the input does (build-spss without --compact indexes records as given), where a position is the k-mer's first occurrence iff the lookup of its k-mer returns it.
-uint64_t okspss_distinct(const OkSpss* h) { return h->core.count_distinct(); }
+/// Counts distinct canonical k-mers.
+/// okspss_kmers instead counts positions, which repeat whenever the input does, since build-spss without --compact indexes records as given.
+/// A position is a k-mer's first occurrence exactly when looking up that k-mer returns it.
+uint64_t okspss_distinct(const OkSpss* handle) { return handle->core.count_distinct(); }
 
-/// okspss_ids() - dictionary lookup of every k-mer window of @seq:
-/// out[i] = dense k-mer
-/// identifier in [0, num_kmers) of window i, or -1 when it is absent or holds a non-ACGT base.
-/// out holds len - k + 1 entries, and that count is returned.
-uint64_t okspss_ids(const OkSpss* h, const char* seq, uint64_t len, int64_t* out) {
-    const unsigned k = h->core.k();
-    if (len < k) return 0;
-    const uint64_t mask = tpoptoa::kmer_mask(k);
-    uint64_t f = 0; uint64_t valid = 0;
+/// Writes each window's dense id in [0, num_kmers) to out[i], or kAbsentId when the window is missing or invalid.
+/// @p out needs len - k + 1 entries, and that count is returned.
+uint64_t okspss_ids(const OkSpss* handle, const char* seq, uint64_t len, int64_t* out) {
+    const unsigned kmer_len = handle->core.kmer_len();
+
+    if (len < kmer_len) return 0;
+
+    const uint64_t mask = tpoptoa::kmer_mask(kmer_len);
+    uint64_t fwd = 0; uint64_t valid = 0;
+
     for (uint64_t i = 0; i < len; ++i) {
-        const uint8_t b = tpoptoa::base_encode(seq[i]);
-        if (b == tpoptoa::kInvalidBase) { valid = 0; f = 0; }
-        else { f = ((f << 2) | b) & mask; ++valid; }
-        if (i + 1 >= k) {
-            int64_t id = -1;
-            if (valid >= k) {
-                const uint64_t r = h->core.kmer_id(f);
-                if (r != tpoptoa::SpssCore::kNotFound) id = static_cast<int64_t>(r);
+        const uint8_t base = tpoptoa::base_encode(seq[i]);
+
+        if (base == tpoptoa::kInvalidBase) { valid = 0; fwd = 0; }
+        else { fwd = ((fwd << tpoptoa::kBitsPerBase) | base) & mask; ++valid; }
+
+        // Every window position gets an output slot, and a window containing N is left at the absent id.
+        if (i + 1 >= kmer_len) {
+            int64_t kmer_ident = kAbsentId;
+
+            if (valid >= kmer_len) {
+                const uint64_t found = handle->core.kmer_id(fwd);
+
+                if (found != tpoptoa::SpssCore::kNotFound) kmer_ident = static_cast<int64_t>(found);
             }
-            out[i + 1 - k] = id;
+
+            out[i + 1 - kmer_len] = kmer_ident;
         }
     }
-    return len - k + 1;
+
+    return len - kmer_len + 1;
 }
 
-/// okspss_scan_seq() - streaming lookup of every k-mer of one sequence (non-ACGT characters restart the k-mer).
-void okspss_scan_seq(const OkSpss* h, const char* seq, uint64_t len,
+void okspss_scan_seq(const OkSpss* handle, const char* seq, uint64_t len,
                      uint64_t* num_valid, uint64_t* num_positive,
                      uint64_t* num_searches, uint64_t* num_extensions) {
-    tpoptoa::SpssCore::ScanStats st;
-    h->core.scan(seq, static_cast<std::size_t>(len), st);
-    *num_valid = st.valid;
-    *num_positive = st.positive;
-    *num_searches = st.searches;
-    *num_extensions = st.extensions;
+    tpoptoa::SpssCore::ScanStats stats;
+
+    handle->core.scan(seq, static_cast<std::size_t>(len), stats);
+    *num_valid = stats.valid;
+    *num_positive = stats.positive;
+    *num_searches = stats.searches;
+    *num_extensions = stats.extensions;
 }
 
-/// okspss_scan_many() - streaming lookup over many records at once, so cache misses overlap across records (SpssCore::scan_many()).
-void okspss_scan_many(const OkSpss* h, const char* const* seqs, const uint64_t* lens,
-                      uint64_t n, uint64_t* num_valid, uint64_t* num_positive,
+/// Handles many records per call, so cache misses overlap across records (SpssCore::scan_many()).
+void okspss_scan_many(const OkSpss* handle, const char* const* seqs, const uint64_t* lens,
+                      uint64_t count, uint64_t* num_valid, uint64_t* num_positive,
                       uint64_t* num_searches, uint64_t* num_extensions) {
-    std::vector<std::size_t> l(lens, lens + n);
-    tpoptoa::SpssCore::ScanStats st;
-    h->core.scan_many(seqs, l.data(), static_cast<std::size_t>(n), st);
-    *num_valid = st.valid;
-    *num_positive = st.positive;
-    *num_searches = st.searches;
-    *num_extensions = st.extensions;
+    std::vector<std::size_t> lens_sz(lens, lens + count);
+    tpoptoa::SpssCore::ScanStats stats;
+
+    handle->core.scan_many(seqs, lens_sz.data(), static_cast<std::size_t>(count), stats);
+    *num_valid = stats.valid;
+    *num_positive = stats.positive;
+    *num_searches = stats.searches;
+    *num_extensions = stats.extensions;
 }
 
-// Dynamic updates use the static core plus open-addressing edit sets (dyn_spss.hpp), compacted into a new static core on save.
+// spss-update edits a loaded index through DynSpss (dyn_spss.hpp) and compacts it into a new static core on save.
 
-/// OkDynSpss - an index opened for spss-update.
 struct OkDynSpss {
-    void* map = nullptr;             // backing mapping of the loaded core
+    void* map = nullptr;             // the loaded core still points into this
     std::size_t map_len = 0;
     std::unique_ptr<tpoptoa::DynSpss> dyn;
+
     ~OkDynSpss() { dyn.reset(); if (map) ::munmap(map, map_len); }
 };
 
-/// okdyn_open() - load @path for editing after verifying its checksum.
+/// Always verifies the checksum, because an edit would otherwise bake corruption into the new file.
 OkDynSpss* okdyn_open(const char* path, char* errbuf, uint64_t errbuf_len) {
-    OkSpss* s = okspss_load(path, /*verify=*/1, errbuf, errbuf_len);
-    if (!s) return nullptr;
-    auto* h = new OkDynSpss();
-    h->map = s->map; h->map_len = s->map_len;
-    s->map = nullptr;                                  // ownership moves to h
-    h->dyn = std::make_unique<tpoptoa::DynSpss>(
-        std::make_unique<tpoptoa::SpssCore>(std::move(s->core)));
-    delete s;
-    return h;
+    OkSpss* loaded = okspss_load(path, /*verify=*/1, errbuf, errbuf_len);
+
+    if (!loaded) return nullptr;
+
+    auto* handle = new OkDynSpss();
+
+    handle->map = loaded->map; handle->map_len = loaded->map_len;
+    loaded->map = nullptr;                                  // the new handle owns it now
+    handle->dyn = std::make_unique<tpoptoa::DynSpss>(
+        std::make_unique<tpoptoa::SpssCore>(std::move(loaded->core)));
+    delete loaded;
+    return handle;
 }
 
-void okdyn_free(OkDynSpss* h) { delete h; }
+void okdyn_free(OkDynSpss* handle) { delete handle; }
 
-/// okdyn_apply_fasta() - insert every k-mer of a FASTA/FASTQ when @add != 0, or erase them, returning the number of k-mers whose membership changed, or -1 with a message in @errbuf.
-int64_t okdyn_apply_fasta(OkDynSpss* h, const char* path, int add,
+/// Inserts (@p add != 0) or erases every k-mer of the file.
+/// It returns how many k-mers changed membership, or kStatusFailed with a message in @p errbuf.
+int64_t okdyn_apply_fasta(OkDynSpss* handle, const char* path, int add,
                           char* errbuf, uint64_t errbuf_len) {
     try {
         int64_t changed = 0;
-        const unsigned K = h->dyn->k();
+        const unsigned kmer_len = handle->dyn->kmer_len();
+
         tpoptoa::iterate_sequences(path, [&](const tpoptoa::SeqRecord& rec) {
-            uint64_t f = 0; std::size_t v = 0;
-            const uint64_t mask = tpoptoa::kmer_mask(K);
-            for (char c : rec.seq) {
-                const uint8_t b = tpoptoa::base_encode(c);
-                if (b == tpoptoa::kInvalidBase) { v = 0; f = 0; continue; }
-                f = ((f << 2) | b) & mask;
-                if (++v >= K) changed += add ? h->dyn->insert(f) : h->dyn->erase(f);
+            uint64_t fwd = 0; std::size_t run_len = 0;
+            const uint64_t mask = tpoptoa::kmer_mask(kmer_len);
+
+            for (char ch : rec.seq) {
+                const uint8_t base = tpoptoa::base_encode(ch);
+
+                if (base == tpoptoa::kInvalidBase) { run_len = 0; fwd = 0; continue; }
+
+                fwd = ((fwd << tpoptoa::kBitsPerBase) | base) & mask;
+
+                // Only k-mers whose membership flips are counted.
+                if (++run_len >= kmer_len) changed += add ? handle->dyn->insert(fwd) : handle->dyn->erase(fwd);
             }
         });
         return changed;
-    } catch (const std::exception& e) {
-        set_error(errbuf, errbuf_len, e.what());
-        return -1;
+    } catch (const std::exception& err) {
+        set_error(errbuf, errbuf_len, err.what());
+        return kStatusFailed;
     }
 }
 
-uint64_t okdyn_added(const OkDynSpss* h) { return h->dyn->added(); }
-uint64_t okdyn_deleted(const OkDynSpss* h) { return h->dyn->deleted(); }
+uint64_t okdyn_added(const OkDynSpss* handle) { return handle->dyn->added(); }
+uint64_t okdyn_deleted(const OkDynSpss* handle) { return handle->dyn->deleted(); }
 
-/// okdyn_compact_save() - fold the edits into a fresh static core and write it to @path.
-/// Returns 0 on success.
-int okdyn_compact_save(OkDynSpss* h, const char* path, unsigned nthreads) {
+/// Folds the edits into a fresh static core before writing.
+int okdyn_compact_save(OkDynSpss* handle, const char* path, unsigned nthreads) {
     try {
-        if (!h->dyn->compact(nthreads)) return -1;
+        if (!handle->dyn->compact(nthreads)) return kStatusFailed;
+
         std::vector<uint8_t> blob(kSpssMagic, kSpssMagic + kMagicBytes);
-        h->dyn->core().save(blob);
-        return write_index(path, blob) ? 0 : -1;
+
+        handle->dyn->core().save(blob);
+        return write_index(path, blob) ? kStatusOk : kStatusFailed;
     } catch (...) {
-        return -1;
+        return kStatusFailed;
     }
 }
 
-uint64_t okdyn_kmers(const OkDynSpss* h) { return h->dyn->core().stats().kmers; }
+uint64_t okdyn_kmers(const OkDynSpss* handle) { return handle->dyn->core().stats().kmers; }
 
 }  // extern "C"

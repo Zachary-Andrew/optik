@@ -13,54 +13,54 @@ static int g_fail = 0;
 
 int main() {
     std::mt19937_64 rng(5);
-    const unsigned k = 21, m = 11;
+    const unsigned kmer_len = 21, minimizer_len = 11;
     std::vector<std::string> seqs;
     for (int i = 0; i < 40; ++i) {
-        std::string s; for (int j = 0; j < 400; ++j) s.push_back("ACGT"[rng() % 4]);
-        seqs.push_back(s);
+        std::string seq; for (int j = 0; j < 400; ++j) seq.push_back("ACGT"[rng() % 4]);
+        seqs.push_back(seq);
     }
     auto core = std::make_unique<SpssCore>();
-    if (!core->build(seqs, k, m)) { std::printf("build failed\n"); return 1; }
-    DynSpss d(std::move(core));
-    std::unordered_set<uint64_t> o;
-    auto canon = [&](uint64_t x) { uint64_t r = SpssCore::rc(x, k); return x < r ? x : r; };
+    if (!core->build(seqs, kmer_len, minimizer_len)) { std::printf("build failed\n"); return 1; }
+    DynSpss dyn(std::move(core));
+    std::unordered_set<uint64_t> oracle;
+    auto canon = [&](uint64_t kmer) { uint64_t rev = SpssCore::revcomp_packed(kmer, kmer_len); return kmer < rev ? kmer : rev; };
     std::vector<uint64_t> pool;
-    for (auto& s : seqs) for (std::size_t i = 0; i + k <= s.size(); ++i) {
-        uint64_t x; encode_kmer(s.data() + i, k, x); o.insert(canon(x)); pool.push_back(x);
+    for (auto& seq : seqs) for (std::size_t i = 0; i + kmer_len <= seq.size(); ++i) {
+        uint64_t kmer; encode_kmer(seq.data() + i, kmer_len, kmer); oracle.insert(canon(kmer)); pool.push_back(kmer);
     }
-    for (int i = 0; i < 20000; ++i) pool.push_back(rng() & kmer_mask(k));
-    std::unordered_set<uint64_t> base = o;            // static set of the current core
+    for (int i = 0; i < 20000; ++i) pool.push_back(rng() & kmer_mask(kmer_len));
+    std::unordered_set<uint64_t> base = oracle;            // static set of the current core
     auto check_core = [&](const char* tag) {
-        std::size_t b = 0;
-        for (uint64_t x : pool) b += d.core().contains(x) != (o.count(canon(x)) != 0);
+        std::size_t mismatches = 0;
+        for (uint64_t kmer : pool) mismatches += dyn.core().contains(kmer) != (oracle.count(canon(kmer)) != 0);
         // streaming scan over the sequences
         for (int i = 0; i < 40; ++i) {
-            SpssCore::ScanStats st; d.core().scan(seqs[i].data(), seqs[i].size(), st);
+            SpssCore::ScanStats stats; dyn.core().scan(seqs[i].data(), seqs[i].size(), stats);
             uint64_t want = 0;
-            for (std::size_t p = 0; p + k <= seqs[i].size(); ++p) { uint64_t x; encode_kmer(seqs[i].data() + p, k, x); want += o.count(canon(x)); }
-            b += st.positive != want;
+            for (std::size_t p = 0; p + kmer_len <= seqs[i].size(); ++p) { uint64_t kmer; encode_kmer(seqs[i].data() + p, kmer_len, kmer); want += oracle.count(canon(kmer)); }
+            mismatches += stats.positive != want;
         }
-        CHECK(b == 0, "%s: %zu mismatches", tag, b);
+        CHECK(mismatches == 0, "%s: %zu mismatches", tag, mismatches);
     };
     check_core("initial");
     for (int round = 0; round < 3; ++round) {
         for (int i = 0; i < 20000; ++i) {
-            uint64_t x = pool[rng() % pool.size()];
-            if (rng() & 1) { bool was = !o.count(canon(x)); CHECK(d.insert(x) == was, "insert"); o.insert(canon(x)); }
-            else { bool was = o.erase(canon(x)) == 1; CHECK(d.erase(x) == was, "erase"); }
+            uint64_t kmer = pool[rng() % pool.size()];
+            if (rng() & 1) { bool was = !oracle.count(canon(kmer)); CHECK(dyn.insert(kmer) == was, "insert"); oracle.insert(canon(kmer)); }
+            else { bool was = oracle.erase(canon(kmer)) == 1; CHECK(dyn.erase(kmer) == was, "erase"); }
         }
         std::size_t want_added = 0, want_deleted = 0;
-        for (uint64_t c : o) want_added += !base.count(c);
-        for (uint64_t c : base) want_deleted += !o.count(c);
-        CHECK(d.added() == want_added && d.deleted() == want_deleted,
-              "delta sizes added=%zu/%zu deleted=%zu/%zu", d.added(), want_added,
-              d.deleted(), want_deleted);
-        CHECK(d.compact(4), "compact");
-        CHECK(d.added() == 0 && d.deleted() == 0, "deltas not cleared");
-        CHECK(d.core().stats().kmers == o.size(), "compacted core holds %llu k-mers, want %zu",
-              (unsigned long long)d.core().stats().kmers, o.size());
+        for (uint64_t kmer : oracle) want_added += !base.count(kmer);
+        for (uint64_t kmer : base) want_deleted += !oracle.count(kmer);
+        CHECK(dyn.added() == want_added && dyn.deleted() == want_deleted,
+              "delta sizes added=%zu/%zu deleted=%zu/%zu", dyn.added(), want_added,
+              dyn.deleted(), want_deleted);
+        CHECK(dyn.compact(4), "compact");
+        CHECK(dyn.added() == 0 && dyn.deleted() == 0, "deltas not cleared");
+        CHECK(dyn.core().stats().kmers == oracle.size(), "compacted core holds %llu k-mers, want %zu",
+              (unsigned long long)dyn.core().stats().kmers, oracle.size());
         check_core("after compact");
-        base = o;
+        base = oracle;
     }
     std::printf(g_fail ? "dyn_spss_stress: %d FAILURE(S)\n" : "dyn_spss_stress: ALL PASS\n", g_fail);
     return g_fail != 0;

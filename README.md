@@ -156,11 +156,11 @@ The scripts in `bench/` also need Python 3, hyperfine, Java 17 or newer for Pica
 
 | Platform | Packages |
 |---|---|
-| Debian, Ubuntu | `sudo apt install python3 hyperfine cmake autoconf automake pkg-config libbz2-dev liblzma-dev libncurses-dev libcurl4-openssl-dev libboost-all-dev libglpk-dev perl openjdk-17-jre-headless samtools bcftools bwa` |
-| Fedora, RHEL | `sudo dnf install python3 hyperfine cmake autoconf automake bzip2-devel xz-devel ncurses-devel libcurl-devel boost-devel glpk-devel perl java-25-openjdk-headless samtools bcftools bwa` |
-| Arch | `sudo pacman -S --needed python hyperfine cmake bzip2 xz ncurses curl boost glpk perl jre-openjdk-headless` |
-| openSUSE | `sudo zypper install python3 hyperfine cmake autoconf automake libbz2-devel xz-devel ncurses-devel libcurl-devel boost-devel glpk-devel perl java-21-openjdk-headless` |
-| Nix | `nix-shell -p python3 hyperfine cmake autoconf automake bzip2 xz ncurses curl boost glpk perl jdk21_headless samtools bcftools bwa` |
+| Debian, Ubuntu | `sudo apt install python3 hyperfine cmake autoconf automake pkg-config libbz2-dev liblzma-dev libncurses-dev libcurl4-openssl-dev libboost-all-dev libglpk-dev libgsl-dev libdeflate-dev perl openjdk-17-jre-headless samtools bcftools bwa` |
+| Fedora, RHEL | `sudo dnf install python3 hyperfine cmake autoconf automake bzip2-devel xz-devel ncurses-devel libcurl-devel boost-devel glpk-devel gsl-devel libdeflate-devel perl java-25-openjdk-headless samtools bcftools bwa` |
+| Arch | `sudo pacman -S --needed python hyperfine cmake bzip2 xz ncurses curl boost glpk gsl libdeflate perl jre-openjdk-headless` |
+| openSUSE | `sudo zypper install python3 hyperfine cmake autoconf automake libbz2-devel xz-devel ncurses-devel libcurl-devel boost-devel glpk-devel gsl-devel libdeflate-devel perl java-21-openjdk-headless` |
+| Nix | `nix-shell -p python3 hyperfine cmake autoconf automake bzip2 xz ncurses curl boost glpk gsl libdeflate perl jdk21_headless samtools bcftools bwa rustc cargo gcc git '(zlib-ng.override { withZlibCompat = true; })'` |
 
 Before any bench runs, build the compared tools and download the genomes and datasets.
 
@@ -197,3 +197,120 @@ Each bench writes its own section of `bench/results/RESULTS.md` with the date, c
 When an input is missing, a bench skips that part or stops and names the command that provides it.
 Paper datasets too large for this machine's disk or memory are held back, as `list` shows, and the 1.1 TB `cf2-white-spruce` downloads only with `--only cf2-white-spruce`.
 Every script scales its threads and memory cap to the machine, takes `--warmup` and `--runs` for the repetitions, and describes itself with `--help`.
+
+## Documentation
+
+The documentation site covers all three layers of optik.
+Doxygen reads the C++ comments and Breathe renders them in Sphinx, which also takes the shared bench modules from their docstrings.
+The Rust reference comes from `cargo doc` and is linked from the same site.
+Each C++ file's page opens with its header comment, so the data layouts and the flow through each stage come before the member list.
+
+Building it needs Doxygen, Graphviz for the call graphs, and Python 3 with `venv`, on top of the packages under [Install](#install).
+
+| Platform | Packages |
+|---|---|
+| Debian, Ubuntu | `sudo apt install doxygen graphviz python3-venv` |
+| Fedora, RHEL | `sudo dnf install doxygen graphviz python3` |
+| Arch | `sudo pacman -S --needed doxygen graphviz python` |
+| openSUSE | `sudo zypper install doxygen graphviz python3` |
+| Nix | `nix-shell -p doxygen graphviz python3` |
+
+RHEL ships `doxygen` in the CodeReady Builder repository, which `sudo dnf config-manager --set-enabled crb` turns on.
+Sphinx and Breathe are not taken from the system.
+The first build installs the versions pinned in `docs/requirements.txt` into `docs/.venv`, because Breathe 5.1 still fails on namespaces under Sphinx 9.
+myst-parser in that venv renders the Lean page straight from the `.lean` files, so the docs build does not need Lean.
+
+```bash
+docs/build.sh                                      # Doxygen, Sphinx, then cargo doc
+nix-shell -p doxygen graphviz --run docs/build.sh  # the same on Nix
+```
+
+The site is written to `docs/_build/html/index.html`.
+Doxygen's own HTML, with source browsing and call and caller graphs, lands in `docs/_build/doxygen/html`.
+The build stops on any Doxygen or Sphinx warning, so a comment that would render wrongly is caught before it is published.
+
+### Documenting new code
+
+C++ comments are `///` lines directly above the declaration they describe.
+Their first sentence becomes the brief description, and the rest follows one sentence per line.
+Since Doxygen reads `@word` as a command, parameters are named as `@p name`.
+Placeholders such as `seq_<n>` or `OPTIK_LOGP=<n>` go in backticks, because Doxygen would take bare angle brackets for HTML tags.
+Explain why the code is shaped the way it is and how the data moves through it, rather than restating what each line does.
+
+A new header or source file opens with a block that Doxygen turns into the top of its page.
+
+```cpp
+/**
+ * @file
+ * @brief One line on what the file holds.
+ *
+ * @par Layout
+ * How the data is laid out, with any diagram indented four spaces so it renders as code.
+ *
+ * @par Lookup
+ * How a query moves through that layout.
+ */
+```
+
+Every file in `include/` and `src/` reaches Doxygen without further setup, but the Sphinx site shows only the files its pages list.
+Each new file therefore needs a `.. doxygenfile:: name.hpp` entry on the page in `docs/cpp/` that matches its stage.
+For a new subsystem, add a page of its own to the C++ toctree in `docs/index.rst`.
+
+Shared modules under `bench/` are documented from their docstrings once `docs/bench.rst` has an `.. automodule::` line for them.
+Rust items need nothing beyond their `///` and `//!` comments, which `cargo doc` picks up on its own.
+A Lean module appears on the site once `docs/lean.rst` has a `.. lean-module::` line for it.
+The build fails if `lean/OptikProofs.lean` imports a module without one.
+The module's `/-!` header must start with a `# Title` line, and its `/--` docstrings are Markdown.
+
+## Formal proofs
+
+`lean/` proves optik's exactness and MAPQ claims in Lean 4.
+The proofs are about executable models of the algorithms, not the C++ and Rust.
+Each model writes test vectors that the binary and `cargo test` must reproduce, so a model that no longer matches the code fails.
+`lean/APPENDIX_B.md` lists every theorem with its paper item, the code it models and its assumptions.
+The docs site's Lean page shows each module's docstrings and signatures.
+
+<!-- lean-setup -->
+The proofs need Lean 4.33.0, git, curl and Python 3.
+No distribution packages Lean 4.33.0, so elan installs it.
+
+| Platform | Packages |
+|---|---|
+| Debian, Ubuntu | `sudo apt install git curl python3`, then the elan installer below |
+| Fedora, RHEL | `sudo dnf install git curl python3`, then the elan installer below |
+| Arch | `sudo pacman -S --needed git curl python elan-lean` |
+| openSUSE | `sudo zypper install git curl python3`, then the elan installer below |
+| Nix | `nix-shell -p git curl python3 elan` |
+
+```bash
+curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+. "$HOME/.elan/env"
+```
+
+The first `lake` command in `lean/` downloads the Lean version named in `lean/lean-toolchain`.
+
+```bash
+cd lean
+lake update && lake exe cache get                # Mathlib at the tag in lakefile.toml, with its prebuilt modules
+lake build                                       # compiles the proofs
+python3 audit.py                                 # fails on a sorry, an admit or an axiom outside Lean's three and bv_decide's
+lake exe optik-vectors --out /tmp/vec --seed 1
+python3 ../bench/validate_lean.py --vectors /tmp/vec
+```
+
+If `cache get` cannot unpack the prebuilt modules, `lake build` compiles the Mathlib modules the proofs import, which is slow the first time.
+`lean/pixi.toml` runs the same steps as `pixi run setup`, `build`, `audit` and `vectors`, with the toolchain installed inside `lean/`.
+Its conda-forge `leantar` cannot unpack the Mathlib cache, so pixi's first build always compiles Mathlib.
+
+Step 12 of `bench/run_validations.sh` runs these checks with pixi when it is installed and with lake otherwise.
+It skips them when neither is found.
+`cargo test` checks the MAPQ, CIGAR and placement vectors in `lean/vectors/`.
+<!-- /lean-setup -->
+
+### Proofs for new features
+
+Change a modelled algorithm and its Lean definition together, then run `lake build` to find the proofs that broke.
+A new theorem goes in the module for its stage, and its docstring names the paper item and the function it models.
+State assumptions as hypotheses rather than `axiom`, and add a row for the theorem to `lean/APPENDIX_B.md`.
+When the binary can answer the model's question, add a generator to `lean/Vectors/Main.lean` and a check to `bench/validate_lean.py`.
+Refresh the checked-in vectors with `lake exe optik-vectors --out vectors --seed 1` from `lean/`.

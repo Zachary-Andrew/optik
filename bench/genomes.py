@@ -18,9 +18,13 @@ import shutil
 import subprocess
 import sys
 
+from units import BYTES_PER_MIB
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEST = os.path.join(ROOT, "temp", "genomes")
 NCBI_GCA = "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA"
+# bytes read per block while hashing a genome
+HASH_BLOCK_BYTES = 4 * BYTES_PER_MIB
 
 # name -> (file name, gzipped source URL, SHA-256 of the uncompressed file, description)
 GENOMES = {
@@ -33,13 +37,13 @@ GENOMES = {
 }
 
 
-def _sha256(p):
+def _sha256(file_path):
     """SHA-256 of the file at `p`."""
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for b in iter(lambda: f.read(1 << 22), b""):
-            h.update(b)
-    return h.hexdigest()
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for block in iter(lambda: handle.read(HASH_BLOCK_BYTES), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def path(name):
@@ -52,21 +56,21 @@ def path(name):
         return dest
     os.makedirs(DEST, exist_ok=True)
     # Temporary names are per process, so two benches fetching at once never share a file.
-    gz, part = f"{dest}.{os.getpid()}.gz.part", f"{dest}.{os.getpid()}.part"
+    gz_part, part = f"{dest}.{os.getpid()}.gz.part", f"{dest}.{os.getpid()}.part"
     print(f"genomes: fetching {name} from {url}", file=sys.stderr)
-    r = subprocess.run(
-        ["curl", "-fsSL", "--retry", "5", "--retry-all-errors", "-o", gz, url],
+    result = subprocess.run(
+        ["curl", "-fsSL", "--retry", "5", "--retry-all-errors", "-o", gz_part, url],
         check=False,
     )
-    if r.returncode != 0:
-        if os.path.exists(gz):
-            os.remove(gz)
+    if result.returncode != 0:
+        if os.path.exists(gz_part):
+            os.remove(gz_part)
         raise SystemExit(
-            f"genomes: download of {name} failed (curl exit {r.returncode})"
+            f"genomes: download of {name} failed (curl exit {result.returncode})"
         )
-    with gzip.open(gz, "rb") as src, open(part, "wb") as out:
+    with gzip.open(gz_part, "rb") as src, open(part, "wb") as out:
         shutil.copyfileobj(src, out)
-    os.remove(gz)
+    os.remove(gz_part)
     got = _sha256(part)
     if got != sha:
         os.remove(part)
@@ -77,26 +81,26 @@ def path(name):
 
 def main():
     """Prints a genome's path after fetching it, or lists the genomes."""
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("name", nargs="?", choices=sorted(GENOMES))
-    ap.add_argument(
+    parser.add_argument("name", nargs="?", choices=sorted(GENOMES))
+    parser.add_argument(
         "--list", action="store_true", help="list the genomes and their sources"
     )
-    a = ap.parse_args()
-    if a.list or not a.name:
-        for n, (fname, url, _, what) in GENOMES.items():
+    args = parser.parse_args()
+    if args.list or not args.name:
+        for genome, (fname, url, _, what) in GENOMES.items():
             have = (
                 "present"
                 if os.path.exists(os.path.join(DEST, fname))
                 else "not fetched"
             )
             print(
-                f"{n:8} {what}\n         {url}\n         temp/genomes/{fname} ({have})"
+                f"{genome:8} {what}\n         {url}\n         temp/genomes/{fname} ({have})"
             )
         return
-    print(path(a.name))
+    print(path(args.name))
 
 
 if __name__ == "__main__":

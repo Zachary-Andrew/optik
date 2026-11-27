@@ -1,10 +1,11 @@
-/*
- * ffi.cpp - C ABI for the helpers shared by every subcommand, namely FASTA/FASTQ iteration, the k-mer counter's memory limits and the OpenMP thread cap.
+/**
+ * @file
+ * @brief C ABI shared by every subcommand, covering FASTA/FASTQ iteration, the counter's memory limits and the OpenMP thread cap.
+ * The index-specific bridges are in ffi_spss.cpp, ffi_fm.cpp, ffi_dbg.cpp and ffi_map.cpp.
+ * On the Rust side, tools/src/main.rs declares all of them.
  *
- * Each index has its own bridge in ffi_spss.cpp, ffi_fm.cpp, ffi_dbg.cpp and ffi_map.cpp.
- * The Rust declarations of these functions are in tools/src/main.rs.
- *
- * By the error convention, a function that can fail returns 0 on success and -1 on failure, after copying at most errbuf_len - 1 bytes of the exception message into the zeroed buffer the caller passes.
+ * Failable calls return kStatusOk or kStatusFailed.
+ * After a failure, the exception text (at most errbuf_len - 1 bytes) sits in the zeroed buffer the caller supplied.
  */
 #include <cstddef>
 #include <cstdint>
@@ -13,23 +14,31 @@
 #endif
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 #include <string>
 
 #include "../include/fasta_reader.hpp"
 #include "../include/spill.hpp"
+#include "ffi_error.hpp"
 
 namespace {
 
-/// run_reporting_errors() - run @body, returning 0, or -1 after an exception whose message is copied to @errbuf.
+/// Thrown when a record callback returns nonzero, which unwinds the reader like any I/O error.
+/// The caller already knows why it stopped, so the message only marks the cause.
+struct ReadStopped : std::runtime_error {
+    ReadStopped() : std::runtime_error("record callback stopped the read") {}
+};
+
 template <typename Body>
 int run_reporting_errors(char* errbuf, uint64_t errbuf_len, Body&& body) {
     try {
         body();
-        return 0;
-    } catch (const std::exception& e) {
+        return tpoptoa::ffi::kStatusOk;
+    } catch (const std::exception& err) {
         if (errbuf && errbuf_len)
-            std::strncpy(errbuf, e.what(), errbuf_len - 1);
-        return -1;
+            std::strncpy(errbuf, err.what(), errbuf_len - 1);
+
+        return tpoptoa::ffi::kStatusFailed;
     }
 }
 
@@ -37,67 +46,68 @@ int run_reporting_errors(char* errbuf, uint64_t errbuf_len, Body&& body) {
 
 extern "C" {
 
-/// Record callback taking the cookie, name, name length, sequence and sequence length.
-typedef void (*SeqCb)(void*, const char*, uint64_t, const char*, uint64_t);
+/// (cookie, name, name_len, seq, seq_len), returning 0 to go on or nonzero to stop the read.
+typedef int (*SeqCb)(void*, const char*, uint64_t, const char*, uint64_t);
 
-/// Record callback with the FASTQ quality string appended, empty for FASTA.
-typedef void (*ReadCb)(void*, const char*, uint64_t, const char*, uint64_t, const char*, uint64_t);
+/// SeqCb plus (qual, qual_len), where the quality string is empty for FASTA.
+typedef int (*ReadCb)(void*, const char*, uint64_t, const char*, uint64_t, const char*, uint64_t);
 
-/// ok_iterate_fasta() - call @cb for every record of @path that has a non-empty sequence.
-int ok_iterate_fasta(const char* path, SeqCb cb, void* cookie,
+/// Skips records with an empty sequence.
+int ok_iterate_fasta(const char* path, SeqCb callback, void* cookie,
                      char* errbuf, uint64_t errbuf_len) {
     return run_reporting_errors(errbuf, errbuf_len, [&] {
-        tpoptoa::iterate_sequences(path, [&](const tpoptoa::SeqRecord& r) {
-            cb(cookie,
-               r.name.data(), (uint64_t)r.name.size(),
-               r.seq.data(),  (uint64_t)r.seq.size());
+        tpoptoa::iterate_sequences(path, [&](const tpoptoa::SeqRecord& rec) {
+            if (callback(cookie,
+                         rec.name.data(), (uint64_t)rec.name.size(),
+                         rec.seq.data(),  (uint64_t)rec.seq.size()))
+                throw ReadStopped();
         });
     });
 }
 
-/// ok_iterate_fasta_all() - as ok_iterate_fasta(), but records with an empty sequence are reported too.
-int ok_iterate_fasta_all(const char* path, SeqCb cb, void* cookie,
+/// Like ok_iterate_fasta() but keeps empty records.
+int ok_iterate_fasta_all(const char* path, SeqCb callback, void* cookie,
                          char* errbuf, uint64_t errbuf_len) {
     return run_reporting_errors(errbuf, errbuf_len, [&] {
-        tpoptoa::iterate_sequences(path, [&](const tpoptoa::SeqRecord& r) {
-            cb(cookie,
-               r.name.data(), (uint64_t)r.name.size(),
-               r.seq.data(),  (uint64_t)r.seq.size());
+        tpoptoa::iterate_sequences(path, [&](const tpoptoa::SeqRecord& rec) {
+            if (callback(cookie,
+                         rec.name.data(), (uint64_t)rec.name.size(),
+                         rec.seq.data(),  (uint64_t)rec.seq.size()))
+                throw ReadStopped();
         }, /*keep_empty=*/true);
     });
 }
 
-/// ok_iterate_reads() - every record, empty ones included, with its FASTQ quality string.
-/// The mapper writes the qualities to SAM QUAL.
-int ok_iterate_reads(const char* path, ReadCb cb, void* cookie,
+/// Keeps empty records and passes qualities along, which the mapper copies into SAM QUAL.
+int ok_iterate_reads(const char* path, ReadCb callback, void* cookie,
                      char* errbuf, uint64_t errbuf_len) {
     return run_reporting_errors(errbuf, errbuf_len, [&] {
-        tpoptoa::iterate_sequences(path, [&](const tpoptoa::SeqRecord& r) {
-            cb(cookie,
-               r.name.data(), (uint64_t)r.name.size(),
-               r.seq.data(),  (uint64_t)r.seq.size(),
-               r.qual.data(), (uint64_t)r.qual.size());
+        tpoptoa::iterate_sequences(path, [&](const tpoptoa::SeqRecord& rec) {
+            if (callback(cookie,
+                         rec.name.data(), (uint64_t)rec.name.size(),
+                         rec.seq.data(),  (uint64_t)rec.seq.size(),
+                         rec.qual.data(), (uint64_t)rec.qual.size()))
+                throw ReadStopped();
         }, /*keep_empty=*/true);
     });
 }
 
-/// ok_set_count_limits() - the counter's memory limit (@max_mem bytes, 0 = automatic), spill directory and graph mode (spill.hpp), used by every build that counts k-mers (dbruijn, build-fm, build-spss --compact).
+/// Settings for every k-mer-counting build (spill.hpp). @p max_mem = 0 picks the limit automatically.
 void ok_set_count_limits(uint64_t max_mem, const char* tmp_dir, int graph_mode) {
     tpoptoa::count_limits().graph_mode = graph_mode;
     tpoptoa::count_limits().max_mem = max_mem;
     tpoptoa::count_limits().tmp_dir = tmp_dir ? tmp_dir : "";
 }
 
-/// ok_set_num_threads() - cap OpenMP regions started from the calling thread at @n, where 0 leaves the setting alone.
-///
-/// omp_set_num_threads() affects only the calling thread's regions.
-/// The CLI also re-executes itself with OMP_NUM_THREADS set to -t, so regions entered from any thread respect it (omp_env_for_budget() in tools/src/main.rs).
-void ok_set_num_threads(unsigned n) {
+/// Caps OpenMP regions started from this thread, while 0 leaves the setting alone.
+/// Because that only covers the calling thread, the CLI also re-execs itself with OMP_NUM_THREADS set.
+/// See omp_env_for_budget() in tools/src/main.rs, which makes regions on other threads obey -t too.
+void ok_set_num_threads(unsigned num_threads) {
 #ifdef _OPENMP
-    if (n > 0) omp_set_num_threads(static_cast<int>(n));
+    if (num_threads > 0) omp_set_num_threads(static_cast<int>(num_threads));
 #else
-    (void)n;
+    (void)num_threads;
 #endif
 }
 
-}  // extern "C"
+}

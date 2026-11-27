@@ -14,14 +14,17 @@ use crate::DbgIdx;
 
 /// True if `path` names unitig FASTA output, ending in .fa, .fasta or .fna, rather than GFA.
 fn fasta_out(path: &str) -> bool {
-    let l = path.to_ascii_lowercase();
-    [".fa", ".fasta", ".fna"].iter().any(|e| l.ends_with(e))
+    let lower = path.to_ascii_lowercase();
+
+    [".fa", ".fasta", ".fna"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 
 /// Builds the compacted de Bruijn graph of `input` and writes it to `output`.
 ///
 /// * `input` holds the FASTA/FASTQ paths, several joined by `'\n'` for a repeated `-i`.
-/// * `k` is the k-mer length, 1..=31, since the (k+1)-mer edges must fit 64 bits.
+/// * `kmer_len` is the k-mer length, 1..=31, since the (k+1)-mer edges must fit 64 bits.
 /// * `min_count` is the lowest k-mer abundance kept.
 /// * `output` receives GFA1, or unitig FASTA when the name ends in .fa/.fasta/.fna.
 /// * `save` is the optional `-s` path of a kdbg archive of the graph core.
@@ -32,62 +35,78 @@ fn fasta_out(path: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error for k outside 1..=31, an input holding no k-mer of length `k`, or any build or I/O failure.
+/// Returns an error for k outside 1..=31, an input holding no k-mer of length `kmer_len`, or any build or I/O failure.
 pub(crate) fn run(
     input: &str,
-    k: usize,
+    kmer_len: usize,
     min_count: u32,
     output: &str,
     save: Option<&str>,
     threads: usize,
 ) -> Result<(), String> {
-    if k == 0 || k >= 32 {
+    if kmer_len == 0 || kmer_len > crate::DBG_MAX_K {
         return Err(format!(
-            "dbruijn requires 1 <= k <= 31 (k+1-mer edge set needs 2*(k+1) <= 64 bits), got k={k}"
+            "dbruijn requires 1 <= k <= 31 (k+1-mer edge set needs 2*(k+1) <= 64 bits), got k={kmer_len}"
         ));
     }
+
     eprintln!(
-        "[dbruijn] counting k-mers from {} (k={k}, min_count={min_count})...",
+        "[dbruijn] counting k-mers from {} (k={kmer_len}, min_count={min_count})...",
         input.replace('\n', ", ")
     );
-    let t0 = Instant::now();
+    let start = Instant::now();
 
-    let graph = match DbgIdx::build_from_fasta(input, k, min_count as u64, threads, save.is_some())
-    {
-        Ok(g) => g,
+    let mut graph = match DbgIdx::build_from_fasta(
+        input,
+        kmer_len,
+        min_count as u64,
+        threads,
+        // Saving needs the node table, which rules out partitioned compaction.
+        save.is_some(),
+    ) {
+        Ok(built) => built,
         // No k-mer reaches the cutoff, so the graph is empty, which is a valid result (header-only GFA) and not a failure.
         // An input without any k-mer at all is a user error, as for build-spss.
-        Err(e) if e.contains("no k-mers extracted") => {
+        Err(err) if err.contains("no k-mers extracted") => {
             // Several -i inputs arrive joined by '\n'.
             // stdin cannot be read twice, so a stdin input is taken to have had k-mers.
             let mut any = false;
-            for f in input.split('\n') {
-                if f == "-" {
+
+            for input_path in input.split('\n') {
+                if input_path == "-" {
                     any = true;
                     continue;
                 }
-                crate::iterate_fasta(f, |_, s| {
+
+                // A record holds a k-mer as soon as it has a run of k unambiguous bases.
+                crate::iterate_fasta(input_path, |_, seq| {
                     let mut run = 0usize;
-                    for &b in s {
-                        run = if matches!(b.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'U')
-                        {
+
+                    for &base in seq {
+                        run = if matches!(
+                            base.to_ascii_uppercase(),
+                            b'A' | b'C' | b'G' | b'T' | b'U'
+                        ) {
                             run + 1
                         } else {
                             0
                         };
-                        if run >= k {
+                        if run >= kmer_len {
                             any = true;
                             break;
                         }
                     }
                 })?;
             }
+
             if !any {
                 return Err(format!(
-                    "no k-mers of length {k} in {} (empty input, or every record shorter than k)",
+                    "no k-mers of length {kmer_len} in {} (empty input, or every record shorter than k)",
                     input.replace('\n', ", ")
                 ));
             }
+
+            // The empty graph is an empty FASTA, or a GFA with only its header line.
             std::fs::write(
                 output,
                 if fasta_out(output) {
@@ -96,53 +115,72 @@ pub(crate) fn run(
                     "H\tVN:Z:1.0\n"
                 },
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|err| err.to_string())?;
             eprintln!(
                 "[dbruijn] warning: no k-mer reaches min_count={min_count}; wrote an empty graph"
             );
+            // Metric lines still print so scripts parsing them see zeros.
             println!("input_kmers\t0");
             println!("unitigs\t0");
             return Ok(());
         }
-        Err(e) => return Err(e),
+        Err(err) => return Err(err),
     };
-    let n = graph.size();
-    eprintln!("[dbruijn] {n} k-mers after filtering");
+    let kmer_count = graph.size();
+
+    eprintln!("[dbruijn] {kmer_count} k-mers after filtering");
 
     if let Some(path) = save {
         graph.save(path)?;
         eprintln!("[dbruijn] graph core saved -> {path}");
     }
 
-    let st = graph.write_gfa(output, threads, fasta_out(output))?;
+    let stats = graph.write_gfa(output, threads, fasta_out(output))?;
+
     eprintln!(
         "[dbruijn] {} unitigs, {} links -> {output} with {threads} thread(s) in {:.2}s",
-        st.n_unitigs,
-        st.n_links,
-        t0.elapsed().as_secs_f64()
+        stats.n_unitigs,
+        stats.n_links,
+        start.elapsed().as_secs_f64()
     );
-    if st.n_dangling != 0 {
+    if stats.n_dangling != 0 {
         // A graph edge whose target is not a segment end means the unitig set is not a maximal partition, which is reported rather than hidden.
         eprintln!(
             "[dbruijn] WARNING: {} edge(s) point into a segment interior (non-maximal unitigs)",
-            st.n_dangling
+            stats.n_dangling
         );
     }
 
     // Deterministic report on stdout.
     // `total_length` counts every segment base (k-1 overlaps between adjacent unitigs are counted twice), so it is not a genome length estimate.
-    if st.n_unitigs > 0 {
-        println!("unitigs\t{}", st.n_unitigs);
-        println!("links\t{}", st.n_links);
-        println!("kmers\t{}", st.n_kmers);
-        println!("total_length\t{}", st.total_bp);
-        println!("max_unitig\t{}", st.max_len);
-        println!("min_unitig\t{}", st.min_len);
+    // Tab-separated metrics on stdout, one per line, for the TUI and scripts.
+    if stats.n_unitigs > 0 {
+        println!("unitigs\t{}", stats.n_unitigs);
+        println!("links\t{}", stats.n_links);
+        println!("kmers\t{}", stats.n_kmers);
+        println!("total_length\t{}", stats.total_bp);
+        println!("max_unitig\t{}", stats.max_len);
+        println!("min_unitig\t{}", stats.min_len);
         println!(
             "avg_unitig\t{:.1}",
-            st.total_bp as f64 / st.n_unitigs as f64
+            stats.total_bp as f64 / stats.n_unitigs as f64
         );
-        println!("n50\t{}", st.n50);
+        println!("n50\t{}", stats.n50);
     }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fasta_out;
+
+    #[test]
+    fn fasta_extensions_pick_unitig_fasta_and_everything_else_gfa() {
+        assert!(fasta_out("unitigs.fa"));
+        assert!(fasta_out("UNITIGS.FASTA"));
+        assert!(fasta_out("out.fna"));
+        assert!(!fasta_out("graph.gfa"));
+        assert!(!fasta_out("graph.fa.gfa"));
+    }
 }

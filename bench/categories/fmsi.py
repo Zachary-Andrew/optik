@@ -13,6 +13,8 @@ Queries use the read file the other runners use.
 from pathlib import Path
 
 from config import PATHS
+from diagnostics import DETAIL_CHARS
+from units import BITS_PER_BYTE, BYTES_PER_MIB, NS_PER_SECOND
 
 from ._base import (
     ToolRunner,
@@ -46,16 +48,16 @@ class FmsiRunner(ToolRunner):
 
     @classmethod
     def binary_path(cls):
-        p = PATHS.get("fmsi")
-        if p and check_binary(p):
-            return str(p)
+        path = PATHS.get("fmsi")
+        if path and check_binary(path):
+            return str(path)
         return None
 
     def _kmercamel_bin(self):
         """Path of the kmercamel binary that computes the masked superstring."""
-        p = PATHS.get("kmercamel")
-        if p and check_binary(p):
-            return str(p)
+        path = PATHS.get("kmercamel")
+        if path and check_binary(path):
+            return str(path)
         return None
 
     @property
@@ -68,15 +70,15 @@ class FmsiRunner(ToolRunner):
         if not kmc_bin:
             return {"error": "kmercamel not found (required for FMSI pipeline)"}
 
-        td = self.tmpdir("fmsi")
+        tmp_dir = self.tmpdir("fmsi")
         try:
-            unitigs = ensure_uncompressed(self.ds["unitigs"], td)
-            queries = ensure_uncompressed(self.ds["queries"], td)
-            k = int(self.ds["k"])
+            unitigs = ensure_uncompressed(self.dataset["unitigs"], tmp_dir)
+            queries = ensure_uncompressed(self.dataset["queries"], tmp_dir)
+            kmer_len = int(self.dataset["k"])
             verbose = self.ctx.get("verbose", False)
 
             # Path of the masked superstring
-            ms_path = f"{td}/ms.fa"
+            ms_path = f"{tmp_dir}/ms.fa"
 
             # Phase 1 computes the masked superstring with kmercamel.
             # It runs once outside hyperfine, because this preprocessing step produces the same output on every run, and only fmsi index is timed.
@@ -86,7 +88,7 @@ class FmsiRunner(ToolRunner):
                 kmc_bin,
                 "compute",
                 "-k",
-                str(k),
+                str(kmer_len),
                 "-S",
                 "-M",
                 ms_path,
@@ -96,23 +98,23 @@ class FmsiRunner(ToolRunner):
             ]
             proc_kmc, kmc_s = run_cmd(cmd_kmc, timeout=BUILD_TIMEOUT, verbose=verbose)
             if proc_kmc.returncode != 0:
-                return {"error": f"kmercamel failed: {proc_kmc.stderr[:500]}"}
+                return {"error": f"kmercamel failed: {proc_kmc.stderr[:DETAIL_CHARS]}"}
             if not Path(ms_path).exists():
                 return {"error": "kmercamel did not produce masked superstring"}
 
             # Distinct k-mers of the indexed set, counted from the unitigs.
             # KmerCamel's log reports the count only without -S, so parsing it silently dropped FMSI's bits/k-mer.
-            distinct_kmers = count_kmers(unitigs, k, distinct=True)
+            distinct_kmers = count_kmers(unitigs, kmer_len, distinct=True)
 
             # Phase 2 runs fmsi index once to collect the index metrics.
-            cmd_idx = [self._fmsi, "index", "-k", str(k), ms_path]
+            cmd_idx = [self._fmsi, "index", "-k", str(kmer_len), ms_path]
             proc_idx, _ = run_cmd(cmd_idx, timeout=BUILD_TIMEOUT, verbose=verbose)
             if proc_idx.returncode != 0:
-                return {"error": f"fmsi index failed: {proc_idx.stderr[:500]}"}
+                return {"error": f"fmsi index failed: {proc_idx.stderr[:DETAIL_CHARS]}"}
 
             # The index size sums every fmsi component file.
-            fmsi_components = list(Path(td).glob("*.fmsi.*"))
-            idx_bytes = sum(f.stat().st_size for f in fmsi_components)
+            fmsi_components = list(Path(tmp_dir).glob("*.fmsi.*"))
+            idx_bytes = sum(component.stat().st_size for component in fmsi_components)
 
             # Hyperfine times fmsi index, and kmercamel's time is added below.
             hf_build = self.run_hyperfine(cmd_idx, timeout=BUILD_TIMEOUT)
@@ -123,15 +125,15 @@ class FmsiRunner(ToolRunner):
             # FMSI streams whole records, whereas it once got one record per k-mer, cut to 50,000, a different workload.
             # For a record containing a non-ACGT base FMSI answers one character per base rather than per k-mer window, so its bits cannot be attributed to windows.
             # It is therefore given each maximal ACGT run as a record, which are exactly the valid windows of the read file.
-            seg_q = f"{td}/query_segments.fa"
-            n_valid, n_invalid = write_acgt_segments(queries, k, seg_q)
+            seg_q = f"{tmp_dir}/query_segments.fa"
+            n_valid, n_invalid = write_acgt_segments(queries, kmer_len, seg_q)
             cmd_q = [
                 self._fmsi,
                 "query",
                 "-q",
                 seg_q,
                 "-k",
-                str(k),
+                str(kmer_len),
                 ms_path,
             ]
             hf_query = self.run_hyperfine(cmd_q, timeout=QUERY_TIMEOUT)
@@ -139,7 +141,7 @@ class FmsiRunner(ToolRunner):
                 return {
                     "build_s": round(hf_build["mean_s"], 4),
                     "build_s_stddev": round(hf_build["stddev_s"], 4),
-                    "idx_mb": round(idx_bytes / (1024 * 1024), 4)
+                    "idx_mb": round(idx_bytes / BYTES_PER_MIB, 4)
                     if idx_bytes
                     else None,
                     "bits_per_kmer": None,
@@ -155,6 +157,7 @@ class FmsiRunner(ToolRunner):
                 if not line.strip() or line.startswith("#"):
                     continue
                 parts = line.strip().split("\t")
+                # Each result line is the query k-mer, a tab and its presence bit string.
                 if len(parts) >= 2:
                     bitstring = parts[-1]
                     total_present += bitstring.count("1")
@@ -162,9 +165,9 @@ class FmsiRunner(ToolRunner):
 
             # The build RSS is the larger of the two pipeline phases.
             rss_vals = [
-                v
-                for v in [hf_build["max_rss_mb"], hf_query["max_rss_mb"]]
-                if v is not None
+                rss
+                for rss in [hf_build["max_rss_mb"], hf_query["max_rss_mb"]]
+                if rss is not None
             ]
             pipeline_rss = max(rss_vals) if rss_vals else None
 
@@ -177,7 +180,7 @@ class FmsiRunner(ToolRunner):
                 "build_runs": len(hf_build["times_s"]),
                 "build_rss_mb": pipeline_rss,
                 "kmercamel_s": round(kmc_s, 2),
-                "idx_mb": round(idx_bytes / (1024 * 1024), 4) if idx_bytes else None,
+                "idx_mb": round(idx_bytes / BYTES_PER_MIB, 4) if idx_bytes else None,
                 "distinct_kmers": distinct_kmers,
                 "query_s": round(hf_query["mean_s"], 4),
                 "query_s_stddev": round(hf_query["stddev_s"], 4),
@@ -189,7 +192,7 @@ class FmsiRunner(ToolRunner):
 
             if total_kmers:
                 result["ns_per_query"] = round(
-                    (hf_query["mean_s"] * 1e9) / total_kmers, 2
+                    (hf_query["mean_s"] * NS_PER_SECOND) / total_kmers, 2
                 )
                 result["queries_s"] = round(total_kmers / hf_query["mean_s"], 2)
                 result["queries_s_max"] = (
@@ -209,18 +212,18 @@ class FmsiRunner(ToolRunner):
                 result["query_negative"] = n_valid - total_present
 
             if idx_bytes and distinct_kmers:
-                result["bits_per_kmer"] = round((idx_bytes * 8) / distinct_kmers, 2)
+                result["bits_per_kmer"] = round((idx_bytes * BITS_PER_BYTE) / distinct_kmers, 2)
 
             # Phase 4 measures random k-mer lookup throughput with hyperfine.
-            rand_path = f"{td}/random_kmers.fa"
-            generate_random_kmers(rand_path, k, RANDOM_KMERS)
+            rand_path = f"{tmp_dir}/random_kmers.fa"
+            generate_random_kmers(rand_path, kmer_len, RANDOM_KMERS)
             cmd_rand = [
                 self._fmsi,
                 "query",
                 "-q",
                 rand_path,
                 "-k",
-                str(k),
+                str(kmer_len),
                 ms_path,
             ]
             hf_rand = self.run_hyperfine(cmd_rand, timeout=QUERY_TIMEOUT)
@@ -236,7 +239,7 @@ class FmsiRunner(ToolRunner):
                         rand_present += bitstring.count("1")
                         rand_kmers += len(bitstring)
                 result["rand_ns"] = (
-                    round((hf_rand["mean_s"] * 1e9) / rand_kmers, 2)
+                    round((hf_rand["mean_s"] * NS_PER_SECOND) / rand_kmers, 2)
                     if rand_kmers
                     else None
                 )
@@ -249,4 +252,4 @@ class FmsiRunner(ToolRunner):
             return result
 
         finally:
-            self.cleanup(td)
+            self.cleanup(tmp_dir)

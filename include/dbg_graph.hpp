@@ -2,31 +2,39 @@
 
 #include "atomic_file.hpp"
 
-/*
+/**
+ * @file
+ * @brief Compacted de Bruijn graph held in one open-addressing table.
+ *
  * dbg_graph.hpp - compacted de Bruijn graph held in one open-addressing table.
  *
- * Slots.
- * 12 bytes per node, five per 64-byte line.
- * The line holds the five key words (canonical k-mer + 1, 0 = empty) and then the five node words (abundance, the walker's two flags, and the in << 4 | out edge mask).
- * Everything a walk step needs is in the node's own line, so one probe (linear probing from a fast-range home line, load at most 0.8) answers "is this neighbour present, and what are its edges".
- * There is no sorted key array, rank table or per-node walker array, so the whole build takes about 16 bytes per k-mer.
+ * @par Slots
+ * Each node takes 12 bytes, and one 64-byte line holds five of them.
+ * A line stores five key words (canonical k-mer + 1, with 0 meaning empty) followed by five node words.
+ * Node words pack the abundance, the walker's two flags and the in << 4 | out edge mask.
+ * Since everything a walk step needs sits in the node's own line, a single probe tells whether a neighbour exists and what its edges are.
+ * Probing is linear from a fast-range home line, with the load kept at or below 0.8.
+ * No sorted key array, rank table or per-node walker array exists, so a whole build costs about 16 bytes per k-mer.
  *
- * Counts.
- * The node word keeps 22 bits of abundance, and the rare abundances of kCountMax and above are kept exactly in a sorted side list.
+ * @par Counts
+ * Node words keep 22 bits of abundance.
+ * The rare abundances of kCountMax and above are stored exactly in a sorted side list.
  *
- * Build.
+ * @par Build
  * The counter inserts each solid k-mer straight into its slot (src/kmer_count.cpp).
- * Every k-mer is counted in exactly one minimizer partition, so one thread owns it, with a compare-and-swap on the key word followed by a plain store of the node word.
- * Observed edges go into the mask byte, and resolve_masks() then restricts them in place to present neighbours.
+ * Each k-mer belongs to exactly one minimizer partition, so a single thread owns it.
+ * That thread claims the key word with a compare-and-swap and then writes the node word with a plain store.
+ * Observed edges go into the mask byte, and resolve_masks() later trims them to neighbours that exist.
  *
- * Walk.
+ * @par Walk
  * dbg_unitigs.hpp extracts the maximal unitigs in linear time without locks.
- * Slot positions depend on insertion timing, so every tie-break uses k-mer values, never slot indices.
- * Sorting the output by head k-mer makes it independent of the thread count.
+ * Slot positions depend on insertion timing, so every tie-break compares k-mer values rather than slot indices.
+ * Sorting the output by head k-mer then makes it independent of the thread count.
  *
- * Lookups compare full keys, so membership is exact.
+ * Lookups compare full keys keeping membership exact.
  *
- * Sources are the bidirected node-and-mask model of Conway and Bromage 2011 and Cuttlefish 2 (Khan et al. 2022), linear probing as in Knuth, TAOCP vol. 3, 6.4, and fast range reduction from Lemire 2019.
+ * The bidirected node-and-mask model follows Conway and Bromage 2011 and Cuttlefish 2 (Khan et al. 2022).
+ * Linear probing is as it is in Knuth, TAOCP vol. 3, 6.4, and the fast range reduction comes from Lemire 2019.
  */
 
 #include <algorithm>
@@ -41,6 +49,7 @@
 
 #include <sys/mman.h>
 
+#include "bits.hpp"
 #include "hugepage.hpp"
 #include "kmer.hpp"
 #include "thread_budget.hpp"
@@ -53,251 +62,308 @@ struct DbgUnitigExtractor;                      // defined in dbg_unitigs.hpp
 class DbgGraph {
 public:
     static constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
+    static constexpr std::size_t kCacheLineBytes = 64;   // x86-64, the unit one probe reads
     static constexpr unsigned kSlotsPerLine = 5;
-    /// Node word, with bits 0..21 abundance (kCountMax meaning look in the side list), bits 22..23 walker flags and bits 24..31 the edge mask in << 4 | out, in the canonical k-mer's frame.
-    static constexpr uint32_t kCountMax = (uint32_t(1) << 22) - 1;
+    /// Node word layout, in the canonical k-mer's frame:
+    ///   bits 0..21   abundance (kCountMax means "look in the side list")
+    ///   bits 22..23  walker flags
+    ///   bits 24..31  edge mask, in << 4 | out
     static constexpr unsigned kFlagShift = 22, kMaskShift = 24;
+    static constexpr uint32_t kCountMax = (uint32_t(1) << kFlagShift) - 1;
     static constexpr unsigned kWalkFlags = 3u;            // the two walker flag bits, unshifted
-    /// Edge mask with all 8 edges set, where every (k-1)-overlap is a candidate.
+    /// Every (k-1)-overlap is a candidate edge when all 8 bits are set.
     static constexpr uint8_t kAllEdges = 0xFF;
+    static constexpr char kKdbgMagic[] = "OKKDBG";       // first bytes of a save() archive
+    static constexpr std::size_t kKdbgMagicLen = sizeof(kKdbgMagic) - 1;
+    static constexpr int kNoFd = -1;                      // anonymous mappings take fd -1
+
     struct Line {
         uint64_t keys[kSlotsPerLine];    // canonical k-mer + 1, or 0 for an empty slot
-        uint32_t nodes[kSlotsPerLine];   // node words
+        uint32_t nodes[kSlotsPerLine];
         uint32_t pad;
     };
-    static_assert(sizeof(Line) == 64, "one line = five slots = one cache line");
+    static_assert(sizeof(Line) == kCacheLineBytes, "one line = five slots = one cache line");
 
-    explicit DbgGraph(unsigned kk) : k_(kk) {}
+    explicit DbgGraph(unsigned kmer_len) : kmer_len_(kmer_len) {}
 
-    unsigned    k() const noexcept { return k_; }
-    std::size_t core_size() const noexcept { return n_; }
+    unsigned    kmer_len() const noexcept { return kmer_len_; }
+    std::size_t core_size() const noexcept { return num_nodes_; }
     std::size_t capacity() const noexcept { return cap_; }
 
-    /// lines_for() and table_bytes() - lines and bytes of the table init_table(@n) allocates, n * 1.25 + 16 slots for a load of at most 0.8.
-    static constexpr std::size_t lines_for(std::size_t n) noexcept { return (n + n / 4 + 16 + kSlotsPerLine - 1) / kSlotsPerLine; }
-    static constexpr uint64_t table_bytes(std::size_t n) noexcept { return uint64_t(lines_for(n)) * sizeof(Line); }
+    /// The table holds the nodes plus a quarter (kSpareSlotDiv) and kSpareSlots more, which keeps the load at or below 0.8.
+    static constexpr std::size_t kSpareSlotDiv = 4;
+    static constexpr std::size_t kSpareSlots = 16;
+    static constexpr std::size_t lines_for(std::size_t nodes) noexcept { return (nodes + nodes / kSpareSlotDiv + kSpareSlots + kSlotsPerLine - 1) / kSlotsPerLine; }
+    static constexpr uint64_t table_bytes(std::size_t nodes) noexcept { return uint64_t(lines_for(nodes)) * sizeof(Line); }
 
-    /// init_table() - allocate an empty table for @n nodes.
-    ///
-    /// It uses anonymous mmap, so zero pages come from the OS on first touch and the allocation is O(1), and the range is marked MADV_HUGEPAGE so random probes of a multi-GB table hit the TLB instead of paying a page walk (hugepage.hpp).
-    void init_table(std::size_t n) {
-        nlines_ = lines_for(n);
+    /// Anonymous mmap makes the allocation O(1), since zero pages only arrive on first touch.
+    /// The range is also advised MADV_HUGEPAGE, so random probes into a multi-GB table hit the TLB instead of walking pages (hugepage.hpp).
+    void init_table(std::size_t nodes) {
+        nlines_ = lines_for(nodes);
         cap_ = nlines_ * kSlotsPerLine;
         lines_.reset(alloc_zeroed(nlines_), map_len(nlines_));
-        n_ = 0;
+        num_nodes_ = 0;
         saturated_.clear();
     }
 
-    /// rank() - slot of canonical k-mer @c, or kNpos.
-    std::size_t rank(uint64_t c) const noexcept {
+    /// Returns kNpos when the k-mer is absent.
+    std::size_t rank(uint64_t canon_kmer) const noexcept {
         if (!cap_) return kNpos;
-        const uint64_t want = c + 1;
-        for (std::size_t L = home(c);;) {
-            const Line& ln = lines_[L];
+
+        const uint64_t want = canon_kmer + 1;
+
+        for (std::size_t line_idx = home(canon_kmer);;) {
+            const Line& line = lines_[line_idx];
+
             for (unsigned s = 0; s < kSlotsPerLine; ++s) {
-                const uint64_t v = ln.keys[s];
-                if (v == want) return L * kSlotsPerLine + s;
-                if (v == 0) return kNpos;
+                const uint64_t stored = line.keys[s];
+
+                if (stored == want) return line_idx * kSlotsPerLine + s;
+
+                if (stored == 0) return kNpos;
             }
-            if (++L == nlines_) L = 0;
+
+            if (++line_idx == nlines_) line_idx = 0;
         }
     }
-    /// prefetch() and prefetch_w() - prefetch the home line of @c for reading or writing.
-    void prefetch(uint64_t c) const noexcept { if (cap_) __builtin_prefetch(&lines_[home(c)]); }
-    void prefetch_w(uint64_t c) const noexcept { if (cap_) __builtin_prefetch(&lines_[home(c)], 1); }
+    void prefetch(uint64_t canon_kmer) const noexcept { if (cap_) __builtin_prefetch(&lines_[home(canon_kmer)]); }
+    void prefetch_w(uint64_t canon_kmer) const noexcept { if (cap_) __builtin_prefetch(&lines_[home(canon_kmer)], 1); }
 
-    /// claim() - slot of canonical k-mer @c, inserting it if absent.
-    ///
-    /// Thread-safe.
-    /// The node count is not maintained here, since a shared counter would bounce one cache line between all inserting threads, so callers insert distinct keys and report the total with finish_insert().
-    std::size_t claim(uint64_t c) noexcept {
-        const uint64_t want = c + 1;
-        for (std::size_t L = home(c);;) {
-            Line& ln = lines_[L];
+    /// Thread-safe, and inserts the k-mer if it's missing.
+    /// The node count isn't updated here, because a shared counter would bounce one cache line between every inserting thread.
+    /// Instead, callers insert distinct keys and report the total through finish_insert().
+    std::size_t claim(uint64_t canon_kmer) noexcept {
+        const uint64_t want = canon_kmer + 1;
+
+        for (std::size_t line_idx = home(canon_kmer);;) {
+            Line& line = lines_[line_idx];
+
             for (unsigned s = 0; s < kSlotsPerLine; ++s) {
                 uint64_t expect = 0;
-                if (__atomic_compare_exchange_n(&ln.keys[s], &expect, want, false,
+
+                if (__atomic_compare_exchange_n(&line.keys[s], &expect, want, false,
                                                 __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-                    return L * kSlotsPerLine + s;
-                if (expect == want) return L * kSlotsPerLine + s;
+                    return line_idx * kSlotsPerLine + s;
+
+                if (expect == want) return line_idx * kSlotsPerLine + s;
             }
-            if (++L == nlines_) L = 0;
+
+            if (++line_idx == nlines_) line_idx = 0;
         }
     }
-    /// put() - store the abundance @cnt and observed edges @raw of claimed slot @i.
-    /// Thread-safe for distinct slots.
-    void put(std::size_t i, uint32_t cnt, uint8_t raw) {
+    /// Safe to call concurrently on distinct slots.
+    void put(std::size_t slot, uint32_t cnt, uint8_t raw) {
         if (cnt >= kCountMax) {
-            std::lock_guard<std::mutex> l(saturated_mutex_);
-            saturated_.push_back({i, cnt});
+            std::lock_guard<std::mutex> guard(saturated_mutex_);
+
+            saturated_.push_back({slot, cnt});
         }
-        node_word(i) = std::min(cnt, kCountMax) | (uint32_t(raw) << kMaskShift);
+
+        node_word(slot) = std::min(cnt, kCountMax) | (uint32_t(raw) << kMaskShift);
     }
-    /// finish_insert() - record that @n distinct nodes were claimed, after all inserts.
-    void finish_insert(std::size_t n) {
-        n_ = n;
+    void finish_insert(std::size_t nodes) {
+        num_nodes_ = nodes;
         std::sort(saturated_.begin(), saturated_.end());
     }
 
     // Per-slot accessors.
-    // Node words are read with relaxed atomic loads, because walkers OR their flags into the same word concurrently (these compile to plain loads on x86).
-    bool     used(std::size_t i) const noexcept { return key_word(i) != 0; }
-    uint64_t key(std::size_t i)  const noexcept { return key_word(i) - 1; }
-    unsigned edge_mask(std::size_t i)  const noexcept { return node(i) >> kMaskShift; }
-    uint64_t count(std::size_t i) const noexcept {
-        const uint32_t c = node(i) & kCountMax;
-        if (c < kCountMax) return c;
-        const auto it = std::lower_bound(saturated_.begin(), saturated_.end(),
-                                         std::pair<std::size_t, uint32_t>{i, 0});
-        return it != saturated_.end() && it->first == i ? it->second : c;
+    // Walkers OR their flags into node words concurrently, so reads use relaxed atomic loads, which are plain loads on x86 anyway.
+    bool     used(std::size_t slot) const noexcept { return key_word(slot) != 0; }
+    uint64_t key(std::size_t slot)  const noexcept { return key_word(slot) - 1; }
+    unsigned edge_mask(std::size_t slot)  const noexcept { return node(slot) >> kMaskShift; }
+
+    uint64_t count(std::size_t slot) const noexcept {
+        const uint32_t stored = node(slot) & kCountMax;
+
+        if (stored < kCountMax) return stored;
+
+        const auto found = std::lower_bound(saturated_.begin(), saturated_.end(),
+                                         std::pair<std::size_t, uint32_t>{slot, 0});
+
+        return found != saturated_.end() && found->first == slot ? found->second : stored;
     }
 
-    /// flags_or(), flags(), clear_flags() - the walker flags of slot @i (2 bits, zero between walks), as an atomic OR returning the previous flags, a relaxed read, and a reset by the slot's one writer.
-    unsigned flags_or(std::size_t i, unsigned f) const noexcept {
-        return (__atomic_fetch_or(&node_word(i), uint32_t(f) << kFlagShift, __ATOMIC_ACQ_REL) >> kFlagShift) & kWalkFlags;
+    /// Each slot has 2 walker-flag bits, which are zero between walks.
+    /// They support an atomic OR that returns the old value, a relaxed read, and a reset by the slot's single writer.
+    unsigned flags_or(std::size_t slot, unsigned flag_bits) const noexcept {
+        return (__atomic_fetch_or(&node_word(slot), uint32_t(flag_bits) << kFlagShift, __ATOMIC_ACQ_REL) >> kFlagShift) & kWalkFlags;
     }
-    unsigned flags(std::size_t i) const noexcept { return (node(i) >> kFlagShift) & kWalkFlags; }
-    void clear_flags(std::size_t i) const noexcept { node_word(i) &= ~(uint32_t(kWalkFlags) << kFlagShift); }
+    unsigned flags(std::size_t slot) const noexcept { return (node(slot) >> kFlagShift) & kWalkFlags; }
+    void clear_flags(std::size_t slot) const noexcept { node_word(slot) &= ~(uint32_t(kWalkFlags) << kFlagShift); }
 
-    /// aux_clear(), aux_set(), aux() - reuse of the node words after the graph's last walk.
+    /// Lets the node words be reused after the graph's last walk.
     ///
-    /// The GFA writer stores segment ids there for link lookup instead of building a separate index.
-    /// aux_clear() zeroes every node word and marks the graph consumed, since abundances, masks and walker flags are gone, and save(), unitigs() and export_sorted() refuse it afterwards.
+    /// The GFA writer stores segment ids there for link lookup, which saves building a separate index.
+    /// aux_clear() zeroes every node word and marks the graph consumed, because abundances, masks and walker flags are gone.
+    /// After that, save(), unitigs() and export_sorted() all refuse to run.
     void aux_clear(unsigned nthreads) {
         consumed_ = true;
         const std::size_t nlines = nlines_;
         const unsigned threads = nthreads ? nthreads : 1;
-        tpoptoa::run_on_threads(threads, [&](unsigned t) {
-            for (std::size_t l = nlines * t / threads; l < nlines * (t + 1) / threads; ++l)
+
+        tpoptoa::run_on_threads(threads, [&](unsigned thread_idx) {
+            for (std::size_t l = nlines * thread_idx / threads; l < nlines * (thread_idx + 1) / threads; ++l)
                 for (unsigned s = 0; s < kSlotsPerLine; ++s) lines_[l].nodes[s] = 0;
         });
     }
-    void aux_set(std::size_t i, uint32_t v) noexcept { __atomic_store_n(&node_word(i), v, __ATOMIC_RELAXED); }
-    uint32_t aux(std::size_t i) const noexcept { return node(i); }
+    void aux_set(std::size_t slot, uint32_t value) noexcept { __atomic_store_n(&node_word(slot), value, __ATOMIC_RELAXED); }
+    uint32_t aux(std::size_t slot) const noexcept { return node(slot); }
     bool consumed() const noexcept { return consumed_; }
 
-    /// out_mask() and in_mask() - edge masks of canonical k-mer @c in its canonical frame, or 0 if it is absent.
-    unsigned out_mask(uint64_t c) const noexcept {
-        const std::size_t r = rank(c);
-        return r == kNpos ? 0u : edge_mask(r) & 0xFu;
+    /// Returns 0 for an absent k-mer.
+    unsigned out_mask(uint64_t canon_kmer) const noexcept {
+        const std::size_t slot = rank(canon_kmer);
+
+        return slot == kNpos ? 0u : edge_mask(slot) & kOutEdgeMask;
     }
-    unsigned in_mask(uint64_t c) const noexcept {
-        const std::size_t r = rank(c);
-        return r == kNpos ? 0u : edge_mask(r) >> 4;
+    unsigned in_mask(uint64_t canon_kmer) const noexcept {
+        const std::size_t slot = rank(canon_kmer);
+
+        return slot == kNpos ? 0u : edge_mask(slot) >> kOutEdgeBits;
     }
 
-    /// masks_from_raw() - no-op for the interface shared with DbgGraphEF and PartUnitigs.
-    /// It is called when every observed edge's neighbour is known to be present, so the stored edges already are the masks.
+    /// Does nothing here, but DbgGraphEF and PartUnitigs share the interface.
+    /// Callers use it when every observed neighbour is known to exist, so the stored edges are already final.
     void masks_from_raw() noexcept {}
 
-    /// resolve_masks() - restrict every node's observed edges to present neighbours, in place.
+    /// Trims every node's observed edges to neighbours that exist, in place.
     ///
-    /// Software pipeline (Slotin, Algorithms for Modern Hardware).
-    /// The neighbour keys of block b + 1 are computed and their home lines prefetched while block b is probed, so each probe's cache miss was issued one block earlier.
-    /// Blocks are small enough that the prefetches in flight fit a core's line-fill buffers.
-    /// A block reads its own observed edges before any of its masks is rewritten, and probes read only key words.
+    /// This is a software pipeline (Slotin, Algorithms for Modern Hardware).
+    /// While block b is probed, the neighbour keys of block b + 1 are computed and their home lines prefetched, so each miss was issued a block earlier.
+    /// Blocks stay small enough that the prefetches in flight fit a core's line-fill buffers.
+    /// Each block reads its own observed edges before rewriting any mask, and probes only ever read key words.
     void resolve_masks() {
-        const unsigned K = k_;
-        const uint64_t kmask = kmer_mask(K);
-        const unsigned shK = 2u * (K - 1);
-        auto canon = [&](uint64_t v) { const uint64_t r = reverse_complement(v, K); return v < r ? v : r; };
+        const unsigned kmer_len = kmer_len_;
+        const uint64_t kmask = kmer_mask(kmer_len);
+        const unsigned first_base_shift = kBitsPerBase * (kmer_len - 1);
+        auto canon = [&](uint64_t kmer) { const uint64_t rev_comp = reverse_complement(kmer, kmer_len); return kmer < rev_comp ? kmer : rev_comp; };
         constexpr std::size_t kBlock = 4, kSpan = 4096;     // slots per prefetch block / per OpenMP task
         constexpr unsigned kEdges = 8;                     // 4 out-edges, then 4 in-edges
+        constexpr int kSpanSchedChunk = 4;                 // spans per OpenMP chunk
+        constexpr std::size_t kPipelineStages = 2;          // the block being probed and the one being prefetched
         const std::size_t nspan = (cap_ + kSpan - 1) / kSpan;
+
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(dynamic, 4)
+        #pragma omp parallel for schedule(dynamic, kSpanSchedChunk)
 #endif
         for (std::size_t sp = 0; sp < nspan; ++sp) {
-            const std::size_t lo = sp * kSpan, hi = std::min(cap_, lo + kSpan);
-            // neighbour keys of the current and next block, with ~0 for no edge
-            uint64_t neighbours[2][kBlock][kEdges];
-            auto prep = [&](std::size_t b0, uint64_t (*t)[kEdges]) {
-                for (std::size_t i = b0; i < std::min(hi, b0 + kBlock); ++i) {
-                    uint64_t* r = t[i - b0];
-                    for (unsigned b = 0; b < kEdges; ++b) r[b] = ~uint64_t(0);
-                    if (!used(i)) continue;
-                    const uint64_t c = key(i);
-                    const unsigned raw = edge_mask(i);
-                    for (unsigned b = 0; b < 4; ++b) {
+            const std::size_t span_lo = sp * kSpan, span_hi = std::min(cap_, span_lo + kSpan);
+            // Neighbour keys of the current and next block, where ~0 marks a missing edge.
+            uint64_t neighbours[kPipelineStages][kBlock][kEdges];
+            auto prep = [&](std::size_t block_start, uint64_t (*block_neighbours)[kEdges]) {
+                for (std::size_t slot = block_start; slot < std::min(span_hi, block_start + kBlock); ++slot) {
+                    uint64_t* slot_neighbours = block_neighbours[slot - block_start];
+
+                    // All ones can mark a missing edge, because no canonical k-mer is all ones.
+                    for (unsigned b = 0; b < kEdges; ++b) slot_neighbours[b] = ~uint64_t(0);
+
+                    if (!used(slot)) continue;
+
+                    const uint64_t kmer = key(slot);
+                    const unsigned raw = edge_mask(slot);
+
+                    for (unsigned b = 0; b < kNumBases; ++b) {
                         if (raw & (1u << b)) {
-                            r[b] = canon(((c << 2) | b) & kmask);
-                            prefetch(r[b]);
+                            slot_neighbours[b] = canon(((kmer << kBitsPerBase) | b) & kmask);
+                            prefetch(slot_neighbours[b]);
                         }
-                        if (raw & (1u << (b + 4))) {
-                            r[b + 4] = canon(((uint64_t(b) << shK) | (c >> 2)) & kmask);
-                            prefetch(r[b + 4]);
+
+                        if (raw & (1u << (b + kOutEdgeBits))) {
+                            slot_neighbours[b + kOutEdgeBits] = canon(((uint64_t(b) << first_base_shift) | (kmer >> kBitsPerBase)) & kmask);
+                            prefetch(slot_neighbours[b + kOutEdgeBits]);
                         }
                     }
                 }
             };
-            prep(lo, neighbours[0]);
-            for (std::size_t b0 = lo, cur = 0; b0 < hi; b0 += kBlock, cur ^= 1) {
-                if (b0 + kBlock < hi) prep(b0 + kBlock, neighbours[cur ^ 1]);
-                for (std::size_t i = b0; i < std::min(hi, b0 + kBlock); ++i) {
-                    if (!used(i)) continue;
-                    unsigned m = 0;
+
+            // With two buffers, the next block's neighbour keys are computed and prefetched while the current block's lookups resolve.
+            prep(span_lo, neighbours[0]);
+
+            for (std::size_t block_start = span_lo, cur = 0; block_start < span_hi; block_start += kBlock, cur ^= 1) {
+                if (block_start + kBlock < span_hi) prep(block_start + kBlock, neighbours[cur ^ 1]);
+
+                for (std::size_t slot = block_start; slot < std::min(span_hi, block_start + kBlock); ++slot) {
+                    if (!used(slot)) continue;
+
+                    unsigned mask = 0;
+
                     for (unsigned b = 0; b < kEdges; ++b)
-                        if (neighbours[cur][i - b0][b] != ~uint64_t(0) && rank(neighbours[cur][i - b0][b]) != kNpos) m |= 1u << b;
-                    node_word(i) = (node_word(i) & ((uint32_t(1) << kMaskShift) - 1)) | (uint32_t(m) << kMaskShift);
+                        if (neighbours[cur][slot - block_start][b] != ~uint64_t(0) && rank(neighbours[cur][slot - block_start][b]) != kNpos) mask |= 1u << b;
+
+                    // An edge bit is cleared when its neighbour k-mer is missing from the table.
+                    node_word(slot) = (node_word(slot) & ((uint32_t(1) << kMaskShift) - 1)) | (uint32_t(mask) << kMaskShift);
                 }
             }
         }
     }
 
-    /// unitigs() - cb(seq, len, coverage) for every maximal unitig in head k-mer order, the same for any thread count.
-    /// dbg_unitigs.hpp defines it.
+    /// Calls cb(seq, len, coverage) for every maximal unitig in head k-mer order, regardless of thread count.
+    /// It is defined in dbg_unitigs.hpp.
     template <typename CB>
-    void unitigs(CB&& cb, unsigned nthreads = 0) const;
-    /// unitigs_sorted() - batch form, calling sink(n, at) with at(i) -> {seq, len, cov} of the i-th unitig in output order (DbgUnitigExtractor::run_sorted).
+    void unitigs(CB&& callback, unsigned nthreads = 0) const;
+
+    /// Batch form that calls sink(count, unitig_at), where unitig_at(i) yields {seq, len, cov} for the i-th unitig in output order.
     template <typename Sink>
     void unitigs_sorted(Sink&& sink, unsigned nthreads = 0) const;
 
-    /// export_sorted() - (canonical k-mer, abundance) pairs in ascending order, and their edge masks.
-    void export_sorted(std::vector<std::pair<uint64_t, uint32_t>>& kv,
+    /// Returns (canonical k-mer, abundance) pairs in ascending order, along with their edge masks.
+    void export_sorted(std::vector<std::pair<uint64_t, uint32_t>>& pairs_out,
                        std::vector<uint8_t>& masks) const {
         if (consumed_) throw std::logic_error("DbgGraph: node words were reused (aux_clear)");
+
         std::vector<uint64_t> keys;
-        keys.reserve(n_);
-        for (std::size_t i = 0; i < cap_; ++i)
-            if (used(i)) keys.push_back(key(i));
+
+        keys.reserve(num_nodes_);
+
+        for (std::size_t slot = 0; slot < cap_; ++slot)
+            if (used(slot)) keys.push_back(key(slot));
+
         std::sort(keys.begin(), keys.end());
-        kv.resize(keys.size());
+        pairs_out.resize(keys.size());
         masks.resize(keys.size());
+
         for (std::size_t i = 0; i < keys.size(); ++i) {
-            const std::size_t r = rank(keys[i]);
-            kv[i] = {keys[i], static_cast<uint32_t>(count(r))};
-            masks[i] = static_cast<uint8_t>(edge_mask(r));
+            const std::size_t slot = rank(keys[i]);
+
+            pairs_out[i] = {keys[i], static_cast<uint32_t>(count(slot))};
+            masks[i] = static_cast<uint8_t>(edge_mask(slot));
         }
     }
 
-    /// save() - write the little-endian kdbg archive (dbruijn -s)
-    ///   "OKKDBG" | u8 k | u64 n | n x u64 sorted canonical k-mers |
-    ///   n x u32 abundances | n x u8 masks (in << 4 | out)
-    /// Returns false on an I/O error or a consumed graph.
+    /// Writes the little-endian kdbg archive of dbruijn -s:
+    ///   "OKKDBG" | u8 k | u64 n | n x u64 sorted canonical k-mers | n x u32 abundances | n x u8 masks (in << 4 | out)
+    /// It fails on an I/O error or on a consumed graph.
     bool save(const char* path) const;
 
-    /// build_core() - build from given nodes and masks, with @pairs sorted by canonical k-mer and duplicate-free, masks[i] = in << 4 | out of pairs[i], already restricted to present neighbours.
-    /// @pairs is released.
+    /// Builds from nodes whose masks are already trimmed to existing neighbours.
+    /// @p pairs must be sorted and duplicate-free, and it is released afterwards.
     void build_core(std::vector<std::pair<uint64_t, uint32_t>>&& pairs,
                     const std::vector<uint8_t>& masks) {
         if (masks.size() != pairs.size())
             throw std::invalid_argument("dbg: masks/pairs size mismatch");
+
         for (std::size_t i = 1; i < pairs.size(); ++i)
             if (pairs[i - 1].first >= pairs[i].first)
                 throw std::invalid_argument("dbg: k-mers must be sorted and unique");
+
         init_table(pairs.size());
+
         for (std::size_t i = 0; i < pairs.size(); ++i)
             put(claim(pairs[i].first), pairs[i].second, masks[i]);
+
         finish_insert(pairs.size());
         std::vector<std::pair<uint64_t, uint32_t>>().swap(pairs);
     }
 
-    /// build_core() - node-centric build, where every (k-1)-overlap between two present k-mers is an edge, for k-mer sets without read windows (DynSpss::compact).
-    /// @pairs must be sorted by canonical k-mer and duplicate-free.
+    /// Node-centric build, where any (k-1)-overlap between two present k-mers counts as an edge.
+    /// It suits k-mer sets that come without read windows, like DynSpss::compact().
+    /// @p pairs must be sorted and duplicate-free.
     void build_core(std::vector<std::pair<uint64_t, uint32_t>>&& pairs) {
         init_table(pairs.size());
-        for (const auto& kv : pairs)                // every overlap is a candidate edge
-            put(claim(kv.first), kv.second, kAllEdges);
+
+        for (const auto& pair : pairs)
+            put(claim(pair.first), pair.second, kAllEdges);
+
         finish_insert(pairs.size());
         std::vector<std::pair<uint64_t, uint32_t>>().swap(pairs);
         resolve_masks();
@@ -306,45 +372,49 @@ public:
 private:
     friend struct DbgUnitigExtractor;
 
-    /// Seed of the home-line hash (2^64 / golden ratio).
-    static constexpr uint64_t kHomeSeed = 0x9E3779B97F4A7C15ULL;
+    static constexpr uint64_t kHomeSeed = kGoldenRatio64;
 
-    /// home() - home line of @c: its hash mapped onto [0, nlines_) by fast range reduction (Lemire 2019).
-    std::size_t home(uint64_t c) const noexcept {
+    /// Maps the hash onto [0, nlines_) by fast range reduction (Lemire 2019).
+    std::size_t home(uint64_t canon_kmer) const noexcept {
         return static_cast<std::size_t>(
-            (static_cast<__uint128_t>(mix64(c, kHomeSeed)) * nlines_) >> 64);
+            (static_cast<__uint128_t>(mix64(canon_kmer, kHomeSeed)) * nlines_) >> kWordBits);
     }
-    uint64_t& key_word(std::size_t i) const noexcept { return lines_[i / kSlotsPerLine].keys[i % kSlotsPerLine]; }
-    uint32_t& node_word(std::size_t i) const noexcept { return lines_[i / kSlotsPerLine].nodes[i % kSlotsPerLine]; }
-    uint32_t node(std::size_t i) const noexcept { return __atomic_load_n(&node_word(i), __ATOMIC_RELAXED); }
+    uint64_t& key_word(std::size_t slot) const noexcept { return lines_[slot / kSlotsPerLine].keys[slot % kSlotsPerLine]; }
+    uint32_t& node_word(std::size_t slot) const noexcept { return lines_[slot / kSlotsPerLine].nodes[slot % kSlotsPerLine]; }
+    uint32_t node(std::size_t slot) const noexcept { return __atomic_load_n(&node_word(slot), __ATOMIC_RELAXED); }
 
     static std::size_t map_len(std::size_t nlines) noexcept {
+        // Rounding up to whole huge pages lets advise_huge() back the entire table.
         return (nlines * sizeof(Line) + kHugePageBytes - 1) & ~(kHugePageBytes - 1);
     }
     static Line* alloc_zeroed(std::size_t nlines) {
         const std::size_t len = map_len(nlines);
-        void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) throw std::bad_alloc();
-        advise_huge(p, len);
-        return static_cast<Line*>(p);
+        // Anonymous pages arrive zeroed and need no clearing pass.
+        void* mem = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, kNoFd, 0);
+
+        if (mem == MAP_FAILED) throw std::bad_alloc();
+
+        advise_huge(mem, len);
+        return static_cast<Line*>(mem);
     }
-    /// LinePtr - owner of the table's mmap.
     struct LinePtr {
-        Line* p = nullptr;
+        Line* ptr = nullptr;
         std::size_t len = 0;
+
         LinePtr() = default;
         LinePtr(const LinePtr&) = delete;
         LinePtr& operator=(const LinePtr&) = delete;
-        ~LinePtr() { if (p) ::munmap(p, len); }
-        void reset(Line* q, std::size_t l) { if (p) ::munmap(p, len); p = q; len = l; }
-        Line& operator[](std::size_t i) const noexcept { return p[i]; }
+        ~LinePtr() { if (ptr) ::munmap(ptr, len); }
+        void reset(Line* new_ptr, std::size_t new_len) { if (ptr) ::munmap(ptr, len); ptr = new_ptr; len = new_len; }
+
+        Line& operator[](std::size_t line_idx) const noexcept { return ptr[line_idx]; }
     };
 
-    unsigned k_;
+    unsigned kmer_len_;
     std::size_t nlines_ = 0;
     std::size_t cap_ = 0;             // nlines_ * kSlotsPerLine slots
-    bool consumed_ = false;           // node words reused by aux_clear
-    std::size_t n_ = 0;               // nodes, i.e. claimed slots
+    bool consumed_ = false;           // set by aux_clear()
+    std::size_t num_nodes_ = 0;       // claimed slots
     LinePtr lines_;
     std::vector<std::pair<std::size_t, uint32_t>> saturated_;   // (slot, abundance >= kCountMax), sorted
     std::mutex saturated_mutex_;
@@ -352,17 +422,23 @@ private:
 
 inline bool DbgGraph::save(const char* path) const {
     if (consumed_) return false;
-    std::vector<std::pair<uint64_t, uint32_t>> kv;
+
+    std::vector<std::pair<uint64_t, uint32_t>> pairs;
     std::vector<uint8_t> masks;
-    export_sorted(kv, masks);
-    return atomic_write(path, [&](std::ofstream& os) {
-        os.write("OKKDBG", 6);
-        os.put(static_cast<char>(k_));
-        const uint64_t n = kv.size();
-        os.write(reinterpret_cast<const char*>(&n), sizeof(n));
-        for (const auto& p : kv) os.write(reinterpret_cast<const char*>(&p.first), 8);
-        for (const auto& p : kv) os.write(reinterpret_cast<const char*>(&p.second), 4);
-        os.write(reinterpret_cast<const char*>(masks.data()), static_cast<std::streamsize>(n));
+
+    export_sorted(pairs, masks);
+    return atomic_write(path, [&](std::ofstream& out) {
+        out.write(kKdbgMagic, kKdbgMagicLen);
+        out.put(static_cast<char>(kmer_len_));
+        const uint64_t count = pairs.size();
+
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+        for (const auto& pair : pairs) out.write(reinterpret_cast<const char*>(&pair.first), sizeof(pair.first));
+
+        for (const auto& pair : pairs) out.write(reinterpret_cast<const char*>(&pair.second), sizeof(pair.second));
+
+        out.write(reinterpret_cast<const char*>(masks.data()), static_cast<std::streamsize>(count));
     });
 }
 

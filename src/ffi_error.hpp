@@ -1,7 +1,8 @@
 #pragma once
 
-/*
- * ffi_error.hpp - error reporting through the C ABI's caller buffers.
+/**
+ * @file
+ * @brief Error reporting through the C ABI's caller buffers.
  *
  * Functions that can fail take (char* errbuf, uint64_t errbuf_len) and write a NUL-terminated message there.
  * The Rust side reads it with CStr::from_ptr.
@@ -13,7 +14,11 @@
 
 namespace tpoptoa::ffi {
 
-/// set_error() - copy @msg into @errbuf, truncated to fit.
+/// Status codes returned by the C ABI functions that report success or failure.
+constexpr int kStatusOk = 0;
+constexpr int kStatusFailed = -1;
+
+/// Copy @p msg into @p errbuf, truncated to fit.
 inline void set_error(char* errbuf, uint64_t errbuf_len, const char* msg) {
     if (errbuf && errbuf_len) std::snprintf(errbuf, errbuf_len, "%s", msg);
 }

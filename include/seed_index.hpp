@@ -1,20 +1,24 @@
 #pragma once
 
-/*
- * seed_index.hpp - SeedIndex, minimizer -> reference positions for the mapper.
+/**
+ * @file
+ * @brief SeedIndex, which maps minimizers to reference positions for the mapper.
  *
- *   keys      distinct canonical minimizers in minimizer.hpp's hashed order
- *   mphf_     partitioned Mphf of phobic_mphf.hpp, mapping each key to a rank r
+ *   keys      distinct canonical minimizers, in minimizer.hpp's hashed order
+ *   mphf_     partitioned Mphf (phobic_mphf.hpp) that maps each key to a rank r
  *   off_[r]   uint32 CSR offsets into post_
- *   post_     postings (rid << kRidShift) | (pos << 1) | rev, grouped by rank and in reference order within a rank
+ *   post_     postings (see make_posting()), grouped by rank and kept in reference order within a rank
  *
- * The reference is the key store.
- * A query minimizer's rank is accepted only if the canonical reference k-mer at its first posting equals it, so no keys are stored and a foreign minimizer costs one MPHF access plus one reference read.
- * collect() drops minimizers occurring more than max_occ times, as minimap2's -f filter drops repetitive minimizers (Li 2018), while collect_chain() keeps some of them (Li 2021).
+ * The reference itself serves as the key store.
+ * A query minimizer's rank is accepted only if the canonical reference k-mer at its first posting equals it.
+ * So no keys are stored, and a foreign minimizer costs one MPHF access plus one reference read.
  *
- * collect() and collect_chain() seed a whole read in one call and emit strand-aware hits.
+ * collect() drops minimizers occurring more than max_occ times, like minimap2's -f filter (Li 2018).
+ * collect_chain(), on the other hand, rescues some of them (Li 2021).
+ * Both seed a whole read in one call and emit strand-aware hits.
  */
 
+#include "bits.hpp"
 #include "thread_budget.hpp"
 #include <algorithm>
 #include <atomic>
@@ -29,419 +33,583 @@
 #include "kmer.hpp"
 #include "minimizer.hpp"
 #include "phobic_mphf.hpp"
+#include "wyhash.hpp"
 
 namespace tpoptoa {
 
 class SeedIndex {
 public:
-    /// Hit - one seed hit, with reference id, strand (1 = read reverse complemented), reference position, and position in the read in that strand's frame, so the alignment-start diagonal is rpos - qpos.
+    /// Strand 1 means the read is reverse complemented, and qpos is measured in that strand's frame.
+    /// The alignment-start diagonal is therefore rpos - qpos.
     struct Hit { uint32_t rid, rev, rpos, qpos; };
 
-    /// build() - index the minimizers of @refs with k-mer length @k and window @w.
-    /// @refs must stay alive and unmodified for the lifetime of the index.
-    /// Returns false for a reference of 2^31 bases or more, more than 2^32 - 1 postings, or a failed MPHF build.
+    /// @p refs must stay alive and unmodified for as long as the index exists.
+    /// The build fails for a reference of kMaxRefLen bases or more, for kMaxPostings or more postings, or when the MPHF build fails.
     ///
-    /// The build is parallel, with @nthreads = 0 resolved by resolve_threads(), and gives the same result as a serial build.
+    /// Although the build is parallel, it produces exactly what a serial build would:
     ///  1. Each reference is cut into tasks of kExtractChunk window starts.
-    ///     A task owns the minimizer positions in its range and emits only those, into kNpart hash partitions.
-    ///  2. One thread collects the distinct keys of each partition, since distinct keys never span partitions.
-    ///  3. One MPHF covers all keys, built in partitions in parallel.
-    ///  4. A counting sort on rank fills the CSR, per partition.
+    ///     A task emits only the minimizer positions it owns, sorted into kNpart hash partitions.
+    ///  2. A single thread collects each partition's distinct keys, which works because a key never spans partitions.
+    ///  3. One MPHF then covers all keys, built partition by partition in parallel.
+    ///  4. Finally, a counting sort on rank fills the CSR, again per partition.
     bool build(const std::vector<std::pair<const char*, std::size_t>>& refs,
-               unsigned k, unsigned w, uint32_t max_occ, unsigned nthreads = 0) {
-        k_ = k; w_ = w; max_occ_ = max_occ; refs_ = refs;
-        PhaseTimer pt;
-        for (const auto& r : refs) if (r.second >= (std::size_t(1) << 31)) return false;
+               unsigned kmer_len, unsigned window, uint32_t max_occ, unsigned nthreads = 0) {
+        kmer_len_ = kmer_len; window_ = window; max_occ_ = max_occ; refs_ = refs;
+        PhaseTimer timer;
+
+        for (const auto& ref : refs) if (ref.second >= kMaxRefLen) return false;
+
         nthreads = resolve_threads(nthreads);
 
-        struct Task { uint32_t rid; std::size_t s, e; };     // window starts [s, e)
+        struct Task { uint32_t rid; std::size_t win_start, win_end; };     // window starts [start, end)
         constexpr std::size_t kExtractChunk = std::size_t(1) << 20;
         std::vector<Task> tasks;
+
         for (std::size_t rid = 0; rid < refs.size(); ++rid) {
             const std::size_t len = refs[rid].second;
-            if (len < k + w - 1) continue;
-            const std::size_t nwin = len - (k + w - 1) + 1;
-            for (std::size_t s = 0; s < nwin; s += kExtractChunk)
-                tasks.push_back({static_cast<uint32_t>(rid), s, std::min(nwin, s + kExtractChunk)});
+
+            if (len < kmer_len + window - 1) continue;
+
+            const std::size_t nwin = len - (kmer_len + window - 1) + 1;
+
+            for (std::size_t chunk_start = 0; chunk_start < nwin; chunk_start += kExtractChunk)
+                tasks.push_back({static_cast<uint32_t>(rid), chunk_start, std::min(nwin, chunk_start + kExtractChunk)});
         }
+
         nthreads = std::max(1u, std::min<unsigned>(nthreads, static_cast<unsigned>(std::max<std::size_t>(tasks.size(), 1))));
-        // 1. Every task owns the minimizer positions [s, e), and the last task of a reference owns through its end.
-        //    It scans the windows starting in [s - (w-1), e), which can select an owned position, and emits only owned positions, so no seed is emitted twice and none is lost.
+        // 1. Every task owns the minimizer positions [start, end), and the last task of a reference owns through its end.
+        //    It scans windows starting in [start - (w-1), end), since any of those can select an owned position.
+        //    Emitting only owned positions means no seed appears twice and none goes missing.
         //    Per-task buffers keep postings in reference order.
-        //    Only the 8-byte posting is kept, since key_of re-reads its key, the reference k-mer it points at, when needed.
-        //    Carrying the key doubled the build's largest buffers, and hg38 with 535M postings peaked at 25 GB for a 6 GB index.
-        //    Buckets are sized from the expected density 2 / (w + 1), so doubling slack stays small.
+        //    Only the 8-byte posting is kept, because key_of() can re-read the key from the reference whenever needed.
+        //    Carrying the key as well doubled the largest buffers, and hg38's 535M postings then peaked at 25 GB for a 6 GB index.
+        //    Buckets are sized from the expected minimizer density, which keeps the doubling slack small.
         std::vector<std::vector<std::vector<uint64_t>>> task_buckets(tasks.size(), std::vector<std::vector<uint64_t>>(kNpart));
-        parallel(nthreads, tasks.size(), [&](unsigned, std::size_t i) {
-            const Task& tk = tasks[i];
-            const char* seq = refs[tk.rid].first;
-            const std::size_t len = refs[tk.rid].second;
-            const std::size_t nwin = len - (k + w - 1) + 1;
-            const std::size_t s0 = tk.s >= w - 1 ? tk.s - (w - 1) : 0;
-            const std::size_t end = tk.e + (w - 1) + (k - 1);   // exclusive base end
-            const std::size_t own_end = tk.e == nwin ? len : tk.e;
-            auto& out = task_buckets[i];
-            const std::size_t expect = 2 * (tk.e - tk.s) / (w + 1) / kNpart;
-            for (auto& b : out) b.reserve(expect + expect / 8 + 8);
-            extract_minimizers(seq + s0, end - s0, k, w, [&](const MinimizerSeed& m) {
-                const uint64_t pos = s0 + m.pos;
-                if (pos < tk.s || pos >= own_end) return;
-                out[part_of(m.kmer)].push_back((uint64_t(tk.rid) << kRidShift) | (pos << 1) | uint64_t(m.rev));
+
+        parallel(nthreads, tasks.size(), [&](unsigned, std::size_t task_idx) {
+            const Task& task = tasks[task_idx];
+            const char* seq = refs[task.rid].first;
+            const std::size_t len = refs[task.rid].second;
+            const std::size_t nwin = len - (kmer_len + window - 1) + 1;
+            const std::size_t scan_start = task.win_start >= window - 1 ? task.win_start - (window - 1) : 0;
+            const std::size_t end = task.win_end + (window - 1) + (kmer_len - 1);   // exclusive base end
+            const std::size_t own_end = task.win_end == nwin ? len : task.win_end;
+            auto& out = task_buckets[task_idx];
+            const std::size_t expect = kMinimizerDensityNumerator * (task.win_end - task.win_start) / (window + 1) / kNpart;
+
+            for (auto& bucket : out) bucket.reserve(expect + expect / kBucketSlackDiv + kBucketSlack);
+
+            extract_minimizers(seq + scan_start, end - scan_start, kmer_len, window, [&](const MinimizerSeed& seed) {
+                const uint64_t pos = scan_start + seed.pos;
+
+                if (pos < task.win_start || pos >= own_end) return;
+
+                out[part_of(seed.kmer)].push_back(make_posting(task.rid, pos, seed.rev));
             });
         });
-        pt.lap("seed: extract minimizers");
+        timer.lap("seed: extract minimizers");
 
-        // 2. Distinct keys per partition are read straight from the per-task buckets in task order, which is reference order, through a cache-sized hash set.
-        //    No sort is needed, since grouping is done by MPHF rank below.
-        //    There is no gathered copy, because freed small buckets stay resident in the allocator and a copy cost its full size again, 4.3 GB on hg38.
-        auto each = [&](std::size_t p, auto&& f) {
-            for (const auto& v : task_buckets) for (const uint64_t x : v[p]) f(x);
+        // 2. Each partition's distinct keys are read straight from the per-task buckets, in reference order, through a cache-sized hash set.
+        //    Sorting is unnecessary, because the MPHF ranks do the grouping below.
+        //    There is no gathered copy either, because freed small buckets stay resident in the allocator and a copy cost its full size again (4.3 GB on hg38).
+        auto each = [&](std::size_t part, auto&& func) {
+            for (const auto& task : task_buckets) for (const uint64_t post : task[part]) func(post);
         };
         // each() serves the passes that re-read keys.
-        // A bucket's postings are about w/2 x kNpart bases apart, so every key read misses cache, and the reference bytes are prefetched kPrefetchDistance postings ahead.
-        auto each_key = [&](std::size_t p, auto&& f) {
-            for (const auto& v : task_buckets) {
-                const auto& a = v[p];
-                const std::size_t m = a.size();
-                for (std::size_t i = 0; i < std::min(m, kPrefetchDistance); ++i) prefetch_ref(a[i]);
-                for (std::size_t i = 0; i < m; ++i) {
-                    if (i + kPrefetchDistance < m) prefetch_ref(a[i + kPrefetchDistance]);
-                    f(a[i]);
+        // A bucket's postings sit about w/2 x kNpart bases apart, so every key read misses cache.
+        // To hide that, the reference bytes are prefetched kPrefetchDistance postings ahead.
+        auto each_key = [&](std::size_t part, auto&& func) {
+            for (const auto& task : task_buckets) {
+                const auto& bucket = task[part];
+                const std::size_t count = bucket.size();
+
+                for (std::size_t i = 0; i < std::min(count, kPrefetchDistance); ++i) prefetch_ref(bucket[i]);
+
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (i + kPrefetchDistance < count) prefetch_ref(bucket[i + kPrefetchDistance]);
+
+                    func(bucket[i]);
                 }
             }
         };
         std::vector<std::size_t> psize(kNpart, 0);
         std::vector<std::vector<uint64_t>> pkeys(kNpart);
-        parallel(nthreads, kNpart, [&](unsigned, std::size_t p) {
+
+        parallel(nthreads, kNpart, [&](unsigned, std::size_t part) {
             std::size_t tot = 0;
-            for (auto& v : task_buckets) tot += v[p].size();
-            psize[p] = tot;
+
+            for (auto& task : task_buckets) tot += task[part].size();
+
+            psize[part] = tot;
             std::size_t cap = kMinKeySetSlots;
-            while (cap < tot * 2) cap <<= 1;
-            std::vector<uint64_t> set(cap, ~uint64_t(0));     // keys < 2^64 - 1, which canonical k-mers with k <= 32 are
-            auto& distinct_keys = pkeys[p];
-            each_key(p, [&](uint64_t post) {
+
+            while (cap < tot * kKeySetSlotsPerKey) cap <<= 1;
+
+            std::vector<uint64_t> set(cap, ~uint64_t(0));     // ~0 is free, since no canonical k-mer with k <= 32 reaches it
+            auto& distinct_keys = pkeys[part];
+
+            each_key(part, [&](uint64_t post) {
                 const uint64_t key = key_of(post);
-                // MurmurHash3 fmix64, a hash independent of part_of(), whose top bits all keys here share
-                uint64_t z = key ^ (key >> 33);
-                z *= 0xff51afd7ed558ccdULL; z ^= z >> 33;
-                z *= 0xc4ceb9fe1a85ec53ULL; z ^= z >> 33;
-                std::size_t h = static_cast<std::size_t>(z) & (cap - 1);
+                // part_of() used the top bits, which every key in this partition shares, so an independent hash is needed here.
+                std::size_t slot = static_cast<std::size_t>(mix64(key, 0)) & (cap - 1);
+
                 for (;;) {
-                    if (set[h] == key) break;
-                    if (set[h] == ~uint64_t(0)) { set[h] = key; distinct_keys.push_back(key); break; }
-                    h = (h + 1) & (cap - 1);
+                    if (set[slot] == key) break;
+
+                    if (set[slot] == ~uint64_t(0)) { set[slot] = key; distinct_keys.push_back(key); break; }
+
+                    slot = (slot + 1) & (cap - 1);
                 }
             });
-            distinct_keys.shrink_to_fit();       // doubling slack x 256 partitions reached 3.3 GB on hg38
+            distinct_keys.shrink_to_fit();       // doubling slack across all partitions reached 3.3 GB on hg38
         });
-        n_ = 0;
-        for (const auto& v : pkeys) n_ += v.size();
-        pt.lap("seed: distinct keys");
-        // Build speed is preferred over MPHF space here, since the 8-byte postings dominate the index.
-        // When this was chosen, c = 16 built 17.5M keys in 1.1 s per thread at 8 bits per key, against 4.2 s and 4.8 bits per key at the size-tuned c = 6.
-        // The per-partition key lists go in directly, with no concatenated copy.
-        if (n_ && !mphf_.build(pkeys, kMphfC, kMphfAlpha, nthreads)) return false;
-        pt.lap("seed: mphf");
+        num_keys_ = 0;
+
+        for (const auto& keys : pkeys) num_keys_ += keys.size();
+
+        timer.lap("seed: distinct keys");
+
+        // Build speed takes priority over MPHF space here, because the 8-byte postings dominate the index anyway.
+        // When this was chosen, c = 16 built 17.5M keys in 1.1 s per thread at 8 bits per key, versus 4.2 s and 4.8 bits per key at the size-tuned c = 6.
+        // The per-partition key lists go in directly, without a concatenated copy.
+        if (num_keys_ && !mphf_.build(pkeys, kMphfC, kMphfAlpha, nthreads)) return false;
+
+        timer.lap("seed: mphf");
 
         // 3. CSR by counting sort on rank.
-        //    Each posting's rank is computed once, re-reading the key from the reference with its MPHF line prefetched kPrefetchDistance postings ahead, and kept for the scatter pass.
-        //    The count and scatter passes prefetch their random off_ and post_ lines likewise (Slotin, Algorithms for Modern Hardware, "Prefetching").
-        //    The scatter uses off_ itself as the write cursor and shifts it back afterwards, where a cursor copy took 1.7 GB on hg38.
-        //    All postings of a key live in one partition and are scattered in reference order, so each posting list is sorted exactly as before.
-        // off_ is 32-bit, and more than 2^32 - 1 postings, from a reference of about 25 Gbp, would wrap the offsets silently, so the build refuses instead.
+        //    Each posting's rank is computed once and kept for the scatter pass.
+        //    Computing it re-reads the key from the reference, with the MPHF line prefetched kPrefetchDistance postings ahead.
+        //    The count and scatter passes prefetch their random off_ and post_ lines in the same way (Slotin, "Prefetching").
+        //    The scatter uses off_ itself as the write cursor and shifts it back afterwards, since a separate cursor took 1.7 GB on hg38.
+        //    All postings of a key are in one partition and are scattered in reference order, so each posting list ends up sorted.
+        // Because off_ is 32-bit, kMaxPostings or more postings (a reference near 25 Gbp) would wrap silently, so the build refuses instead.
         {
             std::size_t total = 0;
-            for (std::size_t t : psize) total += t;
-            if (total >= (std::size_t(1) << 32)) return false;
+
+            for (std::size_t part_size : psize) total += part_size;
+
+            if (total >= kMaxPostings) return false;
         }
-        off_.assign(n_ + 1, 0);
+        off_.assign(num_keys_ + 1, 0);
         std::vector<std::vector<uint32_t>> prank(kNpart);
-        parallel(nthreads, kNpart, [&](unsigned, std::size_t p) {
-            auto& ranks = prank[p];
-            ranks.resize(psize[p]);
-            std::size_t x = 0;
-            for (const auto& v : task_buckets) {
-                const auto& a = v[p];
-                const std::size_t m = a.size();
-                // Each key is re-read once.
-                // Reference bytes are prefetched 2 * kPrefetchDistance postings ahead and the key read kPrefetchDistance ahead (its MPHF line then prefetched), after which it waits in a ring until its use.
+
+        parallel(nthreads, kNpart, [&](unsigned, std::size_t part) {
+            auto& ranks = prank[part];
+
+            ranks.resize(psize[part]);
+            std::size_t cursor = 0;
+
+            for (const auto& task : task_buckets) {
+                const auto& bucket = task[part];
+                const std::size_t count = bucket.size();
+                // Each key is re-read exactly once.
+                // Reference bytes are prefetched 2 * kPrefetchDistance postings ahead, and the key itself is read kPrefetchDistance ahead.
+                // Its MPHF line is prefetched at that point, and the key then waits in a ring until it's used.
                 uint64_t ring[kPrefetchDistance];
-                for (std::size_t i = 0; i < std::min(m, 2 * kPrefetchDistance); ++i) prefetch_ref(a[i]);
-                for (std::size_t i = 0; i < std::min(m, kPrefetchDistance); ++i) {
-                    ring[i] = key_of(a[i]);
+                constexpr std::size_t kRefPrefetchDistance = 2 * kPrefetchDistance;
+
+                for (std::size_t i = 0; i < std::min(count, kRefPrefetchDistance); ++i) prefetch_ref(bucket[i]);
+
+                for (std::size_t i = 0; i < std::min(count, kPrefetchDistance); ++i) {
+                    ring[i] = key_of(bucket[i]);
                     mphf_.prefetch(ring[i]);
                 }
-                for (std::size_t i = 0; i < m; ++i) {
+
+                for (std::size_t i = 0; i < count; ++i) {
                     const uint64_t key = ring[i % kPrefetchDistance];
-                    if (i + 2 * kPrefetchDistance < m) prefetch_ref(a[i + 2 * kPrefetchDistance]);
-                    if (i + kPrefetchDistance < m) {
-                        ring[i % kPrefetchDistance] = key_of(a[i + kPrefetchDistance]);
+
+                    if (i + kRefPrefetchDistance < count) prefetch_ref(bucket[i + kRefPrefetchDistance]);
+
+                    if (i + kPrefetchDistance < count) {
+                        ring[i % kPrefetchDistance] = key_of(bucket[i + kPrefetchDistance]);
                         mphf_.prefetch(ring[i % kPrefetchDistance]);
                     }
-                    ranks[x++] = static_cast<uint32_t>(mphf_(key));
+
+                    // The MPHF rank of each posting's key decides which list it joins.
+                    ranks[cursor++] = static_cast<uint32_t>(mphf_(key));
                 }
             }
+
             for (std::size_t i = 0; i < ranks.size(); ++i) {
-                if (i + kPrefetchDistance < ranks.size()) __builtin_prefetch(&off_[ranks[i + kPrefetchDistance] + 1], 1, 0);
+                if (i + kPrefetchDistance < ranks.size()) prefetch_write_once(&off_[ranks[i + kPrefetchDistance] + 1]);
+
+                // Counting into off_[r + 1] makes the prefix sum below yield each list's start in off_[r].
                 ++off_[ranks[i] + 1];
             }
         });
-        for (std::size_t r = 0; r < n_; ++r) off_[r + 1] += off_[r];
-        post_.resize(off_[n_]);
-        parallel(nthreads, kNpart, [&](unsigned, std::size_t p) {
-            const auto& ranks = prank[p];
-            std::size_t x = 0;
-            each(p, [&](uint64_t post) {
-                if (x + kPrefetchDistance < ranks.size()) __builtin_prefetch(&off_[ranks[x + kPrefetchDistance]], 1, 0);
-                post_[off_[ranks[x]]++] = post;
-                ++x;
+        for (std::size_t r = 0; r < num_keys_; ++r) off_[r + 1] += off_[r];
+
+        post_.resize(off_[num_keys_]);
+        parallel(nthreads, kNpart, [&](unsigned, std::size_t part) {
+            const auto& ranks = prank[part];
+            std::size_t cursor = 0;
+
+            each(part, [&](uint64_t post) {
+                if (cursor + kPrefetchDistance < ranks.size()) prefetch_write_once(&off_[ranks[cursor + kPrefetchDistance]]);
+
+                // Scattering partitions in reference order leaves every posting list sorted by position with no extra sort.
+                post_[off_[ranks[cursor]]++] = post;
+                ++cursor;
             });
-            std::vector<uint32_t>().swap(prank[p]);
+            std::vector<uint32_t>().swap(prank[part]);
         });
-        // off_[r] now holds the end of rank r's list, so shift back by one.
-        for (std::size_t r = n_; r > 0; --r) off_[r] = off_[r - 1];
+        // off_[r] now holds the end of rank r's list, so everything shifts back by one.
+        for (std::size_t r = num_keys_; r > 0; --r) off_[r] = off_[r - 1];
+
         off_[0] = 0;
         task_buckets.clear();
-        // The buckets were small allocations the allocator keeps after free, so they are handed back, or the mapper would run with 4.3 GB of them resident on hg38.
+        // The allocator keeps freed small buckets, so they are handed back explicitly.
+        // Otherwise the mapper would run with 4.3 GB of them resident on hg38.
         malloc_trim(0);
-        pt.lap("seed: csr fill");
+        timer.lap("seed: csr fill");
         set_mid_occ();
         return true;
     }
 
-    /// mid_occ() - occurrence threshold of the chaining path (collect_chain), the occurrence count exceeded by a kMidOccFrac fraction of the distinct minimizers, clamped to [kMinMidOcc, max_occ].
-    /// It comes from the index's own distribution, so it follows the genome's repeat content instead of a fixed constant (the concept is minimap2's mid_occ, Li 2021 btab705).
+    /// collect_chain() skips minimizers above this occurrence count, which a kMidOccFrac fraction of distinct minimizers exceed.
+    /// The count is clamped to [kMinMidOcc, max_occ].
+    /// Deriving it from the index's own distribution lets it track the genome's repeat content (minimap2's mid_occ, Li 2021).
     static constexpr double kMidOccFrac = 2e-4;
     static constexpr uint32_t kMinMidOcc = 10;
-    /// collect_chain keeps, in each run of over-threshold minimizers, the least frequent one per kOccDist read bases, if it occurs at most kMaxMaxOcc times, as btab705 rescues repeat seeds.
+    /// Within a run of over-threshold minimizers, collect_chain() keeps the least frequent one per kOccDist read bases, as long as it occurs at most kMaxMaxOcc times.
     static constexpr uint32_t kOccDist = 500;
     static constexpr uint32_t kMaxMaxOcc = 4095;
     uint32_t mid_occ() const noexcept { return mid_occ_; }
 
-    /// collect_chain() - seed hits for chaining.
-    /// Minimizers occurring at most mid_occ() times seed as in collect().
-    /// A run of consecutive over-threshold minimizers, i.e. a repeat the read lies in, is not dropped whole.
-    /// Between the flanking kept minimizers or read ends at positions ps and pe, the round((pe - ps) / kOccDist) least frequent ones that occur at most kMaxMaxOcc times still seed.
-    /// A read inside a satellite array thus keeps anchors at its true copy and at its competitors, which MAPQ then sees.
-    /// *rep_len gets the read bases that only dropped minimizers cover, the union of their [pos, pos + k) intervals.
+    /// Minimizers occurring at most mid_occ() times seed exactly as in collect().
+    /// A run of over-threshold minimizers, meaning the read lies in a repeat, isn't dropped whole, though.
+    /// Between the flanking kept minimizers (or read ends) at ps and pe, the round((pe - ps) / kOccDist) least frequent ones still seed if they occur at most kMaxMaxOcc times.
+    /// A read inside a satellite array thus keeps anchors at its true copy and at its competitors, and MAPQ can account for both.
+    /// *rep_len receives the read bases covered only by dropped minimizers, as the union of their [pos, pos + k) intervals.
     void collect_chain(const char* seq, std::size_t len, std::vector<Hit>& out,
                        uint32_t* rep_len = nullptr) const {
         out.clear();
+
         if (rep_len) *rep_len = 0;
-        if (n_ == 0) return;
-        thread_local std::vector<MinimizerSeed> ms;
+
+        if (num_keys_ == 0) return;
+
+        thread_local std::vector<MinimizerSeed> seeds;
         thread_local std::vector<uint64_t> ranks;
         thread_local std::vector<uint32_t> occ;
         thread_local std::vector<uint8_t> keep;
         thread_local std::vector<uint32_t> cand;
-        ms.clear();
-        extract_minimizers(seq, len, k_, w_, [&](const MinimizerSeed& s) { ms.push_back(s); });
-        const std::size_t n = ms.size();
-        resolve(ms, ranks);
-        occ.assign(n, 0);
-        keep.assign(n, 0);
-        for (std::size_t i = 0; i < n; ++i) {
-            const uint32_t lo = uint32_t(ranks[i] >> 32), hi = uint32_t(ranks[i]);
-            if (lo == hi || !verify(post_[lo], ms[i].kmer)) continue;
-            occ[i] = hi - lo;
+
+        seeds.clear();
+        extract_minimizers(seq, len, kmer_len_, window_, [&](const MinimizerSeed& seed) { seeds.push_back(seed); });
+        const std::size_t count = seeds.size();
+
+        resolve(seeds, ranks);
+        occ.assign(count, 0);
+        keep.assign(count, 0);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            const uint32_t post_lo = range_lo(ranks[i]), post_hi = range_hi(ranks[i]);
+
+            // The MPHF also maps keys it was never built on. Comparing the first posting's reference k-mer confirms the minimizer is in the index.
+            if (post_lo == post_hi || !verify(post_[post_lo], seeds[i].kmer)) continue;
+
+            occ[i] = post_hi - post_lo;
+            // Minimizers above mid_occ_ are dropped at first, and the loop below restores the least frequent one in each uncovered run.
             keep[i] = occ[i] <= mid_occ_;
         }
-        // runs of over-threshold minimizers, bounded by kept ones or read ends
-        std::size_t i = 0;
-        while (i < n) {
-            if (occ[i] <= mid_occ_) { ++i; continue; }
-            std::size_t j = i;
-            while (j < n && occ[j] > mid_occ_) ++j;          // [i, j) is one run
-            const std::size_t ps = i > 0 ? ms[i - 1].pos : 0;
-            const std::size_t pe = j < n ? ms[j].pos : len;
-            const std::size_t want = static_cast<std::size_t>(double(pe - ps) / kOccDist + 0.499);
+
+        // Find runs of over-threshold minimizers, bounded by kept ones or by the read ends.
+        std::size_t run_start = 0;
+
+        while (run_start < count) {
+            if (occ[run_start] <= mid_occ_) { ++run_start; continue; }
+
+            std::size_t run_end = run_start;
+
+            while (run_end < count && occ[run_end] > mid_occ_) ++run_end;
+
+            const std::size_t prev_pos = run_start > 0 ? seeds[run_start - 1].pos : 0;
+            const std::size_t next_pos = run_end < count ? seeds[run_end].pos : len;
+            const std::size_t want = static_cast<std::size_t>(double(next_pos - prev_pos) / kOccDist + kWantRoundingBias);
+
             if (want > 0) {
                 cand.clear();
-                for (std::size_t t = i; t < j; ++t)
+
+                for (std::size_t t = run_start; t < run_end; ++t)
                     if (occ[t] <= kMaxMaxOcc) cand.push_back(static_cast<uint32_t>(t));
+
                 if (cand.size() > want) {
-                    // the `want` least frequent, with ties going to the earlier ones in the read
-                    std::nth_element(cand.begin(), cand.begin() + want, cand.end(), [&](uint32_t a, uint32_t b) {
-                        return occ[a] != occ[b] ? occ[a] < occ[b] : a < b;
+                    // Keep the `want` least frequent ones, breaking ties toward the earlier ones in the read.
+                    std::nth_element(cand.begin(), cand.begin() + want, cand.end(), [&](uint32_t lhs, uint32_t rhs) {
+                        return occ[lhs] != occ[rhs] ? occ[lhs] < occ[rhs] : lhs < rhs;
                     });
                     cand.resize(want);
                 }
-                for (uint32_t t : cand) keep[t] = 1;
+
+                for (uint32_t seed_idx : cand) keep[seed_idx] = 1;
             }
-            i = j;
+
+            run_start = run_end;
         }
-        uint32_t rl = 0;
+
+        uint32_t rep_bases = 0;
         std::size_t cov_end = 0;                              // union of dropped [pos, pos + k)
-        for (std::size_t t = 0; t < n; ++t) {
+
+        for (std::size_t t = 0; t < count; ++t) {
             if (occ[t] == 0) continue;
+
             if (!keep[t]) {
-                const std::size_t a = std::max<std::size_t>(ms[t].pos, cov_end), b = ms[t].pos + k_;
-                if (b > a) { rl += static_cast<uint32_t>(b - a); cov_end = b; }
+                const std::size_t cov_start = std::max<std::size_t>(seeds[t].pos, cov_end), cov_stop = seeds[t].pos + kmer_len_;
+
+                if (cov_stop > cov_start) { rep_bases += static_cast<uint32_t>(cov_stop - cov_start); cov_end = cov_stop; }
+
                 continue;
             }
-            const uint32_t lo = uint32_t(ranks[t] >> 32), hi = uint32_t(ranks[t]);
-            emit(ms[t], lo, hi, len, out);
+
+            const uint32_t post_lo = range_lo(ranks[t]), post_hi = range_hi(ranks[t]);
+
+            emit(seeds[t], post_lo, post_hi, len, out);
         }
-        if (rep_len) *rep_len = rl;
+
+        if (rep_len) *rep_len = rep_bases;
     }
 
-    std::size_t distinct() const noexcept { return n_; }
+    std::size_t distinct() const noexcept { return num_keys_; }
     std::size_t occurrences() const noexcept { return post_.size(); }
+
     std::size_t bytes() const noexcept {
-        return mphf_.bytes() + off_.size() * 4 + post_.size() * 8;
+        return mphf_.bytes() + off_.size() * sizeof(uint32_t) + post_.size() * sizeof(uint64_t);
     }
 
-    /// find() - postings of canonical minimizer @key, or {nullptr, 0} if absent.
+    /// Returns {nullptr, 0} for an absent key.
     std::pair<const uint64_t*, uint32_t> find(uint64_t key) const noexcept {
-        if (n_ == 0) return {nullptr, 0};
-        const uint64_t r = mphf_(key);
-        const uint32_t lo = off_[r], hi = off_[r + 1];
-        if (lo == hi) return {nullptr, 0};
-        if (!verify(post_[lo], key)) return {nullptr, 0};
-        return {post_.data() + lo, hi - lo};
+        if (num_keys_ == 0) return {nullptr, 0};
+
+        const uint64_t rank = mphf_(key);
+        const uint32_t post_lo = off_[rank], post_hi = off_[rank + 1];
+
+        if (post_lo == post_hi) return {nullptr, 0};
+
+        if (!verify(post_[post_lo], key)) return {nullptr, 0};
+
+        return {post_.data() + post_lo, post_hi - post_lo};
     }
 
-    /// collect() - seed hits of a read on both strands, identical to calling find() per minimizer in read order.
-    /// Every find() is a chain of four dependent misses (pilot, off_[r], post_[lo], reference k-mer), so the read's minimizers are resolved stage by stage with each stage's lines prefetched for all of them first (group prefetching, Slotin), giving about 4 exposed miss latencies per read instead of about 4 per minimizer.
-    /// @n_min and @n_rep (optional) receive the read's minimizers and how many of them occur in the reference but more than max_occ times (dropped as repetitive, since a read whose seeds are mostly dropped lies in a repeat whose other copies were never candidates).
+    /// Gives the same hits as calling find() per minimizer in read order, on both strands.
+    /// Each find() is a chain of four dependent misses: pilot, off_[r], post_[lo] and the reference k-mer.
+    /// So instead, all minimizers advance stage by stage, with each stage's lines prefetched for all of them first (group prefetching, Slotin).
+    /// That exposes about 4 miss latencies per read rather than about 4 per minimizer.
+    /// Optionally, @p n_min receives the read's minimizer count and @p n_rep how many were dropped for occurring more than max_occ times.
+    /// A read whose seeds are mostly dropped lies in a repeat whose other copies were never candidates, which is why callers want that count.
     void collect(const char* seq, std::size_t len, std::vector<Hit>& out,
                  uint32_t* n_min = nullptr, uint32_t* n_rep = nullptr) const {
         out.clear();
+
         if (n_min) *n_min = 0;
+
         if (n_rep) *n_rep = 0;
-        if (n_ == 0) return;
-        thread_local std::vector<MinimizerSeed> ms;
+
+        if (num_keys_ == 0) return;
+
+        thread_local std::vector<MinimizerSeed> seeds;
         thread_local std::vector<uint64_t> ranks;
-        ms.clear();
-        extract_minimizers(seq, len, k_, w_, [&](const MinimizerSeed& s) { ms.push_back(s); });
-        const std::size_t n = ms.size();
-        resolve(ms, ranks);
+
+        seeds.clear();
+        extract_minimizers(seq, len, kmer_len_, window_, [&](const MinimizerSeed& seed) { seeds.push_back(seed); });
+        const std::size_t count = seeds.size();
+
+        resolve(seeds, ranks);
         uint32_t rep = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            const MinimizerSeed& s = ms[i];
-            const uint32_t lo = uint32_t(ranks[i] >> 32), hi = uint32_t(ranks[i]);
-            if (lo == hi || !verify(post_[lo], s.kmer)) continue;
-            if (hi - lo > max_occ_) { ++rep; continue; }
-            emit(s, lo, hi, len, out);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            const MinimizerSeed& seed = seeds[i];
+            const uint32_t post_lo = range_lo(ranks[i]), post_hi = range_hi(ranks[i]);
+
+            if (post_lo == post_hi || !verify(post_[post_lo], seed.kmer)) continue;
+
+            // Skipped but counted, because hidden_odds weighs their share.
+            if (post_hi - post_lo > max_occ_) { ++rep; continue; }
+
+            emit(seed, post_lo, post_hi, len, out);
         }
-        if (n_min) *n_min = static_cast<uint32_t>(n);
+
+        if (n_min) *n_min = static_cast<uint32_t>(count);
+
         if (n_rep) *n_rep = rep;
     }
 
 private:
-    /// resolve() - ranks[i] = (lo << 32) | hi, the posting range of minimizer i, resolved stage by stage with each stage's lines prefetched for all minimizers first (see collect()).
-    void resolve(const std::vector<MinimizerSeed>& ms, std::vector<uint64_t>& ranks) const {
-        const std::size_t n = ms.size();
-        ranks.resize(n);
-        for (std::size_t i = 0; i < n; ++i) mphf_.prefetch(ms[i].kmer);
-        for (std::size_t i = 0; i < n; ++i) {
-            ranks[i] = mphf_(ms[i].kmer);
+    /// Fills ranks[i] with minimizer i's packed posting range (see pack_range()), staged and prefetched as collect() describes.
+    void resolve(const std::vector<MinimizerSeed>& seeds, std::vector<uint64_t>& ranks) const {
+        const std::size_t count = seeds.size();
+
+        ranks.resize(count);
+
+        // Each of the four passes prefetches what the next pass reads, letting a read's cache misses overlap instead of happening one after another.
+        for (std::size_t i = 0; i < count; ++i) mphf_.prefetch(seeds[i].kmer);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            ranks[i] = mphf_(seeds[i].kmer);
             __builtin_prefetch(&off_[ranks[i]]);
         }
-        for (std::size_t i = 0; i < n; ++i) {
-            const uint32_t lo = off_[ranks[i]];
-            ranks[i] = (uint64_t(lo) << 32) | off_[ranks[i] + 1];        // (lo, hi)
-            __builtin_prefetch(&post_[lo]);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            const uint32_t post_lo = off_[ranks[i]];
+
+            ranks[i] = pack_range(post_lo, off_[ranks[i] + 1]);
+            __builtin_prefetch(&post_[post_lo]);
         }
-        for (std::size_t i = 0; i < n; ++i) {
-            const uint32_t lo = uint32_t(ranks[i] >> 32), hi = uint32_t(ranks[i]);
-            if (lo == hi) continue;
-            const uint64_t p = post_[lo];
-            const char* r = refs_[p >> kRidShift].first + ((p >> 1) & kPosMask);
-            __builtin_prefetch(r);
-            __builtin_prefetch(r + k_ - 1);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            const uint32_t post_lo = range_lo(ranks[i]), post_hi = range_hi(ranks[i]);
+
+            if (post_lo == post_hi) continue;
+
+            const uint64_t post = post_[post_lo];
+            const char* ref_ptr = refs_[posting_ref(post)].first + posting_pos(post);
+
+            __builtin_prefetch(ref_ptr);
+            __builtin_prefetch(ref_ptr + kmer_len_ - 1);
         }
     }
 
-    /// emit() - strand-aware hits of minimizer @s over postings [@lo, @hi).
-    void emit(const MinimizerSeed& s, uint32_t lo, uint32_t hi, std::size_t len, std::vector<Hit>& out) const {
-        for (uint32_t t = lo; t < hi; ++t) {
-            const uint64_t e = post_[t];
-            const uint32_t rid = static_cast<uint32_t>(e >> kRidShift);
-            const uint32_t rpos = static_cast<uint32_t>((e >> 1) & kPosMask);
-            const bool rev = ((e & 1) != 0) != s.rev;
-            const uint32_t qp = rev ? static_cast<uint32_t>(len - k_ - s.pos) : s.pos;
-            out.push_back({rid, rev ? 1u : 0u, rpos, qp});
+    void emit(const MinimizerSeed& seed, uint32_t post_lo, uint32_t post_hi, std::size_t len, std::vector<Hit>& out) const {
+        for (uint32_t t = post_lo; t < post_hi; ++t) {
+            const uint64_t post = post_[t];
+            const uint32_t rid = static_cast<uint32_t>(posting_ref(post));
+            const uint32_t rpos = static_cast<uint32_t>(posting_pos(post));
+            // A hit is reverse when the read and the reference saw the minimizer on opposite strands.
+            const bool rev = posting_reverse(post) != seed.rev;
+            // Chaining works on the reverse-complemented read for reverse hits.
+            const uint32_t read_pos = rev ? static_cast<uint32_t>(len - kmer_len_ - seed.pos) : seed.pos;
+
+            out.push_back({rid, rev ? 1u : 0u, rpos, read_pos});
         }
     }
 
-    /// set_mid_occ() - mid_occ_ from a histogram of the keys' occurrence counts, with no per-key array, since hg38 has hundreds of millions of keys.
+    /// Works from a histogram of occurrence counts, because a per-key array would be huge for hg38's hundreds of millions of keys.
     void set_mid_occ() {
         const uint32_t cap = std::max<uint32_t>(max_occ_, 1);
+
         mid_occ_ = std::min(kMinMidOcc, cap);
-        if (n_ == 0) return;
-        std::vector<uint64_t> hist(static_cast<std::size_t>(cap) + 2, 0);
-        for (std::size_t r = 0; r < n_; ++r) ++hist[std::min<uint32_t>(off_[r + 1] - off_[r], cap + 1)];
-        const uint64_t above = static_cast<uint64_t>(kMidOccFrac * double(n_));
+
+        if (num_keys_ == 0) return;
+
+        // Bins 0..cap hold exact counts, and bin cap + 1 collects everything above.
+        std::vector<uint64_t> hist(static_cast<std::size_t>(cap) + kHistogramOverflowBins, 0);
+
+        for (std::size_t r = 0; r < num_keys_; ++r) ++hist[std::min<uint32_t>(off_[r + 1] - off_[r], cap + 1)];
+
+        const uint64_t above = static_cast<uint64_t>(kMidOccFrac * double(num_keys_));
         uint64_t cum = 0;
-        uint32_t t = cap + 1;
-        // the smallest t with at most `above` keys occurring more than t times
-        while (t > 0 && cum + hist[t] <= above) { cum += hist[t]; --t; }
-        mid_occ_ = std::max(std::min(kMinMidOcc, cap), std::min(t, cap));
+        uint32_t threshold = cap + 1;
+
+        // Find the smallest t with at most `above` keys occurring more than t times.
+        while (threshold > 0 && cum + hist[threshold] <= above) { cum += hist[threshold]; --threshold; }
+
+        mid_occ_ = std::max(std::min(kMinMidOcc, cap), std::min(threshold, cap));
     }
 
-    /// verify() - the reference as key store, where posting @p must spell @key.
-    bool verify(uint64_t p, uint64_t key) const noexcept {
-        const auto& ref = refs_[p >> kRidShift];
-        const std::size_t pos = (p >> 1) & kPosMask;
-        uint64_t x;
-        if (!encode_kmer(ref.first + pos, k_, x)) return false;
-        const uint64_t xr = reverse_complement(x, k_);
-        return (x < xr ? x : xr) == key;
+    /// Confirms that the reference spells @p key at posting @p post.
+    bool verify(uint64_t post, uint64_t key) const noexcept {
+        const auto& ref = refs_[posting_ref(post)];
+        const std::size_t pos = posting_pos(post);
+        uint64_t kmer;
+
+        if (!encode_kmer(ref.first + pos, kmer_len_, kmer)) return false;
+
+        const uint64_t rev_comp = reverse_complement(kmer, kmer_len_);
+
+        return (kmer < rev_comp ? kmer : rev_comp) == key;
     }
 
-    /// prefetch_ref() - prefetch the reference bytes posting @p points at.
-    void prefetch_ref(uint64_t p) const noexcept {
-        const char* s = refs_[p >> kRidShift].first + ((p >> 1) & kPosMask);
-        __builtin_prefetch(s, 0, 0);
-        __builtin_prefetch(s + k_ - 1, 0, 0);    // a k-mer may cross a line
+    void prefetch_ref(uint64_t post) const noexcept {
+        const char* ref_ptr = refs_[posting_ref(post)].first + posting_pos(post);
+
+        prefetch_read_once(ref_ptr);
+        prefetch_read_once(ref_ptr + kmer_len_ - 1);    // a k-mer may cross a line
     }
 
-    /// key_of() - the canonical k-mer posting @p points at (its minimizer key).
+    /// Reads the minimizer key back out of the reference.
     ///
-    /// A posting always points at k bases of A/C/G/T (minimizers never span an N), so each base is coded without a table or validity check, since ((c >> 1) ^ (c >> 2)) & 3 gives A 0, C 1, G 2, T 3 for upper- and lower-case ASCII, encode_kmer's code.
-    uint64_t key_of(uint64_t p) const noexcept {
-        const auto& ref = refs_[p >> kRidShift];
-        const auto* s = reinterpret_cast<const unsigned char*>(ref.first + ((p >> 1) & kPosMask));
-        uint64_t x = 0;
-        for (unsigned i = 0; i < k_; ++i) x = (x << 2) | (((s[i] >> 1) ^ (s[i] >> 2)) & 3u);
-        const uint64_t xr = reverse_complement(x, k_);
-        return x < xr ? x : xr;
+    /// A posting always points at k valid bases, because minimizers never span an N.
+    /// That allows decoding without a table or validity check, since ((c >> 1) ^ (c >> 2)) & 3 maps A, C, G, T to 0..3 in either case.
+    uint64_t key_of(uint64_t post) const noexcept {
+        const auto& ref = refs_[posting_ref(post)];
+        const auto* bases = reinterpret_cast<const unsigned char*>(ref.first + posting_pos(post));
+        uint64_t kmer = 0;
+
+        for (unsigned i = 0; i < kmer_len_; ++i)
+            kmer = (kmer << kBitsPerBase) | (((bases[i] >> kAsciiDecodeShift1) ^ (bases[i] >> kAsciiDecodeShift2)) & kComplementMask);
+
+        const uint64_t rev_comp = reverse_complement(kmer, kmer_len_);
+
+        return kmer < rev_comp ? kmer : rev_comp;
     }
 
-    /// Posting layout, with the reference id above bit kRidShift, the position in bits 1..32 and the strand in bit 0.
+    /// A posting stores the reference id above bit kRidShift, the position in bits 1..32 and the strand in bit 0.
+    static constexpr unsigned kPosShift = 1;
     static constexpr unsigned kRidShift = 33;
     static constexpr uint64_t kPosMask = 0xFFFFFFFFu;
+    static constexpr uint64_t kStrandBit = 1;
+    /// A rank's posting range is packed as (lo << kRangeShift) | hi.
+    static constexpr unsigned kRangeShift = 32;
+    /// Shifts that turn an ASCII base into its 2-bit code (see key_of()).
+    static constexpr unsigned kAsciiDecodeShift1 = 1, kAsciiDecodeShift2 = 2;
+    /// A window of w k-mers yields about 2/(w + 1) minimizers per position.
+    static constexpr std::size_t kMinimizerDensityNumerator = 2;
+    /// The per-partition key set keeps at most half its slots full.
+    static constexpr std::size_t kKeySetSlotsPerKey = 2;
+    static constexpr std::size_t kHistogramOverflowBins = 2;   // bin 0 plus the "above cap" bin
     static constexpr std::size_t kPrefetchDistance = 16;   // postings ahead
     static constexpr std::size_t kMinKeySetSlots = 64;
     static constexpr double kMphfC = 16.0, kMphfAlpha = 0.94;
 
-    static constexpr std::size_t kNpart = 256;
-    /// part_of() - hash partition of @key: the top 8 bits (kNpart = 256) of its Fibonacci hash.
-    static constexpr std::size_t part_of(uint64_t key) noexcept {
-        return static_cast<std::size_t>((key * 0x9E3779B97F4A7C15ULL) >> 56);
+    static constexpr unsigned kNpartBits = 8;
+    /// Reference positions get 31 bits and posting offsets 32, so anything at or past these is out of range.
+    static constexpr std::size_t kMaxRefLen = std::size_t(1) << 31;
+    static constexpr std::size_t kMaxPostings = std::size_t(1) << 32;
+    /// Partition buckets reserve an eighth (kBucketSlackDiv) more than the expected minimizers, plus kBucketSlack.
+    static constexpr std::size_t kBucketSlackDiv = 8;
+    static constexpr std::size_t kBucketSlack = 8;
+    /// Added before truncating a repeat run's wanted seed count, so that exact halves round down.
+    static constexpr double kWantRoundingBias = 0.499;
+    static constexpr std::size_t kNpart = std::size_t(1) << kNpartBits;
+
+    static constexpr uint64_t make_posting(uint64_t rid, uint64_t pos, bool rev) noexcept {
+        return (rid << kRidShift) | (pos << kPosShift) | (rev ? kStrandBit : 0);
     }
-    /// parallel() - run f(thread, item) over [0, @n) with dynamic (atomic counter) scheduling, the calling thread included.
+    static constexpr uint64_t posting_ref(uint64_t post) noexcept { return post >> kRidShift; }
+    static constexpr std::size_t posting_pos(uint64_t post) noexcept { return (post >> kPosShift) & kPosMask; }
+    static constexpr bool posting_reverse(uint64_t post) noexcept { return (post & kStrandBit) != 0; }
+    static constexpr uint64_t pack_range(uint32_t lo, uint32_t hi) noexcept { return (uint64_t(lo) << kRangeShift) | hi; }
+    static constexpr uint32_t range_lo(uint64_t range) noexcept { return static_cast<uint32_t>(range >> kRangeShift); }
+    static constexpr uint32_t range_hi(uint64_t range) noexcept { return static_cast<uint32_t>(range); }
+
+    /// Takes the top kNpartBits of the key's Fibonacci hash.
+    static constexpr std::size_t part_of(uint64_t key) noexcept {
+        return static_cast<std::size_t>((key * kGoldenRatio64) >> (kWordBits - kNpartBits));
+    }
+    /// Runs f(thread, item) for every item in [0, @p count), handing items out through an atomic counter.
+    /// The calling thread takes part as well.
     template <typename F>
-    static void parallel(unsigned nthreads, std::size_t n, F&& f) {
+    static void parallel(unsigned nthreads, std::size_t count, F&& func) {
         std::atomic<std::size_t> next{0};
-        auto work = [&](unsigned t) {
-            for (std::size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;) f(t, i);
+        auto work = [&](unsigned thread_idx) {
+            for (std::size_t item; (item = next.fetch_add(1, std::memory_order_relaxed)) < count;) func(thread_idx, item);
         };
-        std::vector<std::thread> th;
-        for (unsigned t = 1; t < nthreads; ++t) th.emplace_back(work, t);
+        std::vector<std::thread> threads;
+
+        for (unsigned t = 1; t < nthreads; ++t) threads.emplace_back(work, t);
+
         work(0);
-        for (auto& x : th) x.join();
+
+        for (auto& thread : threads) thread.join();
     }
 
-    unsigned k_ = 0, w_ = 0;
+    unsigned kmer_len_ = 0, window_ = 0;
     uint32_t max_occ_ = 0;
     uint32_t mid_occ_ = 0;
-    std::size_t n_ = 0;
+    std::size_t num_keys_ = 0;
     std::vector<std::pair<const char*, std::size_t>> refs_;
     Mphf mphf_;
-    HugeVec<uint32_t> off_;       // accessed at random per seed, so on huge pages
+    HugeVec<uint32_t> off_;       // read at random per seed, hence huge pages
     HugeVec<uint64_t> post_;
 };
 

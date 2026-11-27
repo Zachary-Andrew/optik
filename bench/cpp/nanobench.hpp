@@ -31,11 +31,26 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-namespace nb {
+namespace nanobench {
+/// PERF_TYPE_HW_CACHE config layout: cache id, then the operation at kCacheOpShift and the result at kCacheResultShift.
+constexpr unsigned kCacheOpShift = 8;
+constexpr unsigned kCacheResultShift = 16;
+/// perf_event_open arguments: any CPU, and no group leader for the first event.
+constexpr int kAnyCpu = -1;
+constexpr int kNoGroupLeader = -1;
+/// A PERF_FORMAT_GROUP read starts with the event count, the enabled time and the running time.
+constexpr std::size_t kGroupReadHeaderWords = 3;
+/// measure(): reps and warmup of -1 take NB_RUNS / NB_WARMUP, defaulting to kDefaultRuns and kDefaultWarmup.
+constexpr int kFromEnv = -1;
+constexpr int kDefaultRuns = 31;
+constexpr int kDefaultWarmup = 5;
+/// Buffer for one event's JSON fields.
+constexpr std::size_t kJsonFieldBufLen = 256;
+
 
 struct Event { const char* name; uint32_t type; uint64_t config; };
 
-inline uint64_t cache_cfg(uint64_t id, uint64_t op, uint64_t res) { return id | (op << 8) | (res << 16); }
+inline uint64_t cache_cfg(uint64_t cache_id, uint64_t cache_op, uint64_t res) { return cache_id | (cache_op << kCacheOpShift) | (res << kCacheResultShift); }
 
 /// Events grouped so that each group fits the core's counters (AMD Zen has 6 general-purpose counters, one of which the NMI watchdog may hold).
 inline std::vector<std::vector<Event>> default_groups() {
@@ -56,19 +71,19 @@ class Group {
 public:
     explicit Group(const std::vector<Event>& evs) : evs_(evs) {
         for (std::size_t i = 0; i < evs.size(); ++i) {
-            perf_event_attr a;
-            std::memset(&a, 0, sizeof(a));
-            a.size = sizeof(a);
-            a.type = evs[i].type;
-            a.config = evs[i].config;
-            a.disabled = i == 0;
-            a.exclude_kernel = 1;
-            a.exclude_hv = 1;
-            a.pinned = i == 0;
-            a.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
-            const int fd = static_cast<int>(syscall(SYS_perf_event_open, &a, 0, -1, i ? fds_[0] : -1, 0));
-            if (fd < 0) { err_ = std::string(evs[i].name) + ": " + std::strerror(errno); close_all(); return; }
-            fds_.push_back(fd);
+            perf_event_attr attr;
+            std::memset(&attr, 0, sizeof(attr));
+            attr.size = sizeof(attr);
+            attr.type = evs[i].type;
+            attr.config = evs[i].config;
+            attr.disabled = i == 0;
+            attr.exclude_kernel = 1;
+            attr.exclude_hv = 1;
+            attr.pinned = i == 0;
+            attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+            const int desc = static_cast<int>(syscall(SYS_perf_event_open, &attr, 0, kAnyCpu, i ? fds_[0] : kNoGroupLeader, 0));
+            if (desc < 0) { err_ = std::string(evs[i].name) + ": " + std::strerror(errno); close_all(); return; }
+            fds_.push_back(desc);
         }
         ioctl(fds_[0], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
         ioctl(fds_[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
@@ -76,19 +91,19 @@ public:
     ~Group() { close_all(); }
     Group(const Group&) = delete;
     Group& operator=(const Group&) = delete;
-    bool ok() const { return err_.empty() && !fds_.empty(); }
+    bool usable() const { return err_.empty() && !fds_.empty(); }
     const std::string& error() const { return err_; }
     const std::vector<Event>& events() const { return evs_; }
     /// Current counts, or false if the group was not on the counters the whole time it was enabled, since such counts would need scaling, which is not accepted.
-    bool read(std::vector<uint64_t>& v, bool& full) const {
-        std::vector<uint64_t> buf(3 + evs_.size());
-        if (::read(fds_[0], buf.data(), buf.size() * 8) != static_cast<ssize_t>(buf.size() * 8)) return false;
+    bool read(std::vector<uint64_t>& counts, bool& full) const {
+        std::vector<uint64_t> buf(kGroupReadHeaderWords + evs_.size());
+        if (::read(fds_[0], buf.data(), buf.size() * sizeof(uint64_t)) != static_cast<ssize_t>(buf.size() * sizeof(uint64_t))) return false;
         full = buf[1] == buf[2];
-        v.assign(buf.begin() + 3, buf.end());
+        counts.assign(buf.begin() + kGroupReadHeaderWords, buf.end());
         return true;
     }
 private:
-    void close_all() { for (int fd : fds_) close(fd); fds_.clear(); }
+    void close_all() { for (int desc : fds_) close(desc); fds_.clear(); }
     std::vector<Event> evs_;
     std::vector<int> fds_;
     std::string err_;
@@ -97,52 +112,52 @@ private:
 /// Pin the calling thread to the CPU it runs on, which any user may do.
 inline int pin_here() {
     const int cpu = sched_getcpu();
-    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu, &s);
-    sched_setaffinity(0, sizeof(s), &s);
+    cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(cpu, &cpus);
+    sched_setaffinity(0, sizeof(cpus), &cpus);
     return cpu;
 }
 
-struct Stat { double median = 0, min = 0, q1 = 0, q3 = 0; };
+struct Stat { double median = 0, min = 0, first_quartile = 0, third_quartile = 0; };
 struct Result {
     std::string name;
     std::vector<std::pair<std::string, Stat>> per_op;   // event -> per-operation
     std::string error;
 };
 
-inline Stat summarize(std::vector<double> v) {
-    if (v.empty()) return {};
-    std::sort(v.begin(), v.end());
-    return {v[v.size() / 2], v.front(), v[v.size() / 4], v[(3 * v.size()) / 4]};
+inline Stat summarize(std::vector<double> samples) {
+    if (samples.empty()) return {};
+    std::sort(samples.begin(), samples.end());
+    return {samples[samples.size() / 2], samples.front(), samples[samples.size() / 4], samples[(3 * samples.size()) / 4]};
 }
 
 /// Repetitions and warm-ups of every measure() call, from NB_RUNS and NB_WARMUP in the environment (bench/micro_bench.py --runs and --warmup), else 31 and 5.
-inline int env_int(const char* k, int dflt) {
-    const char* v = std::getenv(k);
-    return v && *v ? std::max(1, std::atoi(v)) : dflt;
+inline int env_int(const char* key, int dflt) {
+    const char* value = std::getenv(key);
+    return value && *value ? std::max(1, std::atoi(value)) : dflt;
 }
 
 /// Measure `run(n)`, which performs n operations, per operation.
 /// For every event group it takes `warmup` + `reps` measurements of the difference between n and 2n operations, divided by n, and discards the warm-ups.
-inline Result measure(const std::string& name, const std::function<void(uint64_t)>& run, uint64_t n,
-                      int reps = -1, int warmup = -1) {
-    if (reps < 0) reps = env_int("NB_RUNS", 31);
-    if (warmup < 0) warmup = std::getenv("NB_WARMUP") ? std::max(0, std::atoi(std::getenv("NB_WARMUP"))) : 5;
-    Result r{name, {}, {}};
+inline Result measure(const std::string& name, const std::function<void(uint64_t)>& run, uint64_t count,
+                      int reps = kFromEnv, int warmup = kFromEnv) {
+    if (reps < 0) reps = env_int("NB_RUNS", kDefaultRuns);
+    if (warmup < 0) warmup = std::getenv("NB_WARMUP") ? std::max(0, std::atoi(std::getenv("NB_WARMUP"))) : kDefaultWarmup;
+    Result result{name, {}, {}};
     std::vector<std::pair<std::string, std::vector<double>>> acc;
     for (const auto& evs : default_groups()) {
-        Group g(evs);
-        if (!g.ok()) { r.error = g.error(); return r; }
+        Group group(evs);
+        if (!group.usable()) { result.error = group.error(); return result; }
         std::vector<std::vector<double>> per(evs.size());
         for (int it = 0; it < warmup + reps; ++it) {
-            std::vector<uint64_t> a, b, c, d;
-            bool f1 = true, f2 = true, f3 = true, f4 = true;
-            g.read(a, f1); run(n); g.read(b, f2);
-            g.read(c, f3); run(2 * n); g.read(d, f4);
-            if (!(f1 && f2 && f3 && f4)) { r.error = "counters multiplexed (group did not fit)"; return r; }
+            std::vector<uint64_t> before1, after1, before2, after2;
+            bool full1 = true, full2 = true, full3 = true, full4 = true;
+            group.read(before1, full1); run(count); group.read(after1, full2);
+            group.read(before2, full3); run(2 * count); group.read(after2, full4);
+            if (!(full1 && full2 && full3 && full4)) { result.error = "counters multiplexed (group did not fit)"; return result; }
             if (it < warmup) continue;
             for (std::size_t e = 0; e < evs.size(); ++e) {
-                const double one = double(b[e] - a[e]), two = double(d[e] - c[e]);
-                per[e].push_back((two - one) / double(n));
+                const double one = double(after1[e] - before1[e]), two = double(after2[e] - before2[e]);
+                per[e].push_back((two - one) / double(count));
             }
         }
         for (std::size_t e = 0; e < evs.size(); ++e) {
@@ -150,23 +165,23 @@ inline Result measure(const std::string& name, const std::function<void(uint64_t
             acc.push_back({evs[e].name, per[e]});
         }
     }
-    for (auto& [ev, v] : acc) r.per_op.push_back({ev, summarize(v)});
-    return r;
+    for (auto& [event_name, samples] : acc) result.per_op.push_back({event_name, summarize(samples)});
+    return result;
 }
 
-inline std::string to_json(const Result& r) {
-    std::string s = "{\"kernel\":\"" + r.name + "\"";
-    if (!r.error.empty()) return s + ",\"error\":\"" + r.error + "\"}";
-    for (const auto& [ev, st] : r.per_op) {
-        char b[256];
-        std::snprintf(b, sizeof b, ",\"%s\":%.4f,\"%s_min\":%.4f,\"%s_q1\":%.4f,\"%s_q3\":%.4f", ev.c_str(),
-                      st.median, ev.c_str(), st.min, ev.c_str(), st.q1, ev.c_str(), st.q3);
-        s += b;
+inline std::string to_json(const Result& result) {
+    std::string json = "{\"kernel\":\"" + result.name + "\"";
+    if (!result.error.empty()) return json + ",\"error\":\"" + result.error + "\"}";
+    for (const auto& [event_name, stat] : result.per_op) {
+        char buf[kJsonFieldBufLen];
+        std::snprintf(buf, sizeof buf, ",\"%s\":%.4f,\"%s_min\":%.4f,\"%s_q1\":%.4f,\"%s_q3\":%.4f", event_name.c_str(),
+                      stat.median, event_name.c_str(), stat.min, event_name.c_str(), stat.first_quartile, event_name.c_str(), stat.third_quartile);
+        json += buf;
     }
-    return s + "}";
+    return json + "}";
 }
 
 /// Keep a value alive without letting the compiler drop the work.
-template <typename T> inline void keep(const T& v) { asm volatile("" : : "r,m"(v) : "memory"); }
+template <typename T> inline void keep(const T& value) { asm volatile("" : : "r,m"(value) : "memory"); }
 
 }

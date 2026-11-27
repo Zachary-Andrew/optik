@@ -19,85 +19,89 @@
 #include <vector>
 
 namespace dbg_oracle {
+/// Largest k whose 2-bit k-mers fill a 64-bit word, and the number of bases.
+constexpr unsigned kOracleMaxK = 32;
+constexpr unsigned kOracleBases = 4;
 
-inline uint64_t rc(uint64_t x, unsigned K) {
-    uint64_t r = 0;
-    for (unsigned i = 0; i < K; ++i) { r = (r << 2) | ((x & 3u) ^ 3u); x >>= 2; }
-    return r;
-}
-inline uint64_t canon(uint64_t x, unsigned K) { uint64_t r = rc(x, K); return x < r ? x : r; }
-inline std::string rc_str(const std::string& s) {
-    std::string r;
-    for (auto it = s.rbegin(); it != s.rend(); ++it)
-        r.push_back(*it == 'A' ? 'T' : *it == 'C' ? 'G' : *it == 'G' ? 'C' : 'A');
-    return r;
-}
-inline std::string norm(const std::string& s) { std::string r = rc_str(s); return s < r ? s : r; }
 
-using EdgeFn = std::function<bool(uint64_t E, uint64_t X)>;
+inline uint64_t oracle_revcomp(uint64_t kmer, unsigned kmer_len) {
+    uint64_t rev = 0;
+    for (unsigned i = 0; i < kmer_len; ++i) { rev = (rev << 2) | ((kmer & 3u) ^ 3u); kmer >>= 2; }
+    return rev;
+}
+inline uint64_t canon(uint64_t kmer, unsigned kmer_len) { uint64_t rev = oracle_revcomp(kmer, kmer_len); return kmer < rev ? kmer : rev; }
+inline std::string rc_str(const std::string& seq) {
+    std::string rev;
+    for (auto it = seq.rbegin(); it != seq.rend(); ++it)
+        rev.push_back(*it == 'A' ? 'T' : *it == 'C' ? 'G' : *it == 'G' ? 'C' : 'A');
+    return rev;
+}
+inline std::string norm(const std::string& seq) { std::string rev = rc_str(seq); return seq < rev ? seq : rev; }
+
+using EdgeFn = std::function<bool(uint64_t from_kmer, uint64_t to_kmer)>;
 
 inline std::multiset<std::string> unitigs(const std::set<uint64_t>& nodes,
-                                          unsigned K, const EdgeFn& edge) {
-    const uint64_t mask = K >= 32 ? ~uint64_t(0) : ((uint64_t(1) << (2 * K)) - 1);
-    auto succ = [&](uint64_t E) {
+                                          unsigned kmer_len, const EdgeFn& edge) {
+    const uint64_t mask = kmer_len >= kOracleMaxK ? ~uint64_t(0) : ((uint64_t(1) << (2 * kmer_len)) - 1);
+    auto succ = [&](uint64_t oriented) {
         std::vector<uint64_t> out;
-        for (unsigned b = 0; b < 4; ++b) {
-            uint64_t X = ((E << 2) | b) & mask;
-            if (nodes.count(canon(X, K)) && edge(E, X)) out.push_back(X);
+        for (unsigned b = 0; b < kOracleBases; ++b) {
+            uint64_t next_kmer = ((oriented << 2) | b) & mask;
+            if (nodes.count(canon(next_kmer, kmer_len)) && edge(oriented, next_kmer)) out.push_back(next_kmer);
         }
         return out;
     };
-    auto compact = [&](uint64_t E, uint64_t& X) {
-        auto s = succ(E);
-        if (s.size() != 1) return false;
-        X = s[0];
-        if (canon(X, K) == canon(E, K)) return false;
-        if (E == rc(E, K) || X == rc(X, K)) return false;   // palindromes stay single
-        return succ(rc(X, K)).size() == 1;
+    auto compact = [&](uint64_t oriented, uint64_t& next_kmer) {
+        auto succs = succ(oriented);
+        if (succs.size() != 1) return false;
+        next_kmer = succs[0];
+        if (canon(next_kmer, kmer_len) == canon(oriented, kmer_len)) return false;
+        if (oriented == oracle_revcomp(oriented, kmer_len) || next_kmer == oracle_revcomp(next_kmer, kmer_len)) return false;   // palindromes stay single
+        return succ(oracle_revcomp(next_kmer, kmer_len)).size() == 1;
     };
-    auto dec = [&](uint64_t x) {
-        std::string s;
-        for (int i = int(K) - 1; i >= 0; --i) s.push_back("ACGT"[(x >> (2 * i)) & 3u]);
-        return s;
+    auto dec = [&](uint64_t kmer) {
+        std::string seq;
+        for (int i = int(kmer_len) - 1; i >= 0; --i) seq.push_back("ACGT"[(kmer >> (2 * i)) & 3u]);
+        return seq;
     };
     std::multiset<std::string> out;
     std::unordered_set<uint64_t> used;
-    for (uint64_t c : nodes) {
-        if (used.count(c)) continue;
+    for (uint64_t canon_node : nodes) {
+        if (used.count(canon_node)) continue;
         // Walk left to the start, detecting a pure cycle.
-        uint64_t E = c;
+        uint64_t start = canon_node;
         bool cycle = false;
         for (;;) {
-            uint64_t Y;
-            if (!compact(rc(E, K), Y)) break;
-            uint64_t P = rc(Y, K);
-            if (canon(P, K) == c) { cycle = true; break; }
-            E = P;
+            uint64_t pred_rc;
+            if (!compact(oracle_revcomp(start, kmer_len), pred_rc)) break;
+            uint64_t pred = oracle_revcomp(pred_rc, kmer_len);
+            if (canon(pred, kmer_len) == canon_node) { cycle = true; break; }
+            start = pred;
         }
         if (cycle) {
             // rotate to the smallest canonical node, canonical orientation
-            uint64_t mn = c, cur = c;
+            uint64_t smallest = canon_node, cur = canon_node;
             for (;;) {
-                uint64_t X;
-                if (!compact(cur, X)) break;          // defensive, since this is not a cycle
-                if (canon(X, K) == c) break;
-                mn = std::min(mn, canon(X, K));
-                cur = X;
+                uint64_t next_kmer;
+                if (!compact(cur, next_kmer)) break;          // defensive, since this is not a cycle
+                if (canon(next_kmer, kmer_len) == canon_node) break;
+                smallest = std::min(smallest, canon(next_kmer, kmer_len));
+                cur = next_kmer;
             }
-            E = mn;
+            start = smallest;
         }
-        std::string s = dec(E);
-        used.insert(canon(E, K));
-        uint64_t cur = E;
+        std::string seq = dec(start);
+        used.insert(canon(start, kmer_len));
+        uint64_t cur = start;
         for (;;) {
-            uint64_t X;
-            if (!compact(cur, X)) break;
-            if (canon(X, K) == canon(E, K)) break;
-            s.push_back("ACGT"[X & 3u]);
-            used.insert(canon(X, K));
-            cur = X;
+            uint64_t next_kmer;
+            if (!compact(cur, next_kmer)) break;
+            if (canon(next_kmer, kmer_len) == canon(start, kmer_len)) break;
+            seq.push_back("ACGT"[next_kmer & 3u]);
+            used.insert(canon(next_kmer, kmer_len));
+            cur = next_kmer;
         }
-        out.insert(norm(s));
+        out.insert(norm(seq));
     }
     return out;
 }

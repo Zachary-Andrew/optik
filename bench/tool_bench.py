@@ -31,10 +31,30 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from categories import align, dbg, fmsi, sbwt, ssh
-from config import BENCHMARK, DATASETS
+from categories import (
+    align,
+    dbg,
+    fmsi,
+    sbwt,
+    ssh,
+)
+from config import (
+    BENCHMARK,
+    DATASETS,
+)
+from diagnostics import DETAIL_CHARS
+from units import PERCENT
 
-# Errors of a round or tool that the run survives, reported with their traceback
+# Simulated reads at least this long make the mapping workload a long-read one.
+# It is also the default read length.
+LONG_READ_MIN_LEN = 1000
+DEFAULT_MAP_LEN = "150"
+# cpufreq reports kHz
+KHZ_PER_MHZ = 1000
+# seconds allowed for a tool's --version
+VERSION_TIMEOUT_S = 30
+
+# Errors of a round or tool that do not stop the run, reported with their traceback
 LOG = logging.getLogger(__name__)
 
 CSV_COLUMN_NAMES = [
@@ -243,6 +263,14 @@ CATEGORY_METRIC_ORDER = {
 }
 
 
+# A parity field is only compared once two tools report it.
+MIN_COMPARED_TOOLS = 2
+# Graph builds keep k-mers seen at least twice unless the dataset sets its own cutoff.
+DEFAULT_DBG_MIN_COUNT = 2
+# CSV rows start with the category and the tool, ahead of the metric columns.
+KEY_COLS = 2
+
+
 def normalize_results(results, cat_key):
     """Reorder and complete a runner's result dict to its category's schema.
 
@@ -280,62 +308,64 @@ def query_parity(tools):
     fields = {}
     for key in PARITY_FIELDS:
         vals = {
-            t: r.get(key)
-            for t, r in tools.items()
-            if isinstance(r, dict) and r.get(key) is not None and "error" not in r
+            tool: tool_res.get(key)
+            for tool, tool_res in tools.items()
+            if isinstance(tool_res, dict) and tool_res.get(key) is not None and "error" not in tool_res
         }
-        if len(vals) >= 2:
+        if len(vals) >= MIN_COMPARED_TOOLS:
             fields[key] = vals
-    ok = all(len(set(v.values())) == 1 for v in fields.values())
+    parity_ok = all(len(set(field_vals.values())) == 1 for field_vals in fields.values())
     # A tool that errored answered nothing, so parity is not established, and the report names the tool and the reason instead of a bare FAIL.
     errored = {
-        t: str(r.get("error"))[:200]
-        for t, r in tools.items()
-        if isinstance(r, dict) and "error" in r
+        tool: str(tool_res.get("error"))[:DETAIL_CHARS]
+        for tool, tool_res in tools.items()
+        if isinstance(tool_res, dict) and "error" in tool_res
     }
     return {
-        "pass": ok and bool(fields) and not errored,
+        "pass": parity_ok and bool(fields) and not errored,
         "fields": fields,
         "errored": errored,
     }
 
 
-def graph_parity(tools, ds=None):
+def graph_parity(tools, dataset=None):
     """Check each dBG tool's output k-mer set, as dumped by categories/dbg.py.
 
     It must equal exactly the oracle of the tool's documented filter model, computed from the raw input, and every k-mer must occupy exactly one unitig position."""
-    report, ok = [], True
+    report, all_good = [], True
     any_tool = next(
-        (r for r in tools.values() if isinstance(r, dict) and "graph_kmers_file" in r),
+        (tool_res for tool_res in tools.values() if isinstance(tool_res, dict) and "graph_kmers_file" in tool_res),
         None,
     )
-    if ds is None or any_tool is None:
+    if dataset is None or any_tool is None:
         return {"pass": False, "report": ["no dBG outputs"]}
-    k, c = int(ds["k"]), int(any_tool.get("min_count", ds.get("dbg_min_count", 2)))
+    kmer_len, min_count = int(dataset["k"]), int(any_tool.get("min_count", dataset.get("dbg_min_count", DEFAULT_DBG_MIN_COUNT)))
     from dbg_oracles import filter_oracles
 
-    kf, ef = filter_oracles(ds.get("dbg_input", ds["queries"]), k, c)
-    report.append(f"oracle (c={c}): k-mer filter {len(kf)}, edge filter {len(ef)}")
+    kmer_filter, edge_filter = filter_oracles(dataset.get("dbg_input", dataset["queries"]), kmer_len, min_count)
+    report.append(f"oracle (c={min_count}): k-mer filter {len(kmer_filter)}, edge filter {len(edge_filter)}")
+    # Cuttlefish filters (k+1)-mer edges while optik and Bifrost filter k-mers. Each tool is compared with the oracle set for its own model.
     model = {
-        "optik": ("k-mer filter", kf),
-        "bifrost": ("k-mer filter", kf),
-        "cuttlefish": ("edge filter", ef),
+        "optik": ("k-mer filter", kmer_filter),
+        "bifrost": ("k-mer filter", kmer_filter),
+        "cuttlefish": ("edge filter", edge_filter),
     }
-    for t, r in tools.items():
-        if not isinstance(r, dict) or "graph_kmers_file" not in r or t not in model:
+    for tool, tool_res in tools.items():
+        if not isinstance(tool_res, dict) or "graph_kmers_file" not in tool_res or tool not in model:
             continue
-        with open(r["graph_kmers_file"]) as fh:
-            got = set(fh.read().split())
-        name, want = model[t]
-        dup = r.get("graph_kmer_occurrences", 0) - r.get("graph_kmers", 0)
+        with open(tool_res["graph_kmers_file"]) as handle:
+            got = set(handle.read().split())
+        name, want = model[tool]
+        # Occurrences above distinct k-mers mean some k-mer appears in two unitigs.
+        dup = tool_res.get("graph_kmer_occurrences", 0) - tool_res.get("graph_kmers", 0)
         good = got == want and dup == 0
-        ok &= good
+        all_good &= good
         report.append(
-            f"[{'ok' if good else 'MISMATCH'}] {t} ({r.get('mode', '')}) == "
+            f"[{'ok' if good else 'MISMATCH'}] {tool} ({tool_res.get('mode', '')}) == "
             f"{name}: {len(got)} k-mers, only_tool={len(got - want)} "
             f"only_oracle={len(want - got)}, duplicated positions {dup}"
         )
-    return {"pass": ok, "report": report}
+    return {"pass": all_good, "report": report}
 
 
 def _map_runners():
@@ -346,11 +376,12 @@ def _map_runners():
     On 150 bp reads it was no fair baseline, since an earlier se_k31 run gave it 93.6% correct at about 4k reads/s."""
 
     runners = [align.Minimap2Runner, align.OptikMapRunner]
-    if int(os.environ.get("OPTIK_BENCH_MAP_LEN", "150")) >= 1000:
+    if int(os.environ.get("OPTIK_BENCH_MAP_LEN", DEFAULT_MAP_LEN)) >= LONG_READ_MIN_LEN:
         runners.append(align.WfmashReadsRunner)
     return runners
 
 
+# Every category the bench can run, with its label, its runner classes and a check of whether their tools are installed.
 TOOL_CATEGORIES = {
     "search-dict": {
         "label": "Dict k-mer lookup",
@@ -427,15 +458,15 @@ def cpu_freq_info():
         gov = (base / "scaling_governor").read_text().strip()
         governor = gov if gov else None
     except OSError:
-        pass
+        pass  # no cpufreq here (common in VMs), so the governor stays unknown
     for fname in ("scaling_cur_freq", "cpuinfo_cur_freq"):
         try:
             cur = (base / fname).read_text().strip()
             if cur:
-                mhz = round(int(cur) / 1000)
+                mhz = round(int(cur) / KHZ_PER_MHZ)
                 break
         except OSError:
-            continue
+            continue  # this CPU exposes no frequency, so try the next one
     return governor, mhz
 
 
@@ -443,8 +474,8 @@ def list_datasets():
     """Print a table of all configured datasets."""
     print(f"{'Name':<20} {'Label':<25} {'k':>4}  Description")
     print("-" * 80)
-    for name, ds in DATASETS.items():
-        print(f"{name:<20} {ds['label']:<25} {ds['k']:>4}  {ds.get('desc', '')}")
+    for name, dataset in DATASETS.items():
+        print(f"{name:<20} {dataset['label']:<25} {dataset['k']:>4}  {dataset.get('desc', '')}")
 
 
 def list_tools():
@@ -465,23 +496,23 @@ def validate_dataset(dataset_name):
         print(f"error: unknown dataset '{dataset_name}'")
         print(f"available datasets: {', '.join(DATASETS.keys())}")
         sys.exit(1)
-    ds = DATASETS[dataset_name]
+    dataset = DATASETS[dataset_name]
     missing = []
     for key in ["unitigs", "queries"]:
-        p = Path(ds[key])
-        if not p.exists():
-            missing.append(str(p))
-    if "dbg_input" in ds:
-        p = Path(ds["dbg_input"])
-        if not p.exists():
-            missing.append(str(p))
+        path = Path(dataset[key])
+        if not path.exists():
+            missing.append(str(path))
+    if "dbg_input" in dataset:
+        path = Path(dataset["dbg_input"])
+        if not path.exists():
+            missing.append(str(path))
     if missing:
         print(f"error: dataset '{dataset_name}' has missing files:")
-        for m in missing:
-            print(f"  {m}")
+        for missing_path in missing:
+            print(f"  {missing_path}")
         print("edit config.py or download the required files")
         sys.exit(1)
-    return ds
+    return dataset
 
 
 def resolve_categories(names):
@@ -544,21 +575,21 @@ def print_summary(results):
     )
 
     # Column widths follow the longest names, where labels used to be cut at 20 characters.
-    cw = max(
+    cat_width = max(
         [len("Category")]
-        + [len(c.get("label", "")) for c in results.get("categories", {}).values()]
+        + [len(cat.get("label", "")) for cat in results.get("categories", {}).values()]
     )
-    tw = max(
+    tool_width = max(
         [len("Tool")]
         + [
-            len(t) + 1
-            for c in results.get("categories", {}).values()
-            for t in c.get("tools", {})
+            len(tool) + 1
+            for cat in results.get("categories", {}).values()
+            for tool in cat.get("tools", {})
         ]
     )
     header_parts = [
-        f"{'Category':<{cw}}",
-        f"{'Tool':<{tw}}",
+        f"{'Category':<{cat_width}}",
+        f"{'Tool':<{tool_width}}",
         f"{'Build(s)':>14}",
         f"{'Idx(MB)':>7}",
         f"{'b/kmer':>6}",
@@ -568,6 +599,7 @@ def print_summary(results):
         f"{'Query/s':>10}",
     ]
 
+    # Optional column groups appear only when some category produced them, so a run without mapping keeps a narrow table.
     if has_thread_sweep:
         header_parts.append(f"{'Spd@T':>7}")
         header_parts.append(f"{'RSSxT':>7}")
@@ -601,37 +633,38 @@ def print_summary(results):
     print(header)
     print("-" * len(header))
 
+    # A tool that failed still gets a row, so the table lists every tool that was asked for.
     for cat in results.get("categories", {}).values():
         for tool_name, tool_res in cat.get("tools", {}).items():
             if "error" in tool_res:
                 print(
                     "  ".join(
                         [
-                            f"{cat['label']:<{cw}}",
-                            f"{tool_name:<{tw}}",
+                            f"{cat['label']:<{cat_width}}",
+                            f"{tool_name:<{tool_width}}",
                             f"{'ERROR':>14}",
                         ]
                     )
                 )
                 continue
 
-            bs = tool_res.get("build_s")
+            build_s = tool_res.get("build_s")
             bs_sd = tool_res.get("build_s_stddev")
-            im = tool_res.get("idx_mb")
+            idx_mb = tool_res.get("idx_mb")
             bpk = tool_res.get("bits_per_kmer")
             rss = tool_res.get("build_rss_mb")
             seq_ns = tool_res.get("ns_per_query")
             rand_ns = tool_res.get("rand_ns")
             qps = tool_res.get("queries_s")
 
-            if bs is not None and bs_sd is not None and bs_sd > 0:
-                bs_str = f"{bs:.2f} +/- {bs_sd:.2f}"
-            elif bs is not None:
-                bs_str = f"{bs:.2f}"
+            if build_s is not None and bs_sd is not None and bs_sd > 0:
+                bs_str = f"{build_s:.2f} +/- {bs_sd:.2f}"
+            elif build_s is not None:
+                bs_str = f"{build_s:.2f}"
             else:
                 bs_str = "n/a"
 
-            im_str = format_metric(im, ".2f")
+            im_str = format_metric(idx_mb, ".2f")
             bpk_str = format_metric(bpk, ".2f")
             rss_str = format_metric(rss, ".1f")
             seq_str = format_metric(seq_ns, ".0f")
@@ -641,8 +674,8 @@ def print_summary(results):
             tool_disp = tool_name
 
             row_parts = [
-                f"{cat['label']:<{cw}}",
-                f"{tool_disp:<{tw}}",
+                f"{cat['label']:<{cat_width}}",
+                f"{tool_disp:<{tool_width}}",
                 f"{bs_str:>14}",
                 f"{im_str:>7}",
                 f"{bpk_str:>6}",
@@ -652,6 +685,7 @@ def print_summary(results):
                 f"{qps_str:>10}",
             ]
 
+            # The sweep columns give the speedup and RSS growth at the largest thread count, from whichever sweep the category ran.
             if has_thread_sweep:
                 rows = (
                     tool_res.get("build_sweep_rows")
@@ -686,6 +720,7 @@ def print_summary(results):
                     ]
                 )
 
+            # Mapping rows add placement accuracy and confident-read counts, since a high mapping rate alone says nothing about correctness.
             if has_map:
                 mapped = tool_res.get("mapped_reads")
                 rate = tool_res.get("mapping_rate")
@@ -700,7 +735,7 @@ def print_summary(results):
                         f"{format_metric(avg_ed, '.1f'):>6}",
                         f"{format_metric(med_ed, '.1f'):>6}",
                         # Placement accuracy against the simulation truth, since a mapper that places every read wrongly still shows 100% in Rate%
-                        f"{format_metric(None if tool_res.get('sensitivity') is None else 100 * tool_res['sensitivity'], '.2f'):>6}",
+                        f"{format_metric(None if tool_res.get('sensitivity') is None else PERCENT * tool_res['sensitivity'], '.2f'):>6}",
                         # Confident reads (MAPQ >= 30), the denominator of MQ30x
                         f"{format_metric(tool_res.get('mapq30_reads'), '.0f'):>7}",
                         f"{format_metric(tool_res.get('mapq30_wrong'), '.0f'):>6}",
@@ -718,14 +753,14 @@ def git_revision():
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=VERSION_TIMEOUT_S,
             check=False,
         ).stdout.strip()
         dirty = subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=VERSION_TIMEOUT_S,
             check=False,
         ).stdout.strip()
         return (rev + "-dirty") if dirty else rev
@@ -821,6 +856,7 @@ examples:
         list_tools()
         return
 
+    # A run takes either a catalog dataset or explicit reference and query files, never both.
     has_direct_files = args.reference and args.query
 
     if not args.dataset and not has_direct_files:
@@ -845,10 +881,11 @@ examples:
             missing.append(str(qry_path))
         if missing:
             print("error: file(s) not found:")
-            for m in missing:
-                print(f"  {m}")
+            for missing_path in missing:
+                print(f"  {missing_path}")
             sys.exit(1)
-        ds = {
+        # Explicit files become a one-off dataset with the keys that catalog entries have, so every runner reads it the same way.
+        dataset = {
             "label": f"{ref_path.stem} / {qry_path.stem}",
             "unitigs": ref_path.resolve(),
             "queries": qry_path.resolve(),
@@ -856,13 +893,13 @@ examples:
             "k": args.kmer,
             "desc": f"custom reference: {ref_path.name}, query: {qry_path.name}",
         }
-        dataset_label = ds["label"]
+        dataset_label = dataset["label"]
     else:
-        ds = validate_dataset(args.dataset)
+        dataset = validate_dataset(args.dataset)
         dataset_label = args.dataset
 
     if args.all:
-        selected_cats = {k: v for k, v in TOOL_CATEGORIES.items() if v["enabled"]()}
+        selected_cats = {cat_key: cat for cat_key, cat in TOOL_CATEGORIES.items() if cat["enabled"]()}
     elif args.tools:
         selected_cats = resolve_categories(args.tools)
     else:
@@ -883,6 +920,7 @@ examples:
 
     safe_label = dataset_label.replace("/", "_").replace(" ", "_")
 
+    # Every runner gets the same context, with the run counts, thread settings and scratch directory.
     ctx = {
         "runs": args.runs,
         "warmup": args.warmup,
@@ -903,11 +941,12 @@ examples:
         else:
             print("  [warn] could not enumerate physical cores; --pin ignored")
 
+    # The metadata records what the numbers depend on, from the git revision to the CPU governor, so later runs can be compared.
     results = {
         "metadata": {
             "tool_bench_version": "2.2",
             "dataset": dataset_label,
-            "dataset_info": ds,
+            "dataset_info": dataset,
             "runs": args.runs,
             "warmup": args.warmup,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -932,7 +971,7 @@ examples:
 
         for runner_cls in cat["runners"]:
             tool_name = runner_cls.tool_name()
-            runner = runner_cls(ds, ctx)
+            runner = runner_cls(dataset, ctx)
             if not runner.available():
                 print(f"  [skip] {tool_name}: binary not found")
                 continue
@@ -952,8 +991,8 @@ examples:
             cat_results["parity"] = query_parity(cat_results["tools"])
             par = cat_results["parity"]
             print(f"\n  parity: {'PASS' if par['pass'] else 'FAIL'}")
-            for t, err in par["errored"].items():
-                print(f"    [ERROR] {t} produced no answers: {err}")
+            for tool, err in par["errored"].items():
+                print(f"    [ERROR] {tool} produced no answers: {err}")
             if not par["fields"]:
                 print("    [n/a] fewer than two tools answered: nothing to compare")
             for key, vals in par["fields"].items():
@@ -961,10 +1000,10 @@ examples:
                 print(f"    [{mark}] {key}: {vals}")
 
         if cat_key == "debruijn":
-            cat_results["graph_parity"] = graph_parity(cat_results["tools"], ds)
-            gp = cat_results["graph_parity"]
-            print(f"\n  graph parity: {'PASS' if gp['pass'] else 'FAIL'}")
-            for line in gp["report"]:
+            cat_results["graph_parity"] = graph_parity(cat_results["tools"], dataset)
+            graph_par = cat_results["graph_parity"]
+            print(f"\n  graph parity: {'PASS' if graph_par['pass'] else 'FAIL'}")
+            for line in graph_par["report"]:
                 print(f"    {line}")
 
         # Graph comparison of the debruijn category
@@ -977,6 +1016,7 @@ examples:
                     f"{optik_dbg.get('total_length', 'n/a')} bp total, "
                     f"N50={optik_dbg.get('n50', 'n/a')}"
                 )
+                # Unitig counts and total length should be near 1.0 relative to the reference builders.
                 for ref_tool in ["bifrost", "cuttlefish"]:
                     ref_res = tools.get(ref_tool, {})
                     if "error" not in ref_res and "num_unitigs" in ref_res:
@@ -1033,13 +1073,13 @@ examples:
     extra_cols = []
     for cat in results.get("categories", {}).values():
         for tool_res in cat.get("tools", {}).values():
-            for k, v in tool_res.items():
-                if k in CSV_COLUMN_NAMES:
+            for col, value in tool_res.items():
+                if col in CSV_COLUMN_NAMES:
                     continue
-                if isinstance(v, (list, dict)):
+                if isinstance(value, (list, dict)):
                     continue
-                if k not in extra_cols:
-                    extra_cols.append(k)
+                if col not in extra_cols:
+                    extra_cols.append(col)
     header_cols = list(CSV_COLUMN_NAMES) + sorted(extra_cols)
 
     with open(csv_path, "w") as csv:
@@ -1047,13 +1087,11 @@ examples:
         for cat_key, cat in results.get("categories", {}).items():
             for tool_name, tool_res in cat.get("tools", {}).items():
                 if "error" in tool_res:
-                    empty_row = [cat_key, tool_name, "error"] + [""] * (
-                        len(header_cols) - 2
-                    )
+                    empty_row = [cat_key, tool_name, "error"] + [""] * (len(header_cols) - KEY_COLS)
                     csv.write(",".join(empty_row) + "\n")
                     continue
                 row = [cat_key, tool_name]
-                for col in header_cols[2:]:
+                for col in header_cols[KEY_COLS:]:
                     val = tool_res.get(col, "")
                     row.append(str(val) if val is not None else "")
                 csv.write(",".join(row) + "\n")

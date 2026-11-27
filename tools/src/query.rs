@@ -19,6 +19,17 @@ use rayon::prelude::*;
 use crate::seqio::{batch_bytes_for, for_each_batch};
 use crate::{FM_MAGIC, FmIdx, SPSS_MAGIC, SpssIdx, index_magic};
 
+/// A rayon task gets at least this many query records when there are many records per thread.
+const MIN_RECORDS_PER_TASK: usize = 256;
+/// Multiplier from a fraction to a percentage in the report.
+const PERCENT: f64 = 100.0;
+/// Time units of the report's elapsed line.
+const MS_PER_SEC: u64 = 1000;
+const SECS_PER_MIN: u64 = 60;
+const NS_PER_MS: f64 = 1e6;
+/// Characters below U+0020 are JSON control characters and must be written as \u escapes.
+const JSON_FIRST_PRINTABLE: u32 = 0x20;
+
 /// A loaded SPSS or FM index.
 enum LoadedIdx {
     Fm(FmIdx),
@@ -27,10 +38,10 @@ enum LoadedIdx {
 
 impl LoadedIdx {
     /// Scans one record, looking up every valid k-mer, and returns the counters (valid, positive, searches, extensions) it contributed.
-    fn scan_chunk(&self, chunk: &[u8], k: usize) -> (u64, u64, u64, u64) {
+    fn scan_chunk(&self, chunk: &[u8], kmer_len: usize) -> (u64, u64, u64, u64) {
         match self {
-            LoadedIdx::Fm(i) => i.scan_chunk(chunk, k),
-            LoadedIdx::Spss(i) => i.scan_chunk(chunk),
+            LoadedIdx::Fm(fm) => fm.scan_chunk(chunk, kmer_len),
+            LoadedIdx::Spss(spss) => spss.scan_chunk(chunk),
         }
     }
 }
@@ -46,23 +57,24 @@ struct Rec {
 }
 
 /// Counts one query record, with record_len - k + 1 total positions and one scan call (the scanner excludes non-ACGT windows).
-fn process_record(seq: &[u8], k: usize, idx: &LoadedIdx) -> Rec {
-    let total_positions = if seq.len() >= k {
-        (seq.len() - k + 1) as u64
+fn process_record(seq: &[u8], kmer_len: usize, idx: &LoadedIdx) -> Rec {
+    let total_positions = if seq.len() >= kmer_len {
+        (seq.len() - kmer_len + 1) as u64
     } else {
         0
     };
-    let (v, p, s, e) = if total_positions > 0 {
-        idx.scan_chunk(seq, k)
+    let (valid, positive, searches, extensions) = if total_positions > 0 {
+        idx.scan_chunk(seq, kmer_len)
     } else {
         (0, 0, 0, 0)
     };
+
     Rec {
         total_positions,
-        num_valid: v,
-        num_positive: p,
-        num_searches: s,
-        num_extensions: e,
+        num_valid: valid,
+        num_positive: positive,
+        num_searches: searches,
+        num_extensions: extensions,
     }
 }
 
@@ -89,22 +101,25 @@ pub(crate) fn query(
 ) -> Result<(), String> {
     let k_check = |built: usize| -> Result<(), String> {
         match k_arg {
-            Some(k) if k != built => Err(format!(
-                "index was built with k={built} but -k {k} was given"
+            Some(given_k) if given_k != built => Err(format!(
+                "index was built with k={built} but -k {given_k} was given"
             )),
             _ => Ok(()),
         }
     };
+    // FM_MAGIC or SPSS_MAGIC at the start of the file selects the loader, which is why query has no index-type flag.
     let idx: LoadedIdx = match index_magic(index_path)? {
         Some(FM_MAGIC) => {
-            let i = FmIdx::load(index_path)?;
-            k_check(i.k())?;
-            LoadedIdx::Fm(i)
+            let fm = FmIdx::load(index_path)?;
+
+            k_check(fm.kmer_len())?;
+            LoadedIdx::Fm(fm)
         }
         Some(SPSS_MAGIC) => {
-            let i = SpssIdx::load(index_path, verify)?;
-            k_check(i.k())?;
-            LoadedIdx::Spss(i)
+            let spss = SpssIdx::load(index_path, verify)?;
+
+            k_check(spss.kmer_len())?;
+            LoadedIdx::Spss(spss)
         }
         _ => {
             return Err(format!(
@@ -114,9 +129,9 @@ pub(crate) fn query(
         }
     };
 
-    let k = match &idx {
-        LoadedIdx::Fm(i) => i.k(),
-        LoadedIdx::Spss(i) => i.k(),
+    let kmer_len = match &idx {
+        LoadedIdx::Fm(fm) => fm.kmer_len(),
+        LoadedIdx::Spss(spss) => spss.kmer_len(),
     };
 
     // One pool serves the whole run, reused by every batch.
@@ -125,7 +140,7 @@ pub(crate) fn query(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .map_err(|e| e.to_string())?,
+                .map_err(|err| err.to_string())?,
         )
     } else {
         None
@@ -133,34 +148,36 @@ pub(crate) fn query(
 
     let t_start = Instant::now();
 
-    let add = |a: Rec, b: Rec| Rec {
-        total_positions: a.total_positions + b.total_positions,
-        num_valid: a.num_valid + b.num_valid,
-        num_positive: a.num_positive + b.num_positive,
-        num_searches: a.num_searches + b.num_searches,
-        num_extensions: a.num_extensions + b.num_extensions,
+    let add = |lhs: Rec, rhs: Rec| Rec {
+        total_positions: lhs.total_positions + rhs.total_positions,
+        num_valid: lhs.num_valid + rhs.num_valid,
+        num_positive: lhs.num_positive + rhs.num_positive,
+        num_searches: lhs.num_searches + rhs.num_searches,
+        num_extensions: lhs.num_extensions + rhs.num_extensions,
     };
     // SPSS records go through the pipelined batch scan (misses of consecutive lookups overlap, across record boundaries too).
-    let batch_rec = |recs: &[&[u8]], si: &SpssIdx| -> Rec {
+    let batch_rec = |recs: &[&[u8]], spss: &SpssIdx| -> Rec {
         let total_positions = recs
             .iter()
-            .map(|r| {
-                if r.len() >= k {
-                    (r.len() - k + 1) as u64
+            .map(|record| {
+                if record.len() >= kmer_len {
+                    (record.len() - kmer_len + 1) as u64
                 } else {
                     0
                 }
             })
             .sum();
-        let (v, p, s, e) = si.scan_many(recs);
+        let (valid, positive, searches, extensions) = spss.scan_many(recs);
+
         Rec {
             total_positions,
-            num_valid: v,
-            num_positive: p,
-            num_searches: s,
-            num_extensions: e,
+            num_valid: valid,
+            num_positive: positive,
+            num_searches: searches,
+            num_extensions: extensions,
         }
     };
+
     const BATCH: usize = 4096; // records per SPSS scan_many() call
 
     // --ids writes one line per record, batch by batch, so memory stays bounded by one batch.
@@ -169,21 +186,22 @@ pub(crate) fn query(
     let mut ids_w: Option<(std::io::BufWriter<std::fs::File>, &SpssIdx)> = match ids_out {
         None => None,
         Some(path) => {
-            let LoadedIdx::Spss(si) = &idx else {
+            let LoadedIdx::Spss(spss) = &idx else {
                 return Err("--ids needs an SPSS index (build-spss)".into());
             };
+
             Some((
                 std::io::BufWriter::new(
-                    std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?,
+                    std::fs::File::create(path).map_err(|err| format!("{path}: {err}"))?,
                 ),
-                si,
+                spss,
             ))
         }
     };
-    let id_line = |si: &SpssIdx, r: &&[u8]| -> String {
-        si.ids(r)
+    let id_line = |spss: &SpssIdx, record: &&[u8]| -> String {
+        spss.ids(record)
             .iter()
-            .map(|x| x.to_string())
+            .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(" ")
     };
@@ -191,71 +209,98 @@ pub(crate) fn query(
     // Records stream through seqio::for_each_batch in batches sized by the thread count, and a batch is split into work units processed in parallel.
     // A record, or a window-exact slice of one, goes to exactly one worker, so the aggregated Rec is exact.
     let mut out = Rec::default();
+
     for_each_batch(queries, batch_bytes_for(threads), |records| {
-        if let Some((w, si)) = ids_w.as_mut() {
-            let si: &SpssIdx = si;
+        if let Some((ids_writer, spss_ref)) = ids_w.as_mut() {
+            let spss: &SpssIdx = spss_ref;
             let lines: Vec<String> = match &pool {
-                Some(pl) => pl.install(|| records.par_iter().map(|r| id_line(si, r)).collect()),
-                None => records.iter().map(|r| id_line(si, r)).collect(),
+                Some(thread_pool) => thread_pool.install(|| {
+                    records
+                        .par_iter()
+                        .map(|record| id_line(spss, record))
+                        .collect()
+                }),
+                None => records.iter().map(|record| id_line(spss, record)).collect(),
             };
-            for l in lines {
-                writeln!(w, "{l}").map_err(|e| e.to_string())?;
+
+            for line in lines {
+                writeln!(ids_writer, "{line}").map_err(|err| err.to_string())?;
             }
         }
+
         // Work units are whole records, except that with -t > 1 a record with more windows than one slice is cut into window-exact slices, since a single multi-Mbp record would otherwise run on one worker.
-        let total_windows: usize = records.iter().map(|r| r.len().saturating_sub(k - 1)).sum();
-        // about 8 slices per thread, each at least MIN_SLICE_WINDOWS
+        let total_windows: usize = records
+            .iter()
+            .map(|record| record.len().saturating_sub(kmer_len - 1))
+            .sum();
+
+        // Each thread gets about 8 slices of at least MIN_SLICE_WINDOWS windows.
         const MIN_SLICE_WINDOWS: usize = 1 << 16;
-        let slice_windows = (total_windows / (threads.max(1) * 8)).max(MIN_SLICE_WINDOWS);
+        const SLICES_PER_THREAD: usize = 8;
+        let slice_windows =
+            (total_windows / (threads.max(1) * SLICES_PER_THREAD)).max(MIN_SLICE_WINDOWS);
         let mut work: Vec<&[u8]> = Vec::with_capacity(records.len());
-        for &r in records {
-            let nwin = r.len().saturating_sub(k - 1);
+
+        for &record in records {
+            let nwin = record.len().saturating_sub(kmer_len - 1);
+
             if pool.is_none() || nwin <= slice_windows {
-                work.push(r);
+                work.push(record);
                 continue;
             }
-            let mut s = 0;
-            while s < nwin {
-                let e = (s + slice_windows).min(nwin);
-                work.push(&r[s..e + k - 1]);
-                s = e;
+
+            let mut slice_start = 0;
+
+            while slice_start < nwin {
+                let slice_end = (slice_start + slice_windows).min(nwin);
+
+                work.push(&record[slice_start..slice_end + kmer_len - 1]);
+                slice_start = slice_end;
             }
         }
+
         let rec = match (&idx, &pool) {
-            (LoadedIdx::Spss(si), None) => work
+            (LoadedIdx::Spss(spss), None) => work
                 .chunks(BATCH)
-                .map(|c| batch_rec(c, si))
+                .map(|chunk| batch_rec(chunk, spss))
                 .fold(Rec::default(), add),
-            (LoadedIdx::Spss(si), Some(pl)) => {
-                // small chunks when records were sliced, so slices spread out
+            (LoadedIdx::Spss(spss), Some(thread_pool)) => {
+                // Sliced records go out in small chunks, so their slices spread over the threads.
                 let batch = if work.len() < threads * BATCH {
                     1
                 } else {
                     BATCH
                 };
-                pl.install(|| {
+
+                thread_pool.install(|| {
                     work.par_chunks(batch)
-                        .map(|c| batch_rec(c, si))
+                        .map(|chunk| batch_rec(chunk, spss))
                         .reduce(Rec::default, add)
                 })
             }
             // The single-threaded headline path has no pool and no task overhead.
             (_, None) => work
                 .iter()
-                .map(|r| process_record(r, k, &idx))
+                .map(|record| process_record(record, kmer_len, &idx))
                 .fold(Rec::default(), add),
-            (_, Some(pl)) => pl.install(|| {
+            (_, Some(thread_pool)) => thread_pool.install(|| {
                 work.par_iter()
-                    .with_min_len(if work.len() < threads * 256 { 1 } else { 256 })
-                    .map(|r| process_record(r, k, &idx))
+                    // Batches smaller than threads * MIN_RECORDS_PER_TASK split per record so every thread gets work, and larger ones use coarser tasks.
+                    .with_min_len(if work.len() < threads * MIN_RECORDS_PER_TASK {
+                        1
+                    } else {
+                        MIN_RECORDS_PER_TASK
+                    })
+                    .map(|record| process_record(record, kmer_len, &idx))
                     .reduce(Rec::default, add)
             }),
         };
+
         out = add(out, rec);
         Ok(())
     })?;
-    if let Some((mut w, _)) = ids_w {
-        w.flush().map_err(|e| e.to_string())?;
+    if let Some((mut ids_writer, _)) = ids_w {
+        ids_writer.flush().map_err(|err| err.to_string())?;
     }
 
     let total_positions = out.total_positions;
@@ -268,9 +313,9 @@ pub(crate) fn query(
 
     let elapsed_ms = t_start.elapsed().as_millis() as u64;
 
-    let pct = |a: u64, b: u64| -> f64 {
-        if b > 0 {
-            (a as f64 * 100.0) / b as f64
+    let pct = |part: u64, whole: u64| -> f64 {
+        if whole > 0 {
+            (part as f64 * PERCENT) / whole as f64
         } else {
             0.0
         }
@@ -290,7 +335,7 @@ pub(crate) fn query(
         elapsed_ms
     );
 
-    // Human-readable report on stdout matching sshash format.
+    // Human-readable report on stdout, in SSHash's format.
     println!("==== query report:");
     println!("num_kmers = {total_positions}");
     println!(
@@ -314,30 +359,50 @@ pub(crate) fn query(
         pct(num_extensions, num_valid)
     );
 
-    let sec = elapsed_ms / 1000;
-    let min = sec / 60;
+    let sec = elapsed_ms / MS_PER_SEC;
+    let min = sec / SECS_PER_MIN;
     let ns_per_kmer = if total_positions > 0 {
-        (elapsed_ms as f64 * 1e6) / total_positions as f64
+        (elapsed_ms as f64 * NS_PER_MS) / total_positions as f64
     } else {
         0.0
     };
+
     println!("elapsed = {sec} sec / {min} min / {ns_per_kmer:.0} ns/kmer");
 
     Ok(())
 }
 
 /// A JSON string literal with quotes, backslashes and control bytes escaped.
-fn json_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
+fn json_str(raw: &str) -> String {
+    const QUOTES: usize = 2;
+    let mut escaped = String::with_capacity(raw.len() + QUOTES);
+
+    escaped.push('"');
+
+    for ch in raw.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            // JSON forbids raw control characters inside strings.
+            ch if (ch as u32) < JSON_FIRST_PRINTABLE => {
+                escaped.push_str(&format!("\\u{:04x}", ch as u32))
+            }
+            ch => escaped.push(ch),
         }
     }
-    o.push('"');
-    o
+
+    escaped.push('"');
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_str;
+
+    #[test]
+    fn json_strings_escape_quotes_backslashes_and_control_bytes() {
+        assert_eq!(json_str("plain"), "\"plain\"");
+        assert_eq!(json_str("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(json_str("tab\there"), "\"tab\\u0009here\"");
+    }
 }

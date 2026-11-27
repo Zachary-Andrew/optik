@@ -43,37 +43,73 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from diagnostics import DETAIL_CHARS, LOG_TAIL_CHARS
+from dna import read_fasta, revcomp
 from sam_spec import (
     HIGH_MAPQ,
-    SAM_FLAG_REVERSE,
-    SAM_FLAG_UNMAPPED,
-    SAM_FLAGS_NOT_PRIMARY,
-    SAM_FLAGS_SECONDARY_SUPPLEMENTARY,
     SAM_MIN_COLUMNS,
+    SAM_TAG_PREFIX_LEN,
+    GfaSegmentCol,
+    SamCol,
+    SamFlag,
+    TruthCol,
 )
 
-COMPLEMENT = str.maketrans("ACGT", "TGCA")
+# timeouts in seconds: an official tool or optik run, a read simulation, and a whole wfmash run
+TOOL_TIMEOUT_S = 3600
+SIMULATE_TIMEOUT_S = 1200
+WFMASH_TIMEOUT_S = 7200
+# characters of a failed tool's stderr, or of its output, kept in the report
+# probability that a probe k-mer is written reverse-complemented
+REVCOMP_PROB = 0.5
+# disagreeing windows kept as examples
+MAX_EXAMPLES = 3
+# a unitig needs this many k-mers to have an interior one
+MIN_INTERIOR_WINDOWS = 3
+# minimap2 v2.31 options.c presets: (k, w)
+MM2_PRESET_KW = {"sr": (21, 11), "map-ont": (15, 10)}
+# A short read is placed correctly within max(MIN_ORIGIN_TOL, length / ORIGIN_TOL_DIV) bp of its origin.
+# A long read, by contrast, counts as correct when it overlaps at least MIN_LONG_OVERLAP of its true span.
+MIN_ORIGIN_TOL = 10
+ORIGIN_TOL_DIV = 10
+MIN_LONG_OVERLAP = 0.5
+# at most one in HQ_WRONG_DIV MAPQ >= 30 placements may be wrong (1%), and on error-free reads at least MIN_HQ_SHARE of the correct ones must reach MAPQ 30
+HQ_WRONG_DIV = 100
+MIN_HQ_SHARE = 0.9
+# CLI defaults
+DEFAULT_K = 31
+DEFAULT_THREADS = 4
+DEFAULT_SEED = 42
+DEFAULT_PROBES = 2000
+DEFAULT_SSHASH_M = 15
+DEFAULT_NUM_READS = 5000
+DEFAULT_READ_LEN = 150
+DEFAULT_LONG_READS = 1000
+DEFAULT_ERR_RATE = 0.01
+DEFAULT_INDEL_RATE = 0.002
+DEFAULT_SENS_TOL = 0.005
 
 
-def rc(seq: str) -> str:
-    """Reverse complement of seq."""
-    return seq.translate(COMPLEMENT)[::-1]
+# The long-read simulation is seeded apart from the short-read sets.
+LONG_READ_SEED_OFFSET = 2
+# At least half of the correct long-read placements must reach MAPQ 30.
+MIN_CONFIDENT_SHARE_DEN = 2
 
 
 def canonical(kmer: str) -> str:
     """The lexicographically smaller of kmer and its reverse complement."""
-    r = rc(kmer)
-    return min(kmer, r)
+    rev = revcomp(kmer)
+    return min(kmer, rev)
 
 
 # Process helpers
 
 
-def run(cmd, **kw):
+def run(cmd, **kwargs):
     """subprocess.run with stdout and stderr captured unless the caller says otherwise."""
-    kw.setdefault("stdout", subprocess.PIPE)
-    kw.setdefault("stderr", subprocess.PIPE)
-    return subprocess.run(cmd, **kw, check=False)
+    kwargs.setdefault("stdout", subprocess.PIPE)
+    kwargs.setdefault("stderr", subprocess.PIPE)
+    return subprocess.run(cmd, **kwargs, check=False)
 
 
 def need(name):
@@ -98,66 +134,44 @@ class Tool:
 # FASTA and sequence helpers
 
 
-def read_fasta(path):
-    """Yield (name, seq) records of a FASTA file, plain or .gz, without splitting at N runs."""
-    opener = gzip.open if str(path).endswith(".gz") else open
-    name = None
-    parts = []
-    with opener(path, "rt") as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            if line.startswith(">"):
-                if name is not None:
-                    yield name, "".join(parts)
-                toks = line[1:].split()
-                name = toks[0] if toks else f"seq{len(parts)}"
-                parts = []
-            else:
-                parts.append(line)
-    if name is not None:
-        yield name, "".join(parts)
-
-
 def read_seqs(path):
     """Yield (name, seq) of FASTA or FASTQ records, plain or .gz.
     The official query reads are FASTQ."""
     opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as fh:
-        first = fh.read(1)
-        fh.seek(0)
+    with opener(path, "rt") as handle:
+        first = handle.read(1)
+        handle.seek(0)
         if first == "@":
             while True:
-                h = fh.readline()
-                if not h:
+                header = handle.readline()
+                if not header:
                     return
-                sq = fh.readline().strip()
-                fh.readline()
-                fh.readline()
-                yield h[1:].split()[0] if h[1:].split() else "", sq
+                seq = handle.readline().strip()
+                handle.readline()
+                handle.readline()
+                yield header[1:].split()[0] if header[1:].split() else "", seq
         else:
             yield from read_fasta(path)
 
 
-def extract_kmers(seq, k):
+def extract_kmers(seq, kmer_len):
     """Canonical k-mers of seq, splitting at N."""
     out = []
     start = 0
-    for i, c in enumerate(seq):
-        if c == "N":
-            if i - start >= k:
-                out.extend(canonical(seq[j : j + k]) for j in range(start, i - k + 1))
+    for i, base in enumerate(seq):
+        if base == "N":
+            if i - start >= kmer_len:
+                out.extend(canonical(seq[j : j + kmer_len]) for j in range(start, i - kmer_len + 1))
             start = i + 1
-    if len(seq) - start >= k:
-        out.extend(canonical(seq[j : j + k]) for j in range(start, len(seq) - k + 1))
+    if len(seq) - start >= kmer_len:
+        out.extend(canonical(seq[j : j + kmer_len]) for j in range(start, len(seq) - kmer_len + 1))
     return out
 
 
 def to_single_line_fasta(path_in, path_out):
     """Write one sequence per line with every record kept, as KMC's FASTA reader and SSHash's query parser require."""
-    with open(path_out, "w") as fh:
-        fh.writelines(f">{name}\n{seq}\n" for name, seq in read_fasta(path_in))
+    with open(path_out, "w") as handle:
+        handle.writelines(f">{name}\n{seq}\n" for name, seq in read_fasta(path_in))
 
 
 def write_uniquified_fasta(path_in, path_out):
@@ -169,8 +183,8 @@ def write_uniquified_fasta(path_in, path_out):
     Callers that index records by name in a dict over `read_fasta` collapse duplicates, while `gen_reads` works on the full list of records and reports only the name.
     The truth window cannot be reconstructed without unique names, so the map reference is rewritten with unique IDs.
     """
-    with open(path_out, "w") as fh:
-        fh.writelines(
+    with open(path_out, "w") as handle:
+        handle.writelines(
             f">seq{i}\n{seq}\n" for i, (_name, seq) in enumerate(read_fasta(path_in), 1)
         )
 
@@ -178,8 +192,8 @@ def write_uniquified_fasta(path_in, path_out):
 def write_single_kmer_fasta(kmers, path_out):
     """Write one canonical k-mer per record.
     k may be up to 63, which covers k = 31."""
-    with open(path_out, "w") as fh:
-        fh.writelines(f">q{i}\n{k}\n" for i, k in enumerate(kmers))
+    with open(path_out, "w") as handle:
+        handle.writelines(f">q{i}\n{kmer}\n" for i, kmer in enumerate(kmers))
 
 
 # KMC oracle
@@ -187,53 +201,53 @@ def write_single_kmer_fasta(kmers, path_out):
 
 def _is_fastq(path):
     """True for a .fq or .fastq path, gzipped or not."""
-    p = str(path).lower()
-    return p.endswith((".fq", ".fastq", ".fq.gz", ".fastq.gz"))
+    lower_path = str(path).lower()
+    return lower_path.endswith((".fq", ".fastq", ".fq.gz", ".fastq.gz"))
 
 
-def kmc_build(kmc_bin, kmc_tmp, in_fasta, prefix, k, threads, min_count=1):
+def kmc_build(kmc_bin, kmc_tmp, in_fasta, prefix, kmer_len, threads, min_count=1):
     """Run KMC over a one-sequence-per-line FASTA file or a FASTQ file and return the distinct k-mer set as a Python set."""
     if not kmc_bin.available:
         need("KMC (kmc)")
     workdir = kmc_tmp / "kmc_work"
     workdir.mkdir(parents=True, exist_ok=True)
     fmt = "-fq" if _is_fastq(in_fasta) else "-fa"
-    db = kmc_tmp / str(prefix)
-    p = run(
+    db_prefix = kmc_tmp / str(prefix)
+    proc = run(
         [
             str(kmc_bin.path),
             fmt,
-            f"-k{k}",
+            f"-k{kmer_len}",
             f"-ci{min_count}",
             f"-t{threads}",
             str(in_fasta),
-            str(db),
+            str(db_prefix),
             str(workdir),
         ]
     )
-    if p.returncode != 0:
-        raise RuntimeError(f"KMC failed: {p.stderr.decode()[-2000:]}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"KMC failed: {proc.stderr.decode()[-LOG_TAIL_CHARS:]}")
     dump = kmc_tmp / f"{prefix}.dump"
-    p = run([str(kmc_bin.path.parent / "kmc_dump"), str(db), str(dump)])
-    if p.returncode != 0:
-        raise RuntimeError(f"kmc_dump failed: {p.stderr.decode()[-2000:]}")
-    return {ln.split("\t")[0] for ln in dump.read_text().splitlines()}
+    proc = run([str(kmc_bin.path.parent / "kmc_dump"), str(db_prefix), str(dump)])
+    if proc.returncode != 0:
+        raise RuntimeError(f"kmc_dump failed: {proc.stderr.decode()[-LOG_TAIL_CHARS:]}")
+    return {line.split("\t")[0] for line in dump.read_text().splitlines()}
 
 
 # SSHash helpers
 
 
-def sshash_query_report(sshash, index, query, k):
+def sshash_query_report(sshash, index, query, kmer_len):
     """Completed process of `sshash query` on index and query."""
-    p = run(
-        [str(sshash.path), "query", "-i", str(index), "-q", str(query)], timeout=3600
+    proc = run(
+        [str(sshash.path), "query", "-i", str(index), "-q", str(query)], timeout=TOOL_TIMEOUT_S
     )
-    return p
+    return proc
 
 
 def parse_sshash_report(text):
     """Counter values (num_kmers, num_positive_kmers, ...) parsed from SSHash's query report."""
-    m = {}
+    counters = {}
     for key in (
         "num_kmers",
         "num_positive_kmers",
@@ -241,27 +255,27 @@ def parse_sshash_report(text):
         "num_invalid_kmers",
         "num_searches",
     ):
-        mm = re.search(rf"^{key}\s*=\s*(\d+)", text, re.MULTILINE)
-        if mm:
-            m[key] = int(mm.group(1))
-    return m
+        match = re.search(rf"^{key}\s*=\s*(\d+)", text, re.MULTILINE)
+        if match:
+            counters[key] = int(match.group(1))
+    return counters
 
 
 # optik helpers
 
 
-def optik_query_report(optik, index, query, k):
+def optik_query_report(optik, index, query, kmer_len):
     """Completed process of `optik query` on index and query at k."""
-    p = run(
-        [str(optik.path), "query", "-i", str(index), "-q", str(query), "-k", str(k)],
-        timeout=3600,
+    proc = run(
+        [str(optik.path), "query", "-i", str(index), "-q", str(query), "-k", str(kmer_len)],
+        timeout=TOOL_TIMEOUT_S,
     )
-    return p
+    return proc
 
 
 def parse_optik_report(text):
     """Counter values parsed from optik's query report, named as in SSHash's."""
-    m = {}
+    counters = {}
     for key in (
         "num_kmers",
         "num_positive_kmers",
@@ -269,10 +283,10 @@ def parse_optik_report(text):
         "num_invalid_kmers",
         "num_searches",
     ):
-        mm = re.search(rf"{key}\s*=\s*(\d+)", text)
-        if mm:
-            m[key] = int(mm.group(1))
-    return m
+        match = re.search(rf"{key}\s*=\s*(\d+)", text)
+        if match:
+            counters[key] = int(match.group(1))
+    return counters
 
 
 # Query suite
@@ -282,54 +296,55 @@ def suite_query(args):
     """Compare optik query with sshash query on probes and reads and return the checks."""
     checks = {}
     optik, sshash, kmc = args.optik, args.sshash, args.kmc
-    k = args.k
+    kmer_len = args.k
     keep = Path(args.workdir)
     keep.mkdir(parents=True, exist_ok=True)
 
     # Step 0 builds the reference k-mer oracle with KMC on the unitig FASTA.
     ref_oneline = keep / "ref_oneline.fa"
     to_single_line_fasta(args.ref, ref_oneline)
-    oracle = kmc_build(kmc, keep, ref_oneline, "oracle", k, args.threads)
+    oracle = kmc_build(kmc, keep, ref_oneline, "oracle", kmer_len, args.threads)
     checks["kmc_oracle"] = {"pass": True, "n": len(oracle)}
 
     # Step 1 indexes with optik and sshash.
     # Both read plain FASTA, and the unitig FASTA may be gzipped or wrapped, so the one-line conversion is indexed in every case.
     # optik contributes both index formats, the SPSS index from build-spss and the FM index from build-fm.
     # Every comparison below runs on each, and --ids adds the per-k-mer check for the SPSS index.
+    # Both optik index types answer the same probes, so each is held to the same oracle.
     optik_idxs = {}
     for fmt, sub in (("_spss", "build-spss"), ("_fm", "build-fm")):
         idx = keep / f"optik_idx{fmt}"
-        p = run(
+        proc = run(
             [
                 str(optik.path),
                 sub,
                 "-i",
                 str(ref_oneline),
                 "-k",
-                str(k),
+                str(kmer_len),
                 "-o",
                 str(idx),
             ],
-            timeout=3600,
+            timeout=TOOL_TIMEOUT_S,
         )
         checks[f"optik_build{fmt}"] = {
-            "pass": p.returncode == 0,
-            "stderr": p.stderr.decode()[-500:],
+            "pass": proc.returncode == 0,
+            "stderr": proc.stderr.decode()[-DETAIL_CHARS:],
         }
-        if p.returncode == 0:
+        if proc.returncode == 0:
             optik_idxs[fmt] = idx
     if not optik_idxs:
         return checks
 
     sshash_idx = keep / "sshash_idx"
-    p = run(
+    proc = run(
         [
             str(sshash.path),
             "build",
             "-i",
             str(ref_oneline),
             "-k",
-            str(k),
+            str(kmer_len),
             "-m",
             str(args.sshash_m),
             "-o",
@@ -338,13 +353,14 @@ def suite_query(args):
             str(keep),
             "--check",
         ],
-        timeout=3600,
+        timeout=TOOL_TIMEOUT_S,
     )
-    out = p.stdout.decode() + p.stderr.decode()
+    out = proc.stdout.decode() + proc.stderr.decode()
     checks["sshash_build_check"] = {
-        "pass": p.returncode == 0 and "EVERYTHING OK!" in out,
-        "rc": p.returncode,
-        "tail": out[-300:],
+        # SSHash's --check verifies its own index. Its success line confirms the oracle is sound before it judges optik.
+        "pass": proc.returncode == 0 and "EVERYTHING OK!" in out,
+        "rc": proc.returncode,
+        "tail": out[-DETAIL_CHARS:],
     }
 
     # Step 2 draws positive probes, G distinct reference k-mers.
@@ -355,28 +371,30 @@ def suite_query(args):
     pos = ref_kmers[:n_positive]
     pos_fa = keep / "pos.fa"
     # Probes come in random orientation, so a lookup that finds only the canonical orientation cannot pass.
-    write_single_kmer_fasta([rc(x) if rng.random() < 0.5 else x for x in pos], pos_fa)
+    write_single_kmer_fasta([revcomp(kmer) if rng.random() < REVCOMP_PROB else kmer for kmer in pos], pos_fa)
 
     # Step 3 draws negative probes, R random canonical k-mers absent from the oracle.
     n_negative = args.probes
     neg = set()
     while len(neg) < n_negative:
-        s = "".join(rng.choice("ACGT") for _ in range(k))
-        s = canonical(s)
-        if s not in oracle:
-            neg.add(s)
+        probe = "".join(rng.choice("ACGT") for _ in range(kmer_len))
+        probe = canonical(probe)
+        if probe not in oracle:
+            neg.add(probe)
     neg_fa = keep / "neg.fa"
+    # Flipping some probes to their reverse complement tests canonical lookup on both strands.
     write_single_kmer_fasta(
-        [rc(x) if rng.random() < 0.5 else x for x in sorted(neg)], neg_fa
+        [revcomp(kmer) if rng.random() < REVCOMP_PROB else kmer for kmer in sorted(neg)], neg_fa
     )
 
-    for (label, fa, want), (fmt, iidx) in (
-        (x, y)
-        for x in (("pos", pos_fa, n_positive), ("neg", neg_fa, 0))
-        for y in optik_idxs.items()
+    # Both optik indexes answer the positive and negative probe sets, and each report must split them exactly.
+    for (label, probe_fa, want), (fmt, iidx) in (
+        (probe_set, index_item)
+        for probe_set in (("pos", pos_fa, n_positive), ("neg", neg_fa, 0))
+        for index_item in optik_idxs.items()
     ):
-        p = optik_query_report(optik, iidx, fa, k)
-        rep = parse_optik_report(p.stdout.decode())
+        proc = optik_query_report(optik, iidx, probe_fa, kmer_len)
+        rep = parse_optik_report(proc.stdout.decode())
         checks[f"optik_query_{label}{fmt}"] = {
             "pass": (
                 rep["num_kmers"] == len(pos if label == "pos" else neg)
@@ -388,9 +406,10 @@ def suite_query(args):
             "expected_positives": want,
         }
 
-    for label, fa, want in (("pos", pos_fa, n_positive), ("neg", neg_fa, 0)):
-        p = sshash_query_report(sshash, sshash_idx, fa, k)
-        rep = parse_sshash_report(p.stdout.decode())
+    # SSHash faces the same probes. A failure here means the oracle or the probes are wrong, not optik.
+    for label, probe_fa, want in (("pos", pos_fa, n_positive), ("neg", neg_fa, 0)):
+        proc = sshash_query_report(sshash, sshash_idx, probe_fa, kmer_len)
+        rep = parse_sshash_report(proc.stdout.decode())
         nrec = len(pos if label == "pos" else neg)
         checks[f"sshash_query_{label}"] = {
             "pass": (
@@ -425,7 +444,7 @@ def suite_query(args):
             "-o",
             str(sim_q),
         ],
-        timeout=1200,
+        timeout=SIMULATE_TIMEOUT_S,
     )
     # SSHash's query parser takes one sequence per line.
     # In a wrapped FASTA (such as a genome at 70 columns) it would read every other line as a header, so both tools get the same single-line copy.
@@ -433,35 +452,35 @@ def suite_query(args):
     queries = args.queries
     if queries:
         opener = gzip.open if str(queries).endswith(".gz") else open
-        with opener(queries, "rt") as fh:
-            first = fh.readline()
+        with opener(queries, "rt") as handle:
+            first = handle.readline()
         if first.startswith(">"):
             queries = keep / "queries_oneline.fa"
             to_single_line_fasta(args.queries, queries)
     read_sets = ([("", queries)] if queries else []) + [("_simreads", sim_q)]
-    for (rs, qpath), (fmt, optik_idx) in (
-        (x, y) for x in read_sets for y in optik_idxs.items()
+    for (read_set_tag, qpath), (fmt, optik_idx) in (
+        (read_set, index_item) for read_set in read_sets for index_item in optik_idxs.items()
     ):
-        fmt = fmt + rs
+        fmt = fmt + read_set_tag
         # Step 4 runs real reads, on which both tools must count positives and negatives the same way.
         # optik counts N-free k-mers, and sshash counts raw ones and reports the invalid separately.
-        p1 = optik_query_report(optik, optik_idx, qpath, k)
-        r1 = parse_optik_report(p1.stdout.decode())
-        p2 = sshash_query_report(sshash, sshash_idx, qpath, k)
-        r2 = parse_sshash_report(p2.stdout.decode())
+        optik_proc = optik_query_report(optik, optik_idx, qpath, kmer_len)
+        optik_rep = parse_optik_report(optik_proc.stdout.decode())
+        sshash_proc = sshash_query_report(sshash, sshash_idx, qpath, kmer_len)
+        sshash_rep = parse_sshash_report(sshash_proc.stdout.decode())
         checks["real_reads_positive_equal" + fmt] = {
             "pass": (
-                r1.get("num_positive_kmers") is not None
-                and r1.get("num_positive_kmers") == r2.get("num_positive_kmers")
+                optik_rep.get("num_positive_kmers") is not None
+                and optik_rep.get("num_positive_kmers") == sshash_rep.get("num_positive_kmers")
             ),
-            "optik": r1,
-            "sshash": r2,
+            "optik": optik_rep,
+            "sshash": sshash_rep,
         }
         checks["real_reads_negative_equal" + fmt] = {
-            "pass": r1.get("num_negative_kmers") is not None
-            and r1.get("num_negative_kmers") == r2.get("num_negative_kmers"),
-            "optik_negative": r1.get("num_negative_kmers"),
-            "sshash_negative": r2.get("num_negative_kmers"),
+            "pass": optik_rep.get("num_negative_kmers") is not None
+            and optik_rep.get("num_negative_kmers") == sshash_rep.get("num_negative_kmers"),
+            "optik_negative": optik_rep.get("num_negative_kmers"),
+            "sshash_negative": sshash_rep.get("num_negative_kmers"),
         }
         # Both tools report num_kmers as the total k-mers seen (positives, negatives and invalid), so the totals are compared directly and the invalid counts must agree.
         # An earlier form subtracted sshash's invalid count from its total while comparing against optik's total, which set two different quantities side by side and could never hold.
@@ -471,7 +490,7 @@ def suite_query(args):
         # Aggregate totals alone would hide a false positive and a false negative in the same run.
         if fmt.startswith("_spss"):
             ids_out = keep / f"ids{fmt}.txt"
-            p3 = run(
+            ids_proc = run(
                 [
                     str(optik.path),
                     "query",
@@ -480,56 +499,56 @@ def suite_query(args):
                     "-q",
                     str(qpath),
                     "-k",
-                    str(k),
+                    str(kmer_len),
                     "--ids",
                     str(ids_out),
                 ],
-                timeout=3600,
+                timeout=TOOL_TIMEOUT_S,
             )
-            seqs = [sq for _, sq in read_seqs(qpath)]
-            lines = ids_out.read_text().splitlines() if p3.returncode == 0 else []
+            seqs = [seq for _, seq in read_seqs(qpath)]
+            lines = ids_out.read_text().splitlines() if ids_proc.returncode == 0 else []
             bad = present = 0
             examples = []
-            for sq, ln in zip(seqs, lines, strict=False):
-                ids = [int(x) for x in ln.split()]
-                u = sq.upper()
-                if len(ids) != max(0, len(u) - k + 1):
+            for seq, ids_line in zip(seqs, lines, strict=False):
+                ids = [int(id_str) for id_str in ids_line.split()]
+                upper_seq = seq.upper()
+                if len(ids) != max(0, len(upper_seq) - kmer_len + 1):
                     bad += 1
                     continue
                 for i, idv in enumerate(ids):
-                    w = u[i : i + k]
-                    want = all(c in "ACGT" for c in w) and canonical(w) in oracle
+                    window = upper_seq[i : i + kmer_len]
+                    want = all(base in "ACGT" for base in window) and canonical(window) in oracle
                     present += idv >= 0
                     if (idv >= 0) != want:
                         bad += 1
-                        if len(examples) < 3:
-                            examples.append((w, idv, want))
+                        if len(examples) < MAX_EXAMPLES:
+                            examples.append((window, idv, want))
             checks["per_kmer_membership" + fmt] = {
                 "pass": (
-                    p3.returncode == 0
+                    ids_proc.returncode == 0
                     and len(lines) == len(seqs) > 0
                     and bad == 0
-                    and present == r1.get("num_positive_kmers")
+                    and present == optik_rep.get("num_positive_kmers")
                 ),
                 "records": len(seqs),
                 "id_lines": len(lines),
                 "window_mismatches": bad,
                 "present_windows": present,
-                "reported_positive": r1.get("num_positive_kmers"),
+                "reported_positive": optik_rep.get("num_positive_kmers"),
                 "examples": examples,
                 "detail": "every window's --ids membership == KMC oracle; present windows "
                 "== reported num_positive_kmers",
             }
         checks["real_reads_kmers_mapping" + fmt] = {
             "pass": (
-                r1.get("num_kmers") == r2.get("num_kmers")
-                and (r1.get("num_invalid_kmers") or 0)
-                == (r2.get("num_invalid_kmers") or 0)
+                optik_rep.get("num_kmers") == sshash_rep.get("num_kmers")
+                and (optik_rep.get("num_invalid_kmers") or 0)
+                == (sshash_rep.get("num_invalid_kmers") or 0)
             ),
-            "optik_kmers": r1.get("num_kmers"),
-            "sshash_kmers": r2.get("num_kmers"),
-            "optik_invalid": r1.get("num_invalid_kmers"),
-            "sshash_invalid": r2.get("num_invalid_kmers"),
+            "optik_kmers": optik_rep.get("num_kmers"),
+            "sshash_kmers": sshash_rep.get("num_kmers"),
+            "optik_invalid": optik_rep.get("num_invalid_kmers"),
+            "sshash_invalid": sshash_rep.get("num_invalid_kmers"),
         }
 
     return checks
@@ -541,53 +560,53 @@ def suite_query(args):
 def parse_gfa_unitigs(gfa_path):
     """Sequences of the S lines of a GFA file, plain or gzipped."""
     seqs = []
-    op = gzip.open if str(gfa_path).endswith(".gz") else open
-    with op(gfa_path, "rt") as fh:
-        for line in fh:
-            t = line.rstrip("\n").split("\t")
-            if t and t[0] == "S" and len(t) >= 3:
-                seqs.append(t[2])
+    opener = gzip.open if str(gfa_path).endswith(".gz") else open
+    with opener(gfa_path, "rt") as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if fields and fields[0] == "S" and len(fields) > GfaSegmentCol.SEQ:
+                seqs.append(fields[GfaSegmentCol.SEQ])
     return seqs
 
 
-def unitig_kmers(seq, k):
+def unitig_kmers(seq, kmer_len):
     """Set of canonical k-mers of seq."""
-    return {canonical(seq[i : i + k]) for i in range(len(seq) - k + 1)}
+    return {canonical(seq[i : i + kmer_len]) for i in range(len(seq) - kmer_len + 1)}
 
 
-def build_canon_graph(km31, km32, k):
+def build_canon_graph(km31, km32, kmer_len):
     """Canonical k-mer graph built from the KMC (k+1)-mer oracle.
     out[x] holds every neighbour of x, since each edge is added in both directions."""
-    out = {m: set() for m in km31}
+    out = {kmer: set() for kmer in km31}
     selfloop = set()
-    for w in km32:
-        a = canonical(w[:k])
-        b = canonical(w[1 : k + 1])
-        if a not in km31 or b not in km31:
+    for edge_kmer in km32:
+        left = canonical(edge_kmer[:kmer_len])
+        right = canonical(edge_kmer[1 : kmer_len + 1])
+        if left not in km31 or right not in km31:
             continue
-        if a == b:
-            selfloop.add(a)
+        if left == right:
+            selfloop.add(left)
             continue
-        out[a].add(b)
-        out[b].add(a)
+        out[left].add(right)
+        out[right].add(left)
     return out, selfloop
 
 
-def branch_crossing_count(unitigs, km31, km32, k):
+def branch_crossing_count(unitigs, km31, km32, kmer_len):
     """Count unitigs that cross a branch node.
     An interior k-mer of a unitig may touch only its path neighbours and its own self-loop."""
-    out, selfloop = build_canon_graph(km31, km32, k)
+    out, selfloop = build_canon_graph(km31, km32, kmer_len)
     violations = 0
-    for s in unitigs:
-        wins = [canonical(s[i : i + k]) for i in range(len(s) - k + 1)]
-        if len(wins) < 3:
+    for seq in unitigs:
+        wins = [canonical(seq[i : i + kmer_len]) for i in range(len(seq) - kmer_len + 1)]
+        if len(wins) < MIN_INTERIOR_WINDOWS:
             continue
         for i in range(1, len(wins) - 1):
-            x = wins[i]
+            kmer = wins[i]
             allowed = {wins[i - 1], wins[i + 1]}
-            extra = set(out.get(x, set())) - allowed
-            if extra and x in selfloop:
-                extra.discard(x)
+            extra = set(out.get(kmer, set())) - allowed
+            if extra and kmer in selfloop:
+                extra.discard(kmer)
             if extra:
                 violations += 1
     return violations
@@ -597,21 +616,21 @@ def suite_dbg(args):
     """Check optik dbruijn's unitigs against the KMC oracle, Bifrost and Cuttlefish and return the checks."""
     checks = {}
     optik, bifrost, cuttle, kmc = args.optik, args.bifrost, args.cuttlefish, args.kmc
-    k = args.k
+    kmer_len = args.k
     keep = Path(args.workdir)
     keep.mkdir(parents=True, exist_ok=True)
 
     # optik dbruijn, then GFA, then unitig FASTA
     gfa = keep / "optik.gfa"
     kdbg = keep / "optik.kdbg"
-    p = run(
+    proc = run(
         [
             str(optik.path),
             "dbruijn",
             "-i",
             str(args.input),
             "-k",
-            str(k),
+            str(kmer_len),
             "-c",
             str(args.min_count),
             "-o",
@@ -621,11 +640,11 @@ def suite_dbg(args):
             "-s",
             str(kdbg),
         ],
-        timeout=3600,
+        timeout=TOOL_TIMEOUT_S,
     )
     checks["optik_dbruijn"] = {
-        "pass": p.returncode == 0,
-        "stderr": p.stderr.decode()[-500:],
+        "pass": proc.returncode == 0,
+        "stderr": proc.stderr.decode()[-DETAIL_CHARS:],
     }
     if not checks["optik_dbruijn"]["pass"]:
         # optik may have written the GFA despite a nonzero exit on runs without retries, so check for it.
@@ -634,8 +653,8 @@ def suite_dbg(args):
         return checks
     optik_us = parse_gfa_unitigs(gfa)
     optik_set = set()
-    for s in optik_us:
-        optik_set |= unitig_kmers(s, k)
+    for seq in optik_us:
+        optik_set |= unitig_kmers(seq, kmer_len)
     checks["optik_unitigs"] = {
         "n_unitigs": len(optik_us),
         "total_bp": sum(map(len, optik_us)),
@@ -650,9 +669,9 @@ def suite_dbg(args):
     # The solid set uses the same abundance cutoff optik ran with.
     # The (k+1)-mer set stays unfiltered, because under optik's edge-centric semantics an edge needs one observed window between two solid k-mers.
     oracle = kmc_build(
-        kmc, keep, oracle_input, "oracle", k, args.threads, args.min_count
+        kmc, keep, oracle_input, "oracle", kmer_len, args.threads, args.min_count
     )
-    oracle_k1 = kmc_build(kmc, keep, oracle_input, "oracle_k1", k + 1, args.threads)
+    oracle_k1 = kmc_build(kmc, keep, oracle_input, "oracle_k1", kmer_len + 1, args.threads)
     checks["oracle"] = {"n_kmers": len(oracle), "n_kmers_k1": len(oracle_k1)}
 
     # The unitig set must equal the oracle exactly.
@@ -675,7 +694,7 @@ def suite_dbg(args):
     }
 
     # No unitig may cross a branch node.
-    viol = branch_crossing_count(optik_us, oracle, oracle_k1, k)
+    viol = branch_crossing_count(optik_us, oracle, oracle_k1, kmer_len)
     checks["no_branch_crossing"] = {"pass": viol == 0, "violations": viol}
 
     # Structural checks cover duplicated k-mers, maximality, exact L links and, at min_count 1, equality of the unitig partition with Cuttlefish --read.
@@ -686,19 +705,19 @@ def suite_dbg(args):
     struct = validate_unitigs.validate(
         str(oracle_input),
         str(gfa),
-        k,
+        kmer_len,
         args.min_count,
         str(cuttle.path) if cuttle.available else None,
         args.threads,
         kdbg=str(kdbg),
     )
-    for name, c in struct.items():
-        checks["gfa_" + name] = c
+    for name, check in struct.items():
+        checks["gfa_" + name] = check
 
     # Bifrost, as an independent tool
     if bifrost.available and args.min_count == 1:
         bf_prefix = keep / "bifrost"
-        p = run(
+        proc = run(
             [
                 str(bifrost.path),
                 "build",
@@ -707,35 +726,35 @@ def suite_dbg(args):
                 "-o",
                 str(bf_prefix),
                 "-k",
-                str(k),
+                str(kmer_len),
                 "-t",
                 str(args.threads),
             ],
-            timeout=3600,
+            timeout=TOOL_TIMEOUT_S,
         )
-        bfr = p.returncode
+        bfr = proc.returncode
         bf_us = []
         for cand in (str(bf_prefix) + ".gfa", str(bf_prefix) + ".gfa.gz"):
             if os.path.isfile(cand):
                 bf_us = parse_gfa_unitigs(cand)
                 break
         bf_set = set()
-        for s in bf_us:
-            bf_set |= unitig_kmers(s, k)
-        d_bf = (len(bf_set ^ oracle), len(bf_set - oracle), len(oracle - bf_set))
+        for seq in bf_us:
+            bf_set |= unitig_kmers(seq, kmer_len)
+        sym_diff, only_bifrost, only_oracle = len(bf_set ^ oracle), len(bf_set - oracle), len(oracle - bf_set)
         checks["bifrost_build"] = {"pass": bfr == 0}
         checks["bifrost_set_equal_oracle"] = {
-            "pass": d_bf[0] == 0,
+            "pass": sym_diff == 0,
             "n_unitigs": len(bf_us),
-            "sym_diff": d_bf[0],
-            "only_bifrost": d_bf[1],
-            "only_oracle": d_bf[2],
+            "sym_diff": sym_diff,
+            "only_bifrost": only_bifrost,
+            "only_oracle": only_oracle,
         }
 
     # Cuttlefish, also independent, which works on (k+1)-mers and drops islands isolated by N
     if cuttle.available and args.min_count == 1:
         cf_prefix = keep / "cuttlefish"
-        p = run(
+        proc = run(
             [
                 str(cuttle.path),
                 "build",
@@ -743,7 +762,7 @@ def suite_dbg(args):
                 "-s",
                 str(args.input),
                 "-k",
-                str(k),
+                str(kmer_len),
                 "-c",
                 str(args.min_count),
                 "-o",
@@ -751,18 +770,18 @@ def suite_dbg(args):
                 "-t",
                 str(args.threads),
             ],
-            timeout=3600,
+            timeout=TOOL_TIMEOUT_S,
         )
         cf_fa = Path(str(cf_prefix) + ".fa")
         cf_set = set()
         ncf = 0
         if cf_fa.is_file():
             for _, seq in read_fasta(cf_fa):
-                cf_set |= unitig_kmers(seq, k)
+                cf_set |= unitig_kmers(seq, kmer_len)
                 ncf += 1
         extra_cf = cf_set - oracle
         missing_cf = oracle - cf_set
-        checks["cuttlefish_build"] = {"pass": p.returncode == 0}
+        checks["cuttlefish_build"] = {"pass": proc.returncode == 0}
         checks["cuttlefish_set_subset"] = {
             "pass": not extra_cf,
             "only_cuttlefish": len(extra_cf),
@@ -781,40 +800,49 @@ def suite_dbg(args):
 def parse_truth_tsv(path):
     """Rows (read, contig, position, strand, length) of a gen_reads.py truth TSV."""
     rows = []
-    for ln in path.read_text().splitlines():
-        if not ln or ln.startswith("read_name"):
+    for line in path.read_text().splitlines():
+        if not line or line.startswith("read_name"):
             continue
-        p = ln.split("\t")
-        if len(p) >= 5:
-            rows.append((p[0], p[1], int(p[2]), p[3], int(p[4])))
+        fields = line.split("\t")
+        if len(fields) > TruthCol.LEN:
+            rows.append(
+                (
+                    fields[TruthCol.NAME],
+                    fields[TruthCol.REF],
+                    int(fields[TruthCol.POS]),
+                    fields[TruthCol.STRAND],
+                    int(fields[TruthCol.LEN]),
+                )
+            )
     return rows
 
 
 def parse_sam_maps(path):
     """Map each read name to its primary record as dict(pairname, pos (1-based), strand, mapq, cigar, nm)."""
     out = {}
-    with open(path) as fh:
-        for line in fh:
+    with open(path) as handle:
+        for line in handle:
             if line.startswith("@"):
                 continue
-            t = line.rstrip("\n").split("\t")
-            if len(t) < SAM_MIN_COLUMNS or t[2] == "*" or int(t[1]) & SAM_FLAG_UNMAPPED:
-                out[t[0]] = {"unmapped": True}
+            fields = line.rstrip("\n").split("\t")
+            # A truncated line or a missing reference counts as unmapped, whatever the flag says.
+            if len(fields) < SAM_MIN_COLUMNS or fields[SamCol.RNAME] == "*" or int(fields[SamCol.FLAG]) & SamFlag.UNMAPPED:
+                out[fields[SamCol.QNAME]] = {"unmapped": True}
                 continue
-            nm = None
-            for tag in t[11:]:
+            nm_tag = None
+            for tag in fields[SamCol.TAGS:]:
                 if tag.startswith("NM:i:"):
-                    nm = int(tag[5:])
+                    nm_tag = int(tag[SAM_TAG_PREFIX_LEN:])
                     break
-            f = int(t[1])
-            out[t[0]] = {
+            flag = int(fields[SamCol.FLAG])
+            out[fields[SamCol.QNAME]] = {
                 "unmapped": False,
-                "ref": t[2],
-                "pos": int(t[3]),
-                "strand": "-" if f & SAM_FLAG_REVERSE else "+",
-                "cigar": t[5],
-                "nm": nm,
-                "mapq": int(t[4]),
+                "ref": fields[SamCol.RNAME],
+                "pos": int(fields[SamCol.POS]),
+                "strand": "-" if flag & SamFlag.REVERSE else "+",
+                "cigar": fields[SamCol.CIGAR],
+                "nm": nm_tag,
+                "mapq": int(fields[SamCol.MAPQ]),
             }
     return out
 
@@ -828,37 +856,37 @@ def sam_nm_from_cigar(read, cigar, refseq, pos1, strand):
 
     Returns None if the CIGAR's reference span runs past the contig.
     """
-    read = rc(read) if strand == "-" else read
-    qi = 0
-    ti = pos1 - 1
+    read = revcomp(read) if strand == "-" else read
+    read_pos = 0
+    ref_pos = pos1 - 1
     ref_span = sum(
-        int(mm.group(1))
-        for mm in re.finditer(r"(\d+)([MDN=X])", cigar)
-        if mm.group(2) in "MDN=X"
+        int(match.group("len"))
+        for match in re.finditer(r"(?P<len>\d+)(?P<op>[MDN=X])", cigar)
     )
-    if ti < 0 or ti + ref_span > len(refseq):
+    # A span past the contig means the record is wrong. None reports that apart from a plain NM mismatch.
+    if ref_pos < 0 or ref_pos + ref_span > len(refseq):
         return None
-    nm = 0
-    for mm in re.finditer(r"(\d+)([MIDNSHP=X])", cigar):
-        ln = int(mm.group(1))
-        op = mm.group(2)
-        if op in "M=X":
-            for j in range(ln):
-                rq = read[qi + j] if qi + j < len(read) else "N"
-                rt = refseq[ti + j] if ti + j < len(refseq) else "N"
-                if not (rq.upper() == rt.upper() and rq.upper() in "ACGT"):
-                    nm += 1
-            qi += ln
-            ti += ln
-        elif op in "IS":
-            qi += ln
-            if op == "I":
-                nm += ln
-        elif op in "DN":
-            ti += ln
-            if op == "D":
-                nm += ln
-    return nm
+    nm_count = 0
+    for match in re.finditer(r"(?P<len>\d+)(?P<op>[MIDNSHP=X])", cigar):
+        op_len = int(match.group("len"))
+        cigar_op = match.group("op")
+        if cigar_op in "M=X":
+            for j in range(op_len):
+                read_base = read[read_pos + j] if read_pos + j < len(read) else "N"
+                ref_base = refseq[ref_pos + j] if ref_pos + j < len(refseq) else "N"
+                if not (read_base.upper() == ref_base.upper() and read_base.upper() in "ACGT"):
+                    nm_count += 1
+            read_pos += op_len
+            ref_pos += op_len
+        elif cigar_op in "IS":
+            read_pos += op_len
+            if cigar_op == "I":
+                nm_count += op_len
+        elif cigar_op in "DN":
+            ref_pos += op_len
+            if cigar_op == "D":
+                nm_count += op_len
+    return nm_count
 
 
 # Helpers for the wavefront mapper wfmash, which pairs MashMap segments with WFA alignment
@@ -879,22 +907,22 @@ def faidx(path):
     if fai.is_file() and fai.stat().st_mtime >= Path(path).stat().st_mtime:
         return
     rows, off = [], 0
-    with open(path, "rb") as fh:
-        name, length, start, lb, lw = None, 0, 0, 0, 0
-        for line in fh:
+    with open(path, "rb") as handle:
+        name, length, start, line_bases, line_width = None, 0, 0, 0, 0
+        for line in handle:
             if line.startswith(b">"):
                 if name is not None:
-                    rows.append(f"{name}\t{length}\t{start}\t{lb}\t{lw}")
+                    rows.append(f"{name}\t{length}\t{start}\t{line_bases}\t{line_width}")
                 name = line[1:].split()[0].decode()
-                length, start, lb, lw = 0, off + len(line), 0, 0
+                length, start, line_bases, line_width = 0, off + len(line), 0, 0
             else:
-                n = len(line.rstrip(b"\r\n"))
-                if lb == 0:
-                    lb, lw = n, len(line)
-                length += n
+                base_count = len(line.rstrip(b"\r\n"))
+                if line_bases == 0:
+                    line_bases, line_width = base_count, len(line)
+                length += base_count
             off += len(line)
         if name is not None:
-            rows.append(f"{name}\t{length}\t{start}\t{lb}\t{lw}")
+            rows.append(f"{name}\t{length}\t{start}\t{line_bases}\t{line_width}")
     fai.write_text("\n".join(rows) + "\n")
 
 
@@ -905,38 +933,39 @@ def one_primary_per_read(sam_in, sam_out):
     For each read the primary with the most aligned read bases (M/=/X/I) is kept and the others are marked supplementary, so the same auditors and scorers apply to every mapper.
     Returns the number of reads that had more than one primary."""
 
-    def aligned(t):
+    def aligned(fields):
         """Read bases aligned by SAM record t (M, =, X and I)."""
         return sum(
-            int(a) for a, o in re.findall(r"(\d+)([MIDNSHP=X])", t[5]) if o in "M=XI"
+            int(op_len) for op_len, cigar_op in re.findall(r"(\d+)([MIDNSHP=X])", fields[SamCol.CIGAR]) if cigar_op in "M=XI"
         )
 
+    # The first pass finds each read's longest primary. The second rewrites the others as supplementary.
     best, lines = {}, []
-    with open(sam_in) as fh:
-        for line in fh:
+    with open(sam_in) as handle:
+        for line in handle:
             lines.append(line)
             if line.startswith("@"):
                 continue
-            t = line.split("\t")
-            f = int(t[1])
-            if f & SAM_FLAGS_NOT_PRIMARY:
+            fields = line.split("\t")
+            flag = int(fields[SamCol.FLAG])
+            if flag & SamFlag.NOT_PRIMARY:
                 continue
-            a = aligned(t)
-            if t[0] not in best or a > best[t[0]][0]:
-                best[t[0]] = (a, len(lines) - 1)
+            aligned_len = aligned(fields)
+            if fields[SamCol.QNAME] not in best or aligned_len > best[fields[SamCol.QNAME]][0]:
+                best[fields[SamCol.QNAME]] = (aligned_len, len(lines) - 1)
     multi = Counter()
     with open(sam_out, "w") as out:
         for i, line in enumerate(lines):
             if not line.startswith("@"):
-                t = line.split("\t")
-                f = int(t[1])
-                if not f & SAM_FLAGS_NOT_PRIMARY:
-                    multi[t[0]] += 1
-                    if best[t[0]][1] != i:
-                        t[1] = str(f | 0x800)
-                        line = "\t".join(t)
+                fields = line.split("\t")
+                flag = int(fields[SamCol.FLAG])
+                if not flag & SamFlag.NOT_PRIMARY:
+                    multi[fields[SamCol.QNAME]] += 1
+                    if best[fields[SamCol.QNAME]][1] != i:
+                        fields[SamCol.FLAG] = str(flag | SamFlag.SUPPLEMENTARY)
+                        line = "\t".join(fields)
             out.write(line)
-    return sum(1 for v in multi.values() if v > 1)
+    return sum(1 for count in multi.values() if count > 1)
 
 
 def run_wfmash(wfmash, ref, reads, out, threads, opts):
@@ -946,24 +975,24 @@ def run_wfmash(wfmash, ref, reads, out, threads, opts):
     faidx(ref)
     faidx(reads)
     raw = Path(str(out) + ".raw")
-    t0 = time.monotonic()
-    with open(raw, "wb") as fh:
-        p = run(
+    start = time.monotonic()
+    with open(raw, "wb") as handle:
+        proc = run(
             [str(wfmash.path), str(ref), str(reads), "-t", str(threads), "-a", *opts],
-            stdout=fh,
+            stdout=handle,
             stderr=subprocess.DEVNULL,
-            timeout=7200,
+            timeout=WFMASH_TIMEOUT_S,
         )
-    dt = time.monotonic() - t0
-    split = one_primary_per_read(raw, out) if p.returncode == 0 else 0
-    return dt, p.returncode, split
+    elapsed = time.monotonic() - start
+    split = one_primary_per_read(raw, out) if proc.returncode == 0 else 0
+    return elapsed, proc.returncode, split
 
 
-def timed(fn, *a, **kw):
+def timed(func, *call_args, **kwargs):
     """Result and wall seconds of calling fn."""
-    t0 = time.monotonic()
-    r = fn(*a, **kw)
-    return r, time.monotonic() - t0
+    start = time.monotonic()
+    result = func(*call_args, **kwargs)
+    return result, time.monotonic() - start
 
 
 def suite_map(args):
@@ -984,23 +1013,23 @@ def suite_map(args):
 
     # optik indexes the same minimizers as the minimap2 preset it is compared with (minimap2 v2.31 options.c gives sr k = 21, w = 11 and map-ont, the default, k = 15, w = 10).
     # --map-k and -w override both.
-    mm2_preset_kw = {"sr": (21, 11), "map-ont": (15, 10)}
+    mm2_preset_kw = MM2_PRESET_KW
 
     def run_optik_map(reads, out, threads, preset="sr"):
         """Run optik map on reads with the preset's k and w unless overridden, writing SAM to out."""
         cmd = [str(optik.path), "map", "-r", str(ref), "-q", str(reads)]
-        pk, pw = mm2_preset_kw[preset]
-        for flag, v in (("-k", args.map_k or pk), ("-w", args.w or pw), ("-e", args.e)):
-            if v is not None:
-                cmd += [flag, str(v)]
-        p = run(cmd + ["-t", str(threads), "-o", str(out)], timeout=3600)
-        return p
+        preset_k, preset_w = mm2_preset_kw[preset]
+        for flag, value in (("-k", args.map_k or preset_k), ("-w", args.w or preset_w), ("-e", args.e)):
+            if value is not None:
+                cmd += [flag, str(value)]
+        proc = run(cmd + ["-t", str(threads), "-o", str(out)], timeout=TOOL_TIMEOUT_S)
+        return proc
 
     # Part 1, error-free simulated reads with exact ground truth
     sim_reads = keep / "sim.fa"
     sim_truth = keep / "sim.truth.tsv"
     greads = Path(__file__).resolve().parent / "gen_reads.py"
-    p = run(
+    proc = run(
         [
             sys.executable,
             str(greads),
@@ -1017,35 +1046,35 @@ def suite_map(args):
             "--gt",
             str(sim_truth),
         ],
-        timeout=1200,
+        timeout=SIMULATE_TIMEOUT_S,
     )
-    checks["gen_sim_reads"] = {"pass": p.returncode == 0}
+    checks["gen_sim_reads"] = {"pass": proc.returncode == 0}
     truth = parse_truth_tsv(sim_truth)
 
     sam0 = keep / "sim_optik.sam"
-    p, dt = timed(run_optik_map, sim_reads, sam0, args.threads)
-    speed.setdefault("error_free_short", {})["optik"] = round(dt, 3)
+    proc, elapsed = timed(run_optik_map, sim_reads, sam0, args.threads)
+    speed.setdefault("error_free_short", {})["optik"] = round(elapsed, 3)
     checks["optik_map_exit"] = {
-        "pass": p.returncode == 0,
-        "stderr": p.stderr.decode()[-400:],
+        "pass": proc.returncode == 0,
+        "stderr": proc.stderr.decode()[-DETAIL_CHARS:],
     }
 
     maps = parse_sam_maps(sam0)
-    ref_seqs = {n: s for n, s in read_fasta(ref)}
+    ref_seqs = {name: seq for name, seq in read_fasta(ref)}
     mism = 0
     repeat_ties = 0
     for tname, tref, tpos, tstrand, tlen in truth:
-        m = maps.get(tname)
-        if m is None or m.get("unmapped"):
+        optik_map = maps.get(tname)
+        if optik_map is None or optik_map.get("unmapped"):
             mism += 1
             continue
-        if (m["ref"], m["pos"], m.get("strand")) != (tref, tpos + 1, tstrand):
-            # The read has no errors, so another placement is a genuine tie only when the reference at the reported locus, in the reported orientation, spells the read exactly, as a repeat copy does, inverted repeats on the other strand included.
+        if (optik_map["ref"], optik_map["pos"], optik_map.get("strand")) != (tref, tpos + 1, tstrand):
+            # The read has no errors, so another placement is a real tie only when the reference at the reported locus, in the reported orientation, spells the read exactly, as a repeat copy does, inverted repeats on the other strand included.
             # Anything else is a misplacement.
-            rw = ref_seqs[m["ref"]][m["pos"] - 1 : m["pos"] - 1 + tlen]
-            tw = ref_seqs[tref][tpos : tpos + tlen]
-            want = tw if tstrand == "+" else rc(tw)  # the read itself
-            got = rw if m.get("strand") == "+" else rc(rw)
+            mapped_window = ref_seqs[optik_map["ref"]][optik_map["pos"] - 1 : optik_map["pos"] - 1 + tlen]
+            truth_window = ref_seqs[tref][tpos : tpos + tlen]
+            want = truth_window if tstrand == "+" else revcomp(truth_window)  # the read itself
+            got = mapped_window if optik_map.get("strand") == "+" else revcomp(mapped_window)
             if got == want:
                 repeat_ties += 1
             else:
@@ -1062,7 +1091,7 @@ def suite_map(args):
     # Records must be self-consistent, with NM matching a recomputation from SAM SEQ and CIGAR, each read needs exactly one primary, and placements with high MAPQ must be right.
     err_reads = keep / "sim_err.fa"
     err_truth_tsv = keep / "sim_err.truth.tsv"
-    p = run(
+    proc = run(
         [
             sys.executable,
             str(greads),
@@ -1073,6 +1102,7 @@ def suite_map(args):
             "-l",
             str(args.read_len),
             "-s",
+            # seed + 1 draws the error set from different positions than the error-free set.
             str(args.seed + 1),
             "-e",
             str(args.err_rate),
@@ -1085,14 +1115,14 @@ def suite_map(args):
             "--gt",
             str(err_truth_tsv),
         ],
-        timeout=1200,
+        timeout=SIMULATE_TIMEOUT_S,
     )
-    checks["gen_err_reads"] = {"pass": p.returncode == 0}
-    err_truth = {t[0]: t for t in parse_truth_tsv(err_truth_tsv)}
+    checks["gen_err_reads"] = {"pass": proc.returncode == 0}
+    err_truth = {row[0]: row for row in parse_truth_tsv(err_truth_tsv)}
     sam1 = keep / "sim_err_optik.sam"
-    p, dt = timed(run_optik_map, err_reads, sam1, args.threads)
-    speed.setdefault("error_short", {})["optik"] = round(dt, 3)
-    checks["optik_map_err_exit"] = {"pass": p.returncode == 0}
+    proc, elapsed = timed(run_optik_map, err_reads, sam1, args.threads)
+    speed.setdefault("error_short", {})["optik"] = round(elapsed, 3)
+    checks["optik_map_err_exit"] = {"pass": proc.returncode == 0}
 
     def audit_sam(path, seqs=None):
         """Per-read primary placements and spec checks of a SAM file.
@@ -1101,85 +1131,86 @@ def suite_map(args):
         seqs = err_seqs if seqs is None else seqs
         prim = {}
         dup_primary = seq_bad = nm_bad = 0
-        with open(path) as fh:
-            for line in fh:
+        with open(path) as handle:
+            for line in handle:
                 if line.startswith("@"):
                     continue
-                t = line.rstrip("\n").split("\t")
-                flag = int(t[1])
-                if flag & SAM_FLAGS_SECONDARY_SUPPLEMENTARY:
+                fields = line.rstrip("\n").split("\t")
+                flag = int(fields[SamCol.FLAG])
+                if flag & SamFlag.SECONDARY_SUPPLEMENTARY:
                     continue
-                if t[0] in prim:
+                if fields[SamCol.QNAME] in prim:
                     dup_primary += 1
                     continue
-                if flag & SAM_FLAG_UNMAPPED:
-                    prim[t[0]] = None
+                if flag & SamFlag.UNMAPPED:
+                    prim[fields[SamCol.QNAME]] = None
                     continue
-                strand = "-" if flag & SAM_FLAG_REVERSE else "+"
-                read = seqs.get(t[0])
-                seq = t[9]
-                want = None if read is None else (rc(read) if strand == "-" else read)
+                strand = "-" if flag & SamFlag.REVERSE else "+"
+                read = seqs.get(fields[SamCol.QNAME])
+                seq = fields[SamCol.SEQ]
+                want = None if read is None else (revcomp(read) if strand == "-" else read)
                 if seq == "*" or want is None or seq.upper() != want.upper():
                     seq_bad += 1
-                nm = None
-                for tag in t[11:]:
+                nm_tag = None
+                for tag in fields[SamCol.TAGS:]:
                     if tag.startswith("NM:i:"):
-                        nm = int(tag[5:])
-                ops = re.findall(r"(\d+)([MIDNSHP=X])", t[5])
+                        nm_tag = int(tag[SAM_TAG_PREFIX_LEN:])
+                ops = re.findall(r"(\d+)([MIDNSHP=X])", fields[SamCol.CIGAR])
                 if (
                     seq == "*"
-                    or sum(int(a) for a, o in ops if o in "MIS=X") != len(seq)
-                    or t[2] not in ref_seqs
+                    or sum(int(op_len) for op_len, cigar_op in ops if cigar_op in "MIS=X") != len(seq)
+                    or fields[SamCol.RNAME] not in ref_seqs
                 ):
                     nm_bad += 1
                 else:
                     # SAM SEQ is already in reference orientation.
-                    d = sam_nm_from_cigar(seq, t[5], ref_seqs[t[2]], int(t[3]), "+")
-                    if nm is None or d != nm:
+                    recomputed_nm = sam_nm_from_cigar(seq, fields[SamCol.CIGAR], ref_seqs[fields[SamCol.RNAME]], int(fields[SamCol.POS]), "+")
+                    if nm_tag is None or recomputed_nm != nm_tag:
                         nm_bad += 1
                 # The read's origin on the reference is POS minus the leading clip, so clipped alignments, soft or hard, are scored like end-to-end ones.
-                lead = re.match(r"^(\d+)[SH]", t[5])
-                origin = int(t[3]) - (int(lead.group(1)) if lead else 0)
-                prim[t[0]] = (t[2], origin, strand, int(t[4]))
+                lead = re.match(r"^(\d+)[SH]", fields[SamCol.CIGAR])
+                origin = int(fields[SamCol.POS]) - (int(lead.group(1)) if lead else 0)
+                prim[fields[SamCol.QNAME]] = (fields[SamCol.RNAME], origin, strand, int(fields[SamCol.MAPQ]))
         return prim, dup_primary, seq_bad, nm_bad
 
-    def score(prim, tr=None):
+    def score(prim, truth_rows=None):
         """Sensitivity and high-MAPQ errors of primary placements prim against truth tr."""
-        correct = wrong = unmapped = hq = hq_wrong = 0
-        tr = err_truth if tr is None else tr
-        for name, (_, tref, tpos, tstrand, tspan) in tr.items():
-            m = prim.get(name)
-            if m is None:
+        correct = wrong = unmapped = hq_total = hq_wrong = 0
+        truth_rows = err_truth if truth_rows is None else truth_rows
+        for name, (_, tref, tpos, tstrand, tspan) in truth_rows.items():
+            placement = prim.get(name)
+            if placement is None:
                 unmapped += 1
                 continue
-            ok = (
-                m[0] == tref
-                and m[2] == tstrand
-                and abs(m[1] - (tpos + 1)) <= max(10, tspan // 10)
+            place_ref, place_origin, place_strand, place_mapq = placement
+            correct_place = (
+                place_ref == tref
+                and place_strand == tstrand
+                and abs(place_origin - (tpos + 1)) <= max(MIN_ORIGIN_TOL, tspan // ORIGIN_TOL_DIV)
             )
-            if not ok:
+            if not correct_place:
                 # An equally good repeat copy is not an error.
-                win = ref_seqs[m[0]][m[1] - 1 : m[1] - 1 + tspan]
-                tw = ref_seqs[tref][tpos : tpos + tspan]
-                ok = win == tw
-            correct += ok
-            wrong += not ok
-            if m[3] >= HIGH_MAPQ:
-                hq += 1
-                hq_wrong += not ok
-        n = max(1, len(tr))
+                win = ref_seqs[place_ref][place_origin - 1 : place_origin - 1 + tspan]
+                truth_window = ref_seqs[tref][tpos : tpos + tspan]
+                correct_place = win == truth_window
+            correct += correct_place
+            wrong += not correct_place
+            if place_mapq >= HIGH_MAPQ:
+                hq_total += 1
+                hq_wrong += not correct_place
+        total = max(1, len(truth_rows))
         return {
-            "sensitivity": round(correct / n, 5),
+            "sensitivity": round(correct / total, 5),
             "correct": correct,
             "wrong": wrong,
             "unmapped": unmapped,
-            "mapq30_n": hq,
+            "mapq30_n": hq_total,
             "mapq30_wrong": hq_wrong,
         }
 
-    err_seqs = {n: s for n, s in read_fasta(err_reads)}
+    err_seqs = {name: seq for name, seq in read_fasta(err_reads)}
     # The error-free set's records get the same spec audit, because its placement check above looks only at positions.
-    sim_seqs = {n: s for n, s in read_fasta(sim_reads)}
+    sim_seqs = {name: seq for name, seq in read_fasta(sim_reads)}
     _, sdup, sseq, snm = audit_sam(sam0, sim_seqs)
     checks["sim_reads_records_valid"] = {
         "pass": sdup == 0 and sseq == 0 and snm == 0,
@@ -1198,7 +1229,8 @@ def suite_map(args):
     checks["err_reads_seq_orientation"] = {"pass": oseq == 0, "mismatches": oseq}
     checks["err_reads_nm_matches_cigar"] = {"pass": onm == 0, "nm_mismatches": onm}
     checks["err_reads_mapq_calibration"] = {
-        "pass": osc["mapq30_wrong"] <= max(1, osc["mapq30_n"] // 100),
+        # max(1, ...) allows one wrong placement on small runs, where 1% would round to zero.
+        "pass": osc["mapq30_wrong"] <= max(1, osc["mapq30_n"] // HQ_WRONG_DIV),
         "mapq30_n": osc["mapq30_n"],
         "mapq30_wrong": osc["mapq30_wrong"],
         "correct": osc["correct"],
@@ -1208,9 +1240,9 @@ def suite_map(args):
     # MAPQ must also be informative.
     # On the error-free set, unique correct placements must reach MAPQ >= 30, since an all-zero MAPQ would satisfy the calibration bound above trivially.
     sim_prim, _, _, _ = audit_sam(sam0, sim_seqs)
-    ssc = score(sim_prim, {t[0]: t for t in truth})
+    ssc = score(sim_prim, {row[0]: row for row in truth})
     checks["mapq_informative"] = {
-        "pass": ssc["mapq30_n"] >= 0.9 * ssc["correct"]
+        "pass": ssc["mapq30_n"] >= MIN_HQ_SHARE * ssc["correct"]
         and ssc["mapq30_wrong"] == 0
         and ssc["correct"] > 0,
         "error_free_correct": ssc["correct"],
@@ -1223,7 +1255,7 @@ def suite_map(args):
     if minimap2.available:
         mm_err = keep / "mm2_err.sam"
         with open(mm_err, "wb") as _fh:
-            _, dt = timed(
+            _, elapsed = timed(
                 run,
                 [
                     str(minimap2.path),
@@ -1236,14 +1268,14 @@ def suite_map(args):
                 ],
                 stdout=_fh,
                 stderr=subprocess.DEVNULL,
-                timeout=3600,
+                timeout=TOOL_TIMEOUT_S,
             )
-        speed["error_short"]["minimap2"] = round(dt, 3)
+        speed["error_short"]["minimap2"] = round(elapsed, 3)
         mprim, _, _, _ = audit_sam(mm_err)
         sens["minimap2"] = score(mprim)
         # minimap2 writes a record for every read, unmapped ones included.
         # Fewer records point to a crashed or truncated baseline, which would make "optik >= minimap2" vacuous.
-        mm_missing = sum(1 for n in err_truth if n not in mprim)
+        mm_missing = sum(1 for name in err_truth if name not in mprim)
         checks["err_reads_sensitivity_vs_minimap2"] = {
             "pass": (
                 osc["sensitivity"] >= sens["minimap2"]["sensitivity"] - args.sens_tol
@@ -1260,7 +1292,7 @@ def suite_map(args):
     # Part 2b, long reads on the chaining path (ONT-like, 0.5-30 kb, about 7% error)
     lr_reads = keep / "sim_long.fa"
     lr_truth_tsv = keep / "sim_long.truth.tsv"
-    p = run(
+    proc = run(
         [
             sys.executable,
             str(greads),
@@ -1273,7 +1305,8 @@ def suite_map(args):
             "--len-sd",
             "0.6",
             "-s",
-            str(args.seed + 2),
+            # LONG_READ_SEED_OFFSET gives the long reads positions unrelated to the short-read sets.
+            str(args.seed + LONG_READ_SEED_OFFSET),
             "-e",
             "0.03",
             "--ins",
@@ -1285,104 +1318,109 @@ def suite_map(args):
             "--gt",
             str(lr_truth_tsv),
         ],
-        timeout=1200,
+        timeout=SIMULATE_TIMEOUT_S,
     )
-    lr_truth = {t[0]: t for t in parse_truth_tsv(lr_truth_tsv)}
+    lr_truth = {row[0]: row for row in parse_truth_tsv(lr_truth_tsv)}
 
     def long_audit(path):
         """Primary placements of a long-read SAM and its duplicate, NM and SEQ-length violations."""
         prim, dup, nm_bad, len_bad = {}, 0, 0, 0
         seen = set()
-        with open(path) as fh:
-            for line in fh:
+        with open(path) as handle:
+            for line in handle:
                 if line.startswith("@"):
                     continue
-                t = line.rstrip("\n").split("\t")
-                flag = int(t[1])
-                seen.add(t[0])
-                if flag & SAM_FLAG_UNMAPPED:
-                    prim.setdefault(t[0], None)
+                fields = line.rstrip("\n").split("\t")
+                flag = int(fields[SamCol.FLAG])
+                seen.add(fields[SamCol.QNAME])
+                if flag & SamFlag.UNMAPPED:
+                    prim.setdefault(fields[SamCol.QNAME], None)
                     continue
-                ops = re.findall(r"(\d+)([MIDNSHP=X])", t[5])
-                hard = any(o == "H" for _, o in ops) or t[9] == "*"
+                ops = re.findall(r"(\d+)([MIDNSHP=X])", fields[SamCol.CIGAR])
+                # A hard-clipped record holds only part of the read, so its SEQ length and NM cannot be checked against the whole sequence.
+                hard = any(cigar_op == "H" for _, cigar_op in ops) or fields[SamCol.SEQ] == "*"
                 if not hard:
-                    if sum(int(a) for a, o in ops if o in "MIS=X") != len(t[9]):
+                    if sum(int(op_len) for op_len, cigar_op in ops if cigar_op in "MIS=X") != len(fields[SamCol.SEQ]):
                         len_bad += 1
-                    nm = next(
-                        (int(x[5:]) for x in t[11:] if x.startswith("NM:i:")), None
+                    nm_tag = next(
+                        (int(tag[SAM_TAG_PREFIX_LEN:]) for tag in fields[SamCol.TAGS:] if tag.startswith("NM:i:")), None
                     )
                     if (
-                        nm is not None
+                        nm_tag is not None
                         and sam_nm_from_cigar(
-                            t[9], t[5], ref_seqs[t[2]], int(t[3]), "+"
+                            fields[SamCol.SEQ], fields[SamCol.CIGAR], ref_seqs[fields[SamCol.RNAME]], int(fields[SamCol.POS]), "+"
                         )
-                        != nm
+                        != nm_tag
                     ):
                         nm_bad += 1
-                if flag & SAM_FLAGS_SECONDARY_SUPPLEMENTARY:
+                if flag & SamFlag.SECONDARY_SUPPLEMENTARY:
                     continue
-                if prim.get(t[0]):
+                # A second primary for the same read breaks the SAM rule of exactly one primary per read.
+                if prim.get(fields[SamCol.QNAME]):
                     dup += 1
-                rs = int(t[3]) - 1
-                re_ = rs + sum(int(a) for a, o in ops if o in "MDN=X")
-                prim[t[0]] = (
-                    t[2],
-                    rs,
-                    re_,
-                    "-" if flag & SAM_FLAG_REVERSE else "+",
-                    int(t[4]),
+                ref_start = int(fields[SamCol.POS]) - 1
+                ref_end = ref_start + sum(int(op_len) for op_len, cigar_op in ops if cigar_op in "MDN=X")
+                prim[fields[SamCol.QNAME]] = (
+                    fields[SamCol.RNAME],
+                    ref_start,
+                    ref_end,
+                    "-" if flag & SamFlag.REVERSE else "+",
+                    int(fields[SamCol.MAPQ]),
                 )
-        good = hq = hq_wrong = 0
+        # A long read is placed correctly when it lands on the true contig and strand and covers at least MIN_LONG_OVERLAP of its true span.
+        good = hq_total = hq_wrong = 0
         for name, (_, tref, tpos, tstrand, tspan) in lr_truth.items():
-            m = prim.get(name)
-            if not m:
+            placement = prim.get(name)
+            if not placement:
                 continue
-            ok = (
-                m[0] == tref
-                and m[3] == tstrand
-                and min(m[2], tpos + tspan) - max(m[1], tpos) >= 0.5 * tspan
+            place_ref, place_start, place_end, place_strand, place_mapq = placement
+            correct_place = (
+                place_ref == tref
+                and place_strand == tstrand
+                and min(place_end, tpos + tspan) - max(place_start, tpos) >= MIN_LONG_OVERLAP * tspan
             )
-            good += ok
-            if m[4] >= HIGH_MAPQ:
-                hq += 1
-                hq_wrong += not ok
-        n = max(1, len(lr_truth))
+            good += correct_place
+            if place_mapq >= HIGH_MAPQ:
+                hq_total += 1
+                hq_wrong += not correct_place
+        total = max(1, len(lr_truth))
         return {
-            "sensitivity": round(good / n, 5),
+            "sensitivity": round(good / total, 5),
             "correct": good,
-            "reads_without_record": sum(1 for x in lr_truth if x not in seen),
+            "reads_without_record": sum(1 for name in lr_truth if name not in seen),
             "duplicate_primary": dup,
             "nm_mismatches": nm_bad,
             "cigar_len_mismatches": len_bad,
-            "mapq30_n": hq,
+            "mapq30_n": hq_total,
             "mapq30_wrong": hq_wrong,
         }
 
     lr_sam = keep / "sim_long_optik.sam"
-    p, dt = timed(run_optik_map, lr_reads, lr_sam, args.threads, "map-ont")
-    speed.setdefault("long", {})["optik"] = round(dt, 3)
-    la = long_audit(lr_sam)
+    proc, elapsed = timed(run_optik_map, lr_reads, lr_sam, args.threads, "map-ont")
+    speed.setdefault("long", {})["optik"] = round(elapsed, 3)
+    long_res = long_audit(lr_sam)
     checks["long_reads_valid_sam"] = {
-        "pass": p.returncode == 0
-        and la["duplicate_primary"] == 0
-        and la["nm_mismatches"] == 0
-        and la["cigar_len_mismatches"] == 0
-        and la["reads_without_record"] == 0,
-        **la,
+        "pass": proc.returncode == 0
+        and long_res["duplicate_primary"] == 0
+        and long_res["nm_mismatches"] == 0
+        and long_res["cigar_len_mismatches"] == 0
+        and long_res["reads_without_record"] == 0,
+        **long_res,
     }
+    # MAPQ must be trustworthy and also useful, so few confident placements may be wrong while at least half the correct ones must be confident.
     checks["long_reads_mapq_calibration"] = {
         "pass": (
-            la["mapq30_wrong"] <= max(1, la["mapq30_n"] // 100)
-            and la["mapq30_n"] >= la["correct"] // 2
+            long_res["mapq30_wrong"] <= max(1, long_res["mapq30_n"] // HQ_WRONG_DIV)
+            and long_res["mapq30_n"] >= long_res["correct"] // MIN_CONFIDENT_SHARE_DEN
         ),
-        "mapq30_n": la["mapq30_n"],
-        "mapq30_wrong": la["mapq30_wrong"],
-        "correct": la["correct"],
+        "mapq30_n": long_res["mapq30_n"],
+        "mapq30_wrong": long_res["mapq30_wrong"],
+        "correct": long_res["correct"],
     }
     if minimap2.available:
         mm_lr = keep / "mm2_long.sam"
         with open(mm_lr, "wb") as _fh:
-            _, dt = timed(
+            _, elapsed = timed(
                 run,
                 [
                     str(minimap2.path),
@@ -1395,28 +1433,28 @@ def suite_map(args):
                 ],
                 stdout=_fh,
                 stderr=subprocess.DEVNULL,
-                timeout=3600,
+                timeout=TOOL_TIMEOUT_S,
             )
-        speed["long"]["minimap2"] = round(dt, 3)
+        speed["long"]["minimap2"] = round(elapsed, 3)
         mla = long_audit(mm_lr)
         checks["long_reads_sensitivity_vs_minimap2"] = {
             "pass": (
-                la["sensitivity"] >= mla["sensitivity"] - args.sens_tol
+                long_res["sensitivity"] >= mla["sensitivity"] - args.sens_tol
                 and mla["reads_without_record"] == 0
             ),
             "minimap2_reads_without_record": mla["reads_without_record"],
-            "optik": la["sensitivity"],
+            "optik": long_res["sensitivity"],
             "minimap2": mla["sensitivity"],
             "tolerance": args.sens_tol,
         }
 
     # Part 3, determinism across thread counts
     sam_t = keep / "sim_optik_t1.sam"
-    p = run_optik_map(sim_reads, sam_t, 1)
-    with open(sam_t) as _f:
-        a_body = [line for line in _f if not line.startswith("@")]
-    with open(sam0) as _f:
-        b_body = [line for line in _f if not line.startswith("@")]
+    proc = run_optik_map(sim_reads, sam_t, 1)
+    with open(sam_t) as handle:
+        a_body = [line for line in handle if not line.startswith("@")]
+    with open(sam0) as handle:
+        b_body = [line for line in handle if not line.startswith("@")]
     checks["map_determinism_t1_vs_tN"] = {
         "pass": a_body == b_body,
         "note": "SAM alignment body must be byte-identical across thread counts",
@@ -1426,7 +1464,7 @@ def suite_map(args):
     if minimap2.available:
         mm2_sam = keep / "mm2_sim.sam"
         with open(mm2_sam, "wb") as _fh:
-            p, dt = timed(
+            proc, elapsed = timed(
                 run,
                 [
                     str(minimap2.path),
@@ -1439,28 +1477,28 @@ def suite_map(args):
                 ],
                 stdout=_fh,
                 stderr=subprocess.DEVNULL,
-                timeout=3600,
+                timeout=TOOL_TIMEOUT_S,
             )
-        speed["error_free_short"]["minimap2"] = round(dt, 3)
+        speed["error_free_short"]["minimap2"] = round(elapsed, 3)
         mmaps = parse_sam_maps(mm2_sam)
-        reads_seq = {n: s for n, s in read_fasta(sim_reads)}
+        reads_seq = {name: seq for name, seq in read_fasta(sim_reads)}
         agree = disagree = both_fail = 0
 
-        def content_ok(mp, tlen, read):
+        def content_ok(mapping, tlen, read):
             """True when mapping mp places the read on reference text that spells it, on either strand."""
-            if mp.get("unmapped", False):
+            if mapping.get("unmapped", False):
                 return False
-            win = ref_seqs[mp["ref"]][mp["pos"] - 1 : mp["pos"] - 1 + tlen]
-            return win == read or rc(win) == read
+            win = ref_seqs[mapping["ref"]][mapping["pos"] - 1 : mapping["pos"] - 1 + tlen]
+            return win == read or revcomp(win) == read
 
         for tname, _tref, _tpos, _tstrand, tlen in truth:
-            m = maps.get(tname)
-            mm = mmaps.get(tname)
+            optik_map = maps.get(tname)
+            mm_map = mmaps.get(tname)
             read = reads_seq.get(tname)
-            if not m or not mm or read is None:
+            if not optik_map or not mm_map or read is None:
                 continue
-            mok = content_ok(m, tlen, read)
-            nok = content_ok(mm, tlen, read)
+            mok = content_ok(optik_map, tlen, read)
+            nok = content_ok(mm_map, tlen, read)
             # A different placement is acceptable when it matches the reference content exactly, in either orientation.
             # Legitimate multi-mappers and palindromic or inverted-repeat ties then count as equal rather than as errors.
             if mok and nok:
@@ -1492,17 +1530,18 @@ def suite_map(args):
                     ],
                     stdout=_fh,
                     stderr=subprocess.DEVNULL,
-                    timeout=3600,
+                    timeout=TOOL_TIMEOUT_S,
                 )
             mmr = parse_sam_maps(mm2_sam_r)
             samr = keep / "optik_real.sam"
             run_optik_map(args.queries, samr, args.threads)
-            mr = parse_sam_maps(samr)
+            optik_real_maps = parse_sam_maps(samr)
+            # Real reads have no truth, so the check is that both mappers place the same reads.
             agg = Counter()
-            for rn in set(mmr) | set(mr):
-                o = not mr.get(rn, {}).get("unmapped", False)
-                mm = not mmr.get(rn, {}).get("unmapped", False)
-                agg[(o, mm)] += 1
+            for read_name in set(mmr) | set(optik_real_maps):
+                optik_mapped = not optik_real_maps.get(read_name, {}).get("unmapped", False)
+                mm_mapped = not mmr.get(read_name, {}).get("unmapped", False)
+                agg[(optik_mapped, mm_mapped)] += 1
             checks["real_reads_map_parity"] = {
                 "pass": agg.get((False, True), 0) == 0
                 and agg.get((True, False), 0) == 0,
@@ -1515,46 +1554,46 @@ def suite_map(args):
     # Part 4b, the wavefront mapper (wfmash) on the same three read sets The same auditors as for optik and minimap2 score it (one primary per read, origin within tolerance, strand, MAPQ >= 30 calibration).
     # optik must be at least as sensitive as the better wfmash configuration.
     if wfmash.available:
-        sim_truth_d = {t[0]: t for t in truth}
+        sim_truth_d = {row[0]: row for row in truth}
         optik_sens = {
             "error_free_short": score(audit_sam(sam0)[0], sim_truth_d),
             "error_short": osc,
-            "long": {"sensitivity": la["sensitivity"]},
+            "long": {"sensitivity": long_res["sensitivity"]},
         }
         legs = (
             ("error_free_short", sim_reads, "short", sim_truth_d),
             ("error_short", err_reads, "short", err_truth),
             ("long", lr_reads, "long", None),
         )
-        for leg, reads, kind, tr in legs:
+        for leg, reads, kind, leg_truth in legs:
             res = {}
             for cfg, opts in (("defaults", []), ("read_opts", WFMASH_READ_OPTS[kind])):
                 out = keep / f"wfmash_{leg}_{cfg}.sam"
-                dt, rc_, split = run_wfmash(wfmash, ref, reads, out, args.threads, opts)
+                elapsed, rc_, split = run_wfmash(wfmash, ref, reads, out, args.threads, opts)
                 if rc_ != 0:
-                    res[cfg] = {"error": f"wfmash exit {rc_}", "seconds": round(dt, 3)}
+                    res[cfg] = {"error": f"wfmash exit {rc_}", "seconds": round(elapsed, 3)}
                     continue
                 if kind == "long":
-                    r = long_audit(out)
-                    r = {
-                        "sensitivity": r["sensitivity"],
-                        "mapq30_n": r["mapq30_n"],
-                        "mapq30_wrong": r["mapq30_wrong"],
+                    leg_res = long_audit(out)
+                    leg_res = {
+                        "sensitivity": leg_res["sensitivity"],
+                        "mapq30_n": leg_res["mapq30_n"],
+                        "mapq30_wrong": leg_res["mapq30_wrong"],
                     }
                 else:
-                    r = score(audit_sam(out)[0], tr)
-                r.update(
+                    leg_res = score(audit_sam(out)[0], leg_truth)
+                leg_res.update(
                     {
-                        "seconds": round(dt, 3),
+                        "seconds": round(elapsed, 3),
                         "reads_split_into_segments": split,
                         "cmd": " ".join(["wfmash", "REF", "READS", "-a", *opts]),
                     }
                 )
-                res[cfg] = r
-                speed[leg][f"wfmash_{cfg}"] = round(dt, 3)
-            best = max((v.get("sensitivity", 0) for v in res.values()), default=0)
+                res[cfg] = leg_res
+                speed[leg][f"wfmash_{cfg}"] = round(elapsed, 3)
+            best = max((result.get("sensitivity", 0) for result in res.values()), default=0)
             # A baseline that crashed or failed is no comparison, since it would score 0.
-            broken = {c: v["error"] for c, v in res.items() if "error" in v}
+            broken = {cfg: result["error"] for cfg, result in res.items() if "error" in result}
             checks[f"{leg}_sensitivity_vs_wfmash"] = {
                 "pass": optik_sens[leg]["sensitivity"] >= best - args.sens_tol
                 and not broken,
@@ -1572,24 +1611,24 @@ def suite_map(args):
     # Part 5, samtools round trip
     if samtools.available:
         bam = keep / "sim_optik.bam"
-        p = run(
-            [str(samtools.path), "view", "-b", "-o", str(bam), str(sam0)], timeout=3600
+        proc = run(
+            [str(samtools.path), "view", "-b", "-o", str(bam), str(sam0)], timeout=TOOL_TIMEOUT_S
         )
-        checks["samtools_view_bam"] = {"pass": p.returncode == 0}
+        checks["samtools_view_bam"] = {"pass": proc.returncode == 0}
         back = keep / "roundtrip.sam"
         with open(back, "wb") as _fh:
-            p = run([str(samtools.path), "view", str(bam)], stdout=_fh, timeout=3600)
-        checks["samtools_view_back"] = {"pass": p.returncode == 0}
-        with open(sam0) as _f:
-            a2 = [line for line in _f if not line.startswith("@")]
-        with open(back) as _f:
-            b2 = [line for line in _f if not line.startswith("@")]
-        checks["samtools_roundtrip_same_body"] = {"pass": a2 == b2, "n_ali": len(a2)}
-        p = run([str(samtools.path), "flagstat", str(bam)], timeout=3600)
-        fs = p.stdout.decode()
+            proc = run([str(samtools.path), "view", str(bam)], stdout=_fh, timeout=TOOL_TIMEOUT_S)
+        checks["samtools_view_back"] = {"pass": proc.returncode == 0}
+        with open(sam0) as handle:
+            orig_body = [line for line in handle if not line.startswith("@")]
+        with open(back) as handle:
+            back_body = [line for line in handle if not line.startswith("@")]
+        checks["samtools_roundtrip_same_body"] = {"pass": orig_body == back_body, "n_ali": len(orig_body)}
+        proc = run([str(samtools.path), "flagstat", str(bam)], timeout=TOOL_TIMEOUT_S)
+        flagstat_text = proc.stdout.decode()
         checks["samtools_flagstat"] = {
-            "pass": p.returncode == 0 and "mapped (" in fs,
-            "summary": fs.splitlines()[0] if fs else "",
+            "pass": proc.returncode == 0 and "mapped (" in flagstat_text,
+            "summary": flagstat_text.splitlines()[0] if flagstat_text else "",
         }
 
     return checks
@@ -1600,20 +1639,20 @@ def suite_map(args):
 
 def base_parser():
     """Parent parser with the tool-path and shared options of every suite."""
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--optik", default=None)
-    ap.add_argument("--sshash", default=None)
-    ap.add_argument("--kmc", default=None)
-    ap.add_argument("--bifrost", default=None)
-    ap.add_argument("--cuttlefish", default=None)
-    ap.add_argument("--minimap2", default=None)
-    ap.add_argument("--samtools", default=None)
-    ap.add_argument("--wfmash", default=None)
-    ap.add_argument("-k", type=int, default=31)
-    ap.add_argument("-t", "--threads", type=int, default=4)
-    ap.add_argument("--workdir", default=None)
-    ap.add_argument("-s", "--seed", type=int, default=42)
-    return ap
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--optik", default=None)
+    parser.add_argument("--sshash", default=None)
+    parser.add_argument("--kmc", default=None)
+    parser.add_argument("--bifrost", default=None)
+    parser.add_argument("--cuttlefish", default=None)
+    parser.add_argument("--minimap2", default=None)
+    parser.add_argument("--samtools", default=None)
+    parser.add_argument("--wfmash", default=None)
+    parser.add_argument("-k", type=int, default=DEFAULT_K)
+    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS)
+    parser.add_argument("--workdir", default=None)
+    parser.add_argument("-s", "--seed", type=int, default=DEFAULT_SEED)
+    return parser
 
 
 def print_report(checks):
@@ -1625,8 +1664,8 @@ def print_report(checks):
     ]
     print(json.dumps(checks, indent=2, default=str))
     print("\nRESULT:", "FAIL" if fails else "PASS", file=sys.stderr)
-    for f in fails:
-        print(f"  FAILED: {f} -> {checks[f]}", file=sys.stderr)
+    for failure in fails:
+        print(f"  FAILED: {failure} -> {checks[failure]}", file=sys.stderr)
     return 0 if not fails else 1
 
 
@@ -1637,48 +1676,48 @@ def main():
     )
     sub = parser.add_subparsers(dest="suite", required=True)
 
-    q = sub.add_parser("query", parents=[base_parser()])
-    q.add_argument("-r", "--ref", required=True)
-    q.add_argument("--queries", default=None)
-    q.add_argument("--probes", type=int, default=2000)
-    q.add_argument("--sshash-m", type=int, default=15)
+    query_parser = sub.add_parser("query", parents=[base_parser()])
+    query_parser.add_argument("-r", "--ref", required=True)
+    query_parser.add_argument("--queries", default=None)
+    query_parser.add_argument("--probes", type=int, default=DEFAULT_PROBES)
+    query_parser.add_argument("--sshash-m", type=int, default=DEFAULT_SSHASH_M)
 
-    d = sub.add_parser("dbg", parents=[base_parser()])
-    d.add_argument("-i", "--input", required=True)
-    d.add_argument("--min-count", type=int, default=1)
+    dbg_parser = sub.add_parser("dbg", parents=[base_parser()])
+    dbg_parser.add_argument("-i", "--input", required=True)
+    dbg_parser.add_argument("--min-count", type=int, default=1)
 
-    m = sub.add_parser("map", parents=[base_parser()])
-    m.add_argument("-r", "--ref", required=True)
-    m.add_argument("--queries", default=None)
-    m.add_argument("-n", type=int, default=5000)
-    m.add_argument("--read-len", type=int, default=150)
-    m.add_argument(
+    map_parser = sub.add_parser("map", parents=[base_parser()])
+    map_parser.add_argument("-r", "--ref", required=True)
+    map_parser.add_argument("--queries", default=None)
+    map_parser.add_argument("-n", type=int, default=DEFAULT_NUM_READS)
+    map_parser.add_argument("--read-len", type=int, default=DEFAULT_READ_LEN)
+    map_parser.add_argument(
         "--n-long",
         type=int,
-        default=1000,
+        default=DEFAULT_LONG_READS,
         help="simulated long reads for the chaining-path checks",
     )
     # optik runs with its own defaults, as minimap2 runs its documented preset.
     # These options override them only when given explicitly.
-    m.add_argument("--map-k", type=int, default=None)
-    m.add_argument("-w", type=int, default=None)
-    m.add_argument("-e", type=int, default=None)
-    m.add_argument(
+    map_parser.add_argument("--map-k", type=int, default=None)
+    map_parser.add_argument("-w", type=int, default=None)
+    map_parser.add_argument("-e", type=int, default=None)
+    map_parser.add_argument(
         "--err-rate",
         type=float,
-        default=0.01,
+        default=DEFAULT_ERR_RATE,
         help="per-base substitution rate of the error-read set",
     )
-    m.add_argument(
+    map_parser.add_argument(
         "--indel-rate",
         type=float,
-        default=0.002,
+        default=DEFAULT_INDEL_RATE,
         help="per-base insertion (and deletion) rate",
     )
-    m.add_argument(
+    map_parser.add_argument(
         "--sens-tol",
         type=float,
-        default=0.005,
+        default=DEFAULT_SENS_TOL,
         help="allowed sensitivity deficit vs minimap2",
     )
 
@@ -1727,9 +1766,9 @@ def main():
                 Path(shutil.which("samtools") or ""),
             ],
         }
-        for c in candidates.get(name, []):
-            if c and c.is_file():
-                return c
+        for candidate in candidates.get(name, []):
+            if candidate and candidate.is_file():
+                return candidate
         return Path(defaults[name])
 
     for name in defaults:

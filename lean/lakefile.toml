@@ -1,0 +1,16 @@
+name = "OptikProofs"
+version = "0.1.0"
+defaultTargets = ["OptikProofs"]
+
+# Mathlib's v4.33.0 tag is built for Lean v4.33.0, the version pixi.toml installs.
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "v4.33.0"
+
+[[lean_lib]]
+name = "OptikProofs"
+
+[[lean_exe]]
+name = "optik-vectors"
+root = "Vectors.Main"

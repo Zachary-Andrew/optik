@@ -19,96 +19,96 @@ static int g_fail = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++g_fail; std::printf("FAIL %s:%d ", __FILE__, __LINE__); \
     std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
 
-static std::vector<std::string> read_fa(const char* p) {
-    std::vector<std::string> v; std::ifstream f(p); std::string l;
-    while (std::getline(f, l)) { if (l.empty()) continue; if (l[0] == '>') v.emplace_back(); else if (!v.empty()) v.back() += l; }
-    return v;
+static std::vector<std::string> read_fa(const char* path) {
+    std::vector<std::string> seqs; std::ifstream file(path); std::string line;
+    while (std::getline(file, line)) { if (line.empty()) continue; if (line[0] == '>') seqs.emplace_back(); else if (!seqs.empty()) seqs.back() += line; }
+    return seqs;
 }
 
-static void check(const std::vector<std::string>& seqs, unsigned k, unsigned m,
+static void check(const std::vector<std::string>& seqs, unsigned kmer_len, unsigned minimizer_len,
                   std::mt19937_64& rng, bool verbose) {
     SpssCore idx;
-    auto t0 = std::chrono::steady_clock::now();
-    if (!idx.build(seqs, k, m)) { CHECK(false, "build failed k=%u m=%u", k, m); return; }
-    double bt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    auto start = std::chrono::steady_clock::now();
+    if (!idx.build(seqs, kmer_len, minimizer_len)) { CHECK(false, "build failed k=%u m=%u", kmer_len, minimizer_len); return; }
+    double build_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::unordered_set<uint64_t> truth;           // canonical k-mers
-    std::vector<uint64_t> fw;                     // forward k-mers in order
-    for (const auto& s : seqs) {
-        uint64_t f = 0; std::size_t v = 0;
-        for (char ch : s) {
-            uint8_t b = base_encode(ch);
-            if (b == 0xFF) { v = 0; f = 0; continue; }
-            f = ((f << 2) | b) & kmer_mask(k);
-            if (++v >= k) { fw.push_back(f); truth.insert(std::min(f, SpssCore::rc(f, k))); }
+    std::vector<uint64_t> fwd_kmers;                     // forward k-mers in order
+    for (const auto& seq : seqs) {
+        uint64_t fwd = 0; std::size_t run_len = 0;
+        for (char base_char : seq) {
+            uint8_t base = base_encode(base_char);
+            if (base == 0xFF) { run_len = 0; fwd = 0; continue; }
+            fwd = ((fwd << 2) | base) & kmer_mask(kmer_len);
+            if (++run_len >= kmer_len) { fwd_kmers.push_back(fwd); truth.insert(std::min(fwd, SpssCore::revcomp_packed(fwd, kmer_len))); }
         }
     }
-    std::size_t fn = 0, fp = 0;
-    t0 = std::chrono::steady_clock::now();
-    for (uint64_t f : fw) { fn += !idx.contains(f); fn += !idx.contains(SpssCore::rc(f, k)); }
-    double lt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::size_t false_neg = 0, false_pos = 0;
+    start = std::chrono::steady_clock::now();
+    for (uint64_t kmer : fwd_kmers) { false_neg += !idx.contains(kmer); false_neg += !idx.contains(SpssCore::revcomp_packed(kmer, kmer_len)); }
+    double lookup_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::size_t neg = 0, tries = 0;
     // A tiny k can have (almost) every k-mer present, so the attempts are bounded.
-    while (neg < std::max<std::size_t>(fw.size(), 1000) && ++tries < 50 * (fw.size() + 1000)) {
-        uint64_t y = rng() & kmer_mask(k);
-        if (truth.count(std::min(y, SpssCore::rc(y, k)))) continue;
-        fp += idx.contains(y); ++neg;
+    while (neg < std::max<std::size_t>(fwd_kmers.size(), 1000) && ++tries < 50 * (fwd_kmers.size() + 1000)) {
+        uint64_t kmer = rng() & kmer_mask(kmer_len);
+        if (truth.count(std::min(kmer, SpssCore::revcomp_packed(kmer, kmer_len)))) continue;
+        false_pos += idx.contains(kmer); ++neg;
     }
     // streaming scan vs per-k-mer lookups on the sequences and their rc
     std::size_t scan_bad = 0;
     for (std::size_t i = 0; i < seqs.size() && i < 2000; ++i) {
         for (int o = 0; o < 2; ++o) {
-            std::string s = seqs[i];
-            if (o) { std::reverse(s.begin(), s.end()); for (auto& c : s) c = c=='A'?'T':c=='C'?'G':c=='G'?'C':c=='T'?'A':c; }
-            SpssCore::ScanStats st; idx.scan(s.data(), s.size(), st);
-            if (st.positive != st.valid) ++scan_bad;
+            std::string seq = seqs[i];
+            if (o) { std::reverse(seq.begin(), seq.end()); for (auto& ch : seq) ch = ch=='A'?'T':ch=='C'?'G':ch=='G'?'C':ch=='T'?'A':ch; }
+            SpssCore::ScanStats stats; idx.scan(seq.data(), seq.size(), stats);
+            if (stats.positive != stats.valid) ++scan_bad;
         }
     }
     // Mixed scans, where mutated copies must count exactly the oracle positives, one record at a time and all at once through the pipelined scan_many
     std::vector<std::string> muts;
     SpssCore::ScanStats sum_one;
     for (std::size_t i = 0; i < seqs.size() && i < 500; ++i) {
-        std::string s = seqs[i];
-        for (auto& c : s) if (rng() % 20 == 0) c = "ACGTN"[rng() % 5];
-        if (rng() & 1) { std::reverse(s.begin(), s.end()); for (auto& c : s) c = c=='A'?'T':c=='C'?'G':c=='G'?'C':c=='T'?'A':c; }
-        uint64_t f = 0, want = 0, nv = 0; std::size_t v = 0;
-        for (char ch : s) {
-            uint8_t b = base_encode(ch);
-            if (b == 0xFF) { v = 0; f = 0; continue; }
-            f = ((f << 2) | b) & kmer_mask(k);
-            if (++v >= k) { ++nv; want += truth.count(std::min(f, SpssCore::rc(f, k))) != 0; }
+        std::string seq = seqs[i];
+        for (auto& ch : seq) if (rng() % 20 == 0) ch = "ACGTN"[rng() % 5];
+        if (rng() & 1) { std::reverse(seq.begin(), seq.end()); for (auto& ch : seq) ch = ch=='A'?'T':ch=='C'?'G':ch=='G'?'C':ch=='T'?'A':ch; }
+        uint64_t fwd = 0, want = 0, num_valid = 0; std::size_t run_len = 0;
+        for (char base_char : seq) {
+            uint8_t base = base_encode(base_char);
+            if (base == 0xFF) { run_len = 0; fwd = 0; continue; }
+            fwd = ((fwd << 2) | base) & kmer_mask(kmer_len);
+            if (++run_len >= kmer_len) { ++num_valid; want += truth.count(std::min(fwd, SpssCore::revcomp_packed(fwd, kmer_len))) != 0; }
         }
-        SpssCore::ScanStats st; idx.scan(s.data(), s.size(), st);
-        if (st.positive != want || st.valid != nv) ++scan_bad;
-        SpssCore::ScanStats ref; idx.scan_reference(s.data(), s.size(), ref);
+        SpssCore::ScanStats stats; idx.scan(seq.data(), seq.size(), stats);
+        if (stats.positive != want || stats.valid != num_valid) ++scan_bad;
+        SpssCore::ScanStats ref; idx.scan_reference(seq.data(), seq.size(), ref);
         // records of <= kGroupMaxKmers windows are batch-looked-up with a search per k-mer, and longer ones stream exactly like the reference
-        const bool tiny = s.size() >= k && s.size() - k + 1 <= SpssCore::kGroupMaxKmers;
-        if (ref.positive != want || ref.valid != nv
-            || (!tiny && (ref.searches != st.searches || ref.extensions != st.extensions))) ++scan_bad;
-        sum_one.valid += st.valid; sum_one.positive += st.positive;
-        muts.push_back(s);
+        const bool tiny = seq.size() >= kmer_len && seq.size() - kmer_len + 1 <= SpssCore::kGroupMaxKmers;
+        if (ref.positive != want || ref.valid != num_valid
+            || (!tiny && (ref.searches != stats.searches || ref.extensions != stats.extensions))) ++scan_bad;
+        sum_one.valid += stats.valid; sum_one.positive += stats.positive;
+        muts.push_back(seq);
         if (rng() % 3 == 0) {                               // single k-mer records
-            for (std::size_t o = 0; o + k <= s.size() && o < 5 * k; o += k) muts.push_back(s.substr(o, k));
-            for (std::size_t o = 0; o + k <= s.size() && o < 5 * k; o += k) {
-                SpssCore::ScanStats t; idx.scan(muts[muts.size() - 1].data(), 0, t);
+            for (std::size_t o = 0; o + kmer_len <= seq.size() && o < 5 * kmer_len; o += kmer_len) muts.push_back(seq.substr(o, kmer_len));
+            for (std::size_t o = 0; o + kmer_len <= seq.size() && o < 5 * kmer_len; o += kmer_len) {
+                SpssCore::ScanStats stats_tmp; idx.scan(muts[muts.size() - 1].data(), 0, stats_tmp);
             }
         }
     }
     {
-        std::vector<const char*> ps; std::vector<std::size_t> ls;
+        std::vector<const char*> ptrs; std::vector<std::size_t> lens;
         SpssCore::ScanStats one;
         SpssCore::ScanStats ref;                           // single-cursor reference
-        for (const auto& m2 : muts) {
-            ps.push_back(m2.data()); ls.push_back(m2.size());
-            idx.scan(m2.data(), m2.size(), one);
-            if (m2.size() >= k && m2.size() - k + 1 <= SpssCore::kGroupMaxKmers) {
-                SpssCore::ScanStats t; idx.scan_reference(m2.data(), m2.size(), t);
-                ref.valid += t.valid; ref.positive += t.positive; ref.searches += t.valid;
+        for (const auto& mutated : muts) {
+            ptrs.push_back(mutated.data()); lens.push_back(mutated.size());
+            idx.scan(mutated.data(), mutated.size(), one);
+            if (mutated.size() >= kmer_len && mutated.size() - kmer_len + 1 <= SpssCore::kGroupMaxKmers) {
+                SpssCore::ScanStats ref_one; idx.scan_reference(mutated.data(), mutated.size(), ref_one);
+                ref.valid += ref_one.valid; ref.positive += ref_one.positive; ref.searches += ref_one.valid;
             } else {
-                idx.scan_reference(m2.data(), m2.size(), ref);
+                idx.scan_reference(mutated.data(), mutated.size(), ref);
             }
         }
         // the interleaved lanes (scan_many) and the reference must agree on Every counter gives the same searches, extensions and answers per record.
-        SpssCore::ScanStats all; idx.scan_many(ps.data(), ls.data(), ps.size(), all);
+        SpssCore::ScanStats all; idx.scan_many(ptrs.data(), lens.data(), ptrs.size(), all);
         if (all.valid != one.valid || all.positive != one.positive) ++scan_bad;
         if (all.valid != ref.valid || all.positive != ref.positive
             || all.searches != ref.searches || all.extensions != ref.extensions) ++scan_bad;
@@ -116,97 +116,97 @@ static void check(const std::vector<std::string>& seqs, unsigned k, unsigned m,
     // Dictionary ids lie in [0, n), and access inverts lookup (in the reported orientation), absent k-mers have none, and with distinct input k-mers the ids are exactly {0, ..., n - 1}
     std::size_t dict_bad = 0;
     {
-        const uint64_t n = idx.num_kmers();
+        const uint64_t num_kmers = idx.num_kmers();
         std::unordered_set<uint64_t> ids;
-        for (uint64_t f : fw) {
+        for (uint64_t kmer : fwd_kmers) {
             bool rev = false;
-            const uint64_t id = idx.kmer_id(f, &rev);
-            if (id == SpssCore::kNotFound || id >= n) { ++dict_bad; continue; }
-            const uint64_t got = idx.access(id);
-            if (got != (rev ? SpssCore::rc(f, k) : f)) ++dict_bad;
-            ids.insert(id);
+            const uint64_t kmer_ident = idx.kmer_id(kmer, &rev);
+            if (kmer_ident == SpssCore::kNotFound || kmer_ident >= num_kmers) { ++dict_bad; continue; }
+            const uint64_t got = idx.access(kmer_ident);
+            if (got != (rev ? SpssCore::revcomp_packed(kmer, kmer_len) : kmer)) ++dict_bad;
+            ids.insert(kmer_ident);
         }
-        if (truth.size() == fw.size()) {               // every k-mer distinct
-            if (n != fw.size() || ids.size() != n) ++dict_bad;
-            for (uint64_t i = 0; i < n; ++i) {
-                const uint64_t x = idx.access(i);
-                if (idx.kmer_id(x) != i) { ++dict_bad; break; }
+        if (truth.size() == fwd_kmers.size()) {               // every k-mer distinct
+            if (num_kmers != fwd_kmers.size() || ids.size() != num_kmers) ++dict_bad;
+            for (uint64_t i = 0; i < num_kmers; ++i) {
+                const uint64_t kmer = idx.access(i);
+                if (idx.kmer_id(kmer) != i) { ++dict_bad; break; }
             }
         }
         for (int t = 0; t < 2000; ++t) {
-            const uint64_t y = rng() & kmer_mask(k);
-            if (!truth.count(std::min(y, SpssCore::rc(y, k))) && idx.kmer_id(y) != SpssCore::kNotFound) ++dict_bad;
+            const uint64_t kmer = rng() & kmer_mask(kmer_len);
+            if (!truth.count(std::min(kmer, SpssCore::revcomp_packed(kmer, kmer_len))) && idx.kmer_id(kmer) != SpssCore::kNotFound) ++dict_bad;
         }
     }
     std::vector<uint8_t> blob; idx.save(blob);
-    SpssCore ld; std::size_t used = ld.load(blob.data(), blob.size());
-    std::size_t rt = used != blob.size();
-    for (std::size_t i = 0; i < fw.size(); i += 7) rt += !ld.contains(fw[i]);
+    SpssCore loaded; std::size_t used = loaded.load(blob.data(), blob.size());
+    std::size_t roundtrip_bad = used != blob.size();
+    for (std::size_t i = 0; i < fwd_kmers.size(); i += 7) roundtrip_bad += !loaded.contains(fwd_kmers[i]);
     // A borrowing load, the one query uses on a mapped file, answers the same with every array, the MPHF's and the Elias-Fano starts' included, read in place from the blob.
-    SpssCore lb; rt += lb.load(blob.data(), blob.size(), /*borrow=*/true) != blob.size();
-    for (std::size_t i = 0; i < fw.size(); i += 7) rt += !lb.contains(fw[i]) || lb.kmer_id(fw[i]) != idx.kmer_id(fw[i]);
+    SpssCore borrowed; roundtrip_bad += borrowed.load(blob.data(), blob.size(), /*borrow=*/true) != blob.size();
+    for (std::size_t i = 0; i < fwd_kmers.size(); i += 7) roundtrip_bad += !borrowed.contains(fwd_kmers[i]) || borrowed.kmer_id(fwd_kmers[i]) != idx.kmer_id(fwd_kmers[i]);
     for (int t = 0; t < 500; ++t) {
-        const uint64_t y = rng() & kmer_mask(k);
-        rt += lb.contains(y) != idx.contains(y);
+        const uint64_t kmer = rng() & kmer_mask(kmer_len);
+        roundtrip_bad += borrowed.contains(kmer) != idx.contains(kmer);
     }
-    CHECK(fn == 0 && fp == 0 && scan_bad == 0 && rt == 0 && dict_bad == 0,
-          "k=%u m=%u FN=%zu FP=%zu scan_bad=%zu roundtrip=%zu dict_bad=%zu", k, m, fn, fp, scan_bad, rt, dict_bad);
+    CHECK(false_neg == 0 && false_pos == 0 && scan_bad == 0 && roundtrip_bad == 0 && dict_bad == 0,
+          "k=%u m=%u FN=%zu FP=%zu scan_bad=%zu roundtrip=%zu dict_bad=%zu", kmer_len, minimizer_len, false_neg, false_pos, scan_bad, roundtrip_bad, dict_bad);
     if (verbose) {
-        const auto& S = idx.stats();
+        const auto& stats_ref = idx.stats();
         std::printf("  k=%u m=%u kmers=%lu superkmers=%lu buckets=%lu ovf=%lu bits/kmer=%.2f build=%.2fs lookup=%.1fns FN=%zu FP=%zu\n",
-                    k, m, (unsigned long)S.kmers, (unsigned long)S.superkmers, (unsigned long)S.buckets,
-                    (unsigned long)S.ovf_buckets, idx.bytes() * 8.0 / S.kmers, bt, lt * 1e9 / (2 * fw.size()), fn, fp);
+                    kmer_len, minimizer_len, (unsigned long)stats_ref.kmers, (unsigned long)stats_ref.superkmers, (unsigned long)stats_ref.buckets,
+                    (unsigned long)stats_ref.ovf_buckets, idx.bytes() * 8.0 / stats_ref.kmers, build_secs, lookup_secs * 1e9 / (2 * fwd_kmers.size()), false_neg, false_pos);
     }
 }
 
 int main(int argc, char** argv) {
     std::mt19937_64 rng(77);
-    const char* A = "ACGT";
+    const char* bases = "ACGT";
     for (int it = 0; it < 300; ++it) {
-        unsigned k = 5 + rng() % 28, m = 2 + rng() % (k - 2);
-        if (m > 31) m = 31;
+        unsigned kmer_len = 5 + rng() % 28, minimizer_len = 2 + rng() % (kmer_len - 2);
+        if (minimizer_len > 31) minimizer_len = 31;
         std::vector<std::string> seqs;
-        int ns = 1 + rng() % 30;
-        for (int i = 0; i < ns; ++i) {
-            std::string s; std::size_t L = rng() % 300;
-            for (std::size_t j = 0; j < L; ++j) {
-                unsigned r = rng() % 100;
-                s.push_back(r < 2 ? 'N' : r < 20 ? 'A' : A[rng() % 4]);
+        int num_seqs = 1 + rng() % 30;
+        for (int i = 0; i < num_seqs; ++i) {
+            std::string seq; std::size_t len = rng() % 300;
+            for (std::size_t j = 0; j < len; ++j) {
+                unsigned roll = rng() % 100;
+                seq.push_back(roll < 2 ? 'N' : roll < 20 ? 'A' : bases[rng() % 4]);
             }
-            if (!seqs.empty() && rng() % 4 == 0) s += seqs[rng() % seqs.size()];   // repeats
-            seqs.push_back(s);
+            if (!seqs.empty() && rng() % 4 == 0) seq += seqs[rng() % seqs.size()];   // repeats
+            seqs.push_back(seq);
         }
-        check(seqs, k, m, rng, false);
+        check(seqs, kmer_len, minimizer_len, rng, false);
     }
     std::printf("random battery done (%d failures)\n", g_fail);
     // Repeat families (human-like), with one unit copied hundreds to thousands of times with point mutations puts many super-k-mers behind a single minimizer, i.e. buckets beyond kSkewMin that the skew tables answer.
     // Exact duplicates of whole copies are included (repeated k-mers).
     uint64_t skew_seen = 0;
     for (int it = 0; it < 12; ++it) {
-        const unsigned k = 31, m = (it % 3 == 0) ? 11 : (it % 3 == 1) ? 15 : 21;
+        const unsigned kmer_len = 31, minimizer_len = (it % 3 == 0) ? 11 : (it % 3 == 1) ? 15 : 21;
         std::string unit;
-        for (int j = 0; j < 200 + int(rng() % 200); ++j) unit.push_back(A[rng() % 4]);
+        for (int j = 0; j < 200 + int(rng() % 200); ++j) unit.push_back(bases[rng() % 4]);
         std::vector<std::string> seqs;
         const int copies = 300 + int(rng() % 2000);
         for (int c = 0; c < copies; ++c) {
-            std::string s;
-            for (int j = 0; j < int(rng() % 40); ++j) s.push_back(A[rng() % 4]);   // flank
+            std::string seq;
+            for (int j = 0; j < int(rng() % 40); ++j) seq.push_back(bases[rng() % 4]);   // flank
             const unsigned div = 1 + rng() % 5;                                      // 1-5% diverged
-            for (char ch : unit) s.push_back(rng() % 100 < div ? A[rng() % 4] : ch);
-            for (int j = 0; j < int(rng() % 40); ++j) s.push_back(A[rng() % 4]);
-            seqs.push_back(s);
-            if (rng() % 10 == 0) seqs.push_back(s);                                   // exact duplicate
+            for (char base_char : unit) seq.push_back(rng() % 100 < div ? bases[rng() % 4] : base_char);
+            for (int j = 0; j < int(rng() % 40); ++j) seq.push_back(bases[rng() % 4]);
+            seqs.push_back(seq);
+            if (rng() % 10 == 0) seqs.push_back(seq);                                   // exact duplicate
         }
         SpssCore probe_idx;
-        if (probe_idx.build(seqs, k, m)) skew_seen += probe_idx.skew_entries();
-        check(seqs, k, m, rng, false);
+        if (probe_idx.build(seqs, kmer_len, minimizer_len)) skew_seen += probe_idx.skew_entries();
+        check(seqs, kmer_len, minimizer_len, rng, false);
     }
     CHECK(skew_seen > 0, "repeat battery never reached the skew tables");
     std::printf("repeat-family battery done (%d failures, %llu k-mers via skew tables)\n",
                 g_fail, (unsigned long long)skew_seen);
     if (argc > 1) {
         auto seqs = read_fa(argv[1]);
-        for (unsigned m : {15u, 17u, 19u, 21u}) check(seqs, 31, m, rng, true);
+        for (unsigned minimizer_len : {15u, 17u, 19u, 21u}) check(seqs, 31, minimizer_len, rng, true);
     }
     std::printf(g_fail ? "spss_stress: %d FAILURE(S)\n" : "spss_stress: ALL PASS\n", g_fail);
     return g_fail != 0;

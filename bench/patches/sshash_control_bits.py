@@ -51,7 +51,7 @@ NEW = """    // optik patch (bench/patches/sshash_control_bits.py): the heavy-lo
 
 def main():
     """Patch SSHash's builder in the source tree given as the only argument."""
-    if len(sys.argv) != 2:
+    if len(sys.argv[1:]) != 1:
         sys.exit("usage: " + __doc__.split("Usage:")[1].strip())
     path = os.path.join(sys.argv[1], FILE)
     src = Path(path).read_text()
@@ -63,8 +63,8 @@ def main():
             f"{path}: anchor not found (upstream drift?); not modified", file=sys.stderr
         )
         return 1
-    with open(path, "w") as f:
-        f.write(src.replace(OLD, NEW))
+    with open(path, "w") as handle:
+        handle.write(src.replace(OLD, NEW))
     print(f"{path}: patched")
     return 0
 

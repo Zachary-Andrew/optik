@@ -1,6 +1,6 @@
 """Dataset catalogue of compare_tools_published_sets.py.
 
-Each dataset the published-sets bench can run is registered with ds(), which records what it is, the files to fetch, how its paper used it, the published counts and memory figures that serve as gates, and the paper it comes from.
+Each dataset the published-sets bench can run is registered with register_dataset(), which records what it is, the files to fetch, how its paper used it, the published counts and memory figures that serve as gates, and the paper it comes from.
 The module also holds the paths of the bench's working directories and the pinned helper-tool versions.
 """
 
@@ -11,25 +11,40 @@ from external_oracles import BWA_BIN
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-T = os.path.join(ROOT, "temp")
+TEMP_DIR = os.path.join(ROOT, "temp")
 
-TOOLS = os.path.join(T, "published_sets_tools")
+
+class DataRoot:
+    """Where datasets are downloaded and formatted.
+
+    It is an object rather than a module global so that every module reads the same value when smoke() points it at a scratch copy.
+    """
+
+    def __init__(self, path):
+        self.path = path
+
+
+DATA_ROOT = DataRoot(os.environ.get("OPTIK_BENCH_DATA") or os.path.join(TEMP_DIR, "published_sets"))
+
+TOOLS = os.path.join(TEMP_DIR, "published_sets_tools")
 
 # Helper tools are taken at their latest stable version, meaning default-branch HEAD or the latest release where the tool ships that way, as k8's prebuilt binary and SeqAn 2's mason2 do.
 # The papers fix what is measured and with which parameters, not these versions.
 K8_URL = "https://github.com/attractivechaos/k8/releases/download/v1.2/k8-1.2.tar.bz2"
 
 BIWFA_REV = "6289fd23f2a908097b4532ec67fad2f1188c7a3e"
+# characters of a commit hash shown, as git abbreviates it
+GIT_SHORT_HASH_LEN = 7
 
 SEQAN_TAG = "seqan-v2.5.3"  # latest SeqAn 2 release, which provides mason2
 
 HG38 = os.path.join(
-    T, "scaling/hg38_primary.fa"
+    TEMP_DIR, "scaling/hg38_primary.fa"
 )  # UCSC's 25 primary chromosomes of GRCh38
 
-BWA_IDX = os.path.join(T, "real/bwaidx/hg38.fa")  # bwa index of the same file (symlink)
+BWA_IDX = os.path.join(TEMP_DIR, "real/bwaidx/hg38.fa")  # bwa index of the same file (symlink)
 
-BWA = BWA_BIN or os.path.join(T, "bwa/bwa")  # from PATH, else bench/build_tools.sh bwa
+BWA = BWA_BIN or os.path.join(TEMP_DIR, "bwa/bwa")  # from PATH, else bench/build_tools.sh bwa
 
 Z_SSHASH = "17582116"  # "Eulertigs for benchmarking kmer dictionaries" (SSHash 2026 data availability)
 
@@ -72,17 +87,17 @@ def zen(rec, key):
 # `title` says what the dataset is and `files` lists what is fetched.
 # `use` describes how the paper used it and how the bench uses it.
 # `kmers31` is the published distinct 31-mer count, and `mem` maps a tool to the (GB, source) memory figure a paper reports for this dataset.
-D = {}
+CATALOG = {}
 
 
-def ds(id_, **kw):
-    """Register dataset id_ in D, defaulting to no files and tier M.
+def register_dataset(id_, **fields):
+    """Register dataset id_ in CATALOG, defaulting to no files and tier M.
 
     `tscale` is the first thread count of a thread-scaling sweep.
     The bench runs hw.thread_points() from there up to its --threads, by default every usable CPU, so the sweep grows with the machine."""
-    kw.setdefault("files", [])
-    kw.setdefault("tier", "M")
-    D[id_] = kw
+    fields.setdefault("files", [])
+    fields.setdefault("tier", "M")
+    CATALOG[id_] = fields
 
 
 # Query datasets, whole genomes and pangenomes, from the SSHash 2026 collections
@@ -118,25 +133,25 @@ _SS_Q = {  # collection -> (title, high-hit query file, SSHash -m at k=31, disti
     ),
 }
 
-for c, (title, q, m, n, tier) in _SS_Q.items():
-    ds(
-        f"sshash26-{c}",
+for collection, (title, query_file, sshash_m, kmers31, tier) in _SS_Q.items():
+    register_dataset(
+        f"sshash26-{collection}",
         section="query",
         paper=SSHASH26,
         tier=tier,
         title=title + " eulertigs, k = 31",
         source=f"zenodo.org/records/{Z_SSHASH} (paper: 'Data availability'); query pairing from "
         "kmer_sets_benchmark/script/query_sshash_indexes.sh",
-        files=[zen(Z_SSHASH, f"{c}.k31.eulertigs.fa.gz"), zen(Z_SSHASH, q)],
-        input=f"{c}.k31.eulertigs.fa.gz",
-        stream=q,
+        files=[zen(Z_SSHASH, f"{collection}.k31.eulertigs.fa.gz"), zen(Z_SSHASH, query_file)],
+        input=f"{collection}.k31.eulertigs.fa.gz",
+        stream=query_file,
         k=[31],
-        sshash_m=m,
-        kmers31=n,
+        sshash_m=sshash_m,
+        kmers31=kmers31,
         use="index the eulertigs; 1e6 positive (half RC) and 1e6 random k-mers; stream the high-hit FASTQ",
     )
 
-ds(
+register_dataset(
     "sshash26-hprc",
     section="query",
     paper=SSHASH26,
@@ -164,7 +179,7 @@ ds(
     use="as the other collections (3.7 B distinct 31-mers)",
 )
 
-ds(
+register_dataset(
     "sweep-chr1",
     section="query",
     paper=SSHASH26,
@@ -172,7 +187,7 @@ ds(
     title="Human chromosome 1 (GRCh38), the matched k x threads sweep",
     source="chromosome 1 of the GRCh38 genome SSHash 2026 indexes as its 'human' collection (UCSC copy, "
     "bench/build_tools.sh scaling); queried with the same deposit's high-hit FASTQ SRR5833294",
-    local=os.path.join(T, "scaling/chr1.fa"),
+    local=os.path.join(TEMP_DIR, "scaling/chr1.fa"),
     stream="SRR5833294.fastq.gz",
     stream_from="sshash26-human",
     k=[15, 19, 21, 23, 27, 31],
@@ -183,7 +198,7 @@ ds(
     "of the sweep (the deposit's eulertigs exist only at k = 31)",
 )
 
-ds(
+register_dataset(
     "sshash26-k63",
     section="query",
     paper=SSHASH26,
@@ -265,15 +280,15 @@ _FM_EXCLUDED = {  # id -> why the deposit cannot be used
     "full set cannot be recovered (checked 2026-10-17)",
 }
 
-for c, (key, title, name, tier, sub) in _FM.items():
-    ds(
-        f"fmsi25-{c}",
+for collection, (key, title, name, tier, sub) in _FM.items():
+    register_dataset(
+        f"fmsi25-{collection}",
         section="query",
         paper=FMSI25,
         tier=tier,
         title=title + ", k = 23 and 31",
-        **({"excluded": _FM_EXCLUDED[c]} if c in _FM_EXCLUDED else {}),
-        **({"spss_unitigs": _FM_UNITIGS[c]} if c in _FM_UNITIGS else {}),
+        **({"excluded": _FM_EXCLUDED[collection]} if collection in _FM_EXCLUDED else {}),
+        **({"spss_unitigs": _FM_UNITIGS[collection]} if collection in _FM_UNITIGS else {}),
         source=f"doi.org/10.5281/zenodo.{Z_FMSI} (paper: 'The datasets used in the experiments are deposited "
         "at Zenodo'); paper's name: " + name,
         files=[zen(Z_FMSI, key)] + ([zen(Z_FMSI, sub)] if sub else []),
@@ -283,13 +298,13 @@ for c, (key, title, name, tier, sub) in _FM.items():
         spss=True,
         sshash_m_rule="fmsi",
         # FMSI's memory k-sweep on its large sets uses k = 15, 23 and 31 (Table 4, Fig. 2), which become the plan's k points.
-        **({"kscale": [15, 23, 31]} if c == "ecoli-all" else {}),
+        **({"kscale": [15, 23, 31]} if collection == "ecoli-all" else {}),
         use="SPSS at each k (the paper's GGCAT step), then every index; the 10%-subsampled k = 23 set "
         "indexed as deposited; FMSI's query sets are in its supplement (not public text), so the "
         "SSHash 2026 positive/negative protocol is used",
     )
 
-ds(
+register_dataset(
     "sbwt23-ecoli3682",
     section="query",
     paper=SBWT23,
@@ -310,7 +325,7 @@ ds(
     "and random k-mers",
 )
 
-ds(
+register_dataset(
     "sbwt23-gut",
     section="query",
     paper=SBWT23,
@@ -333,7 +348,7 @@ ds(
     use="every k-mer of the reads (no abundance cutoff, as the paper), SPSS, every index",
 )
 
-ds(
+register_dataset(
     "sbwt23-sarscov2",
     section="query",
     paper=SBWT23,
@@ -344,7 +359,7 @@ ds(
 )
 
 # De Bruijn graph datasets of Cuttlefish 2
-ds(
+register_dataset(
     "cf2-celegans-ref",
     section="dbg",
     paper=CF2,
@@ -366,7 +381,7 @@ ds(
     "genome: the single-threaded point is affordable here, not on HG004)",
 )
 
-ds(
+register_dataset(
     "cf2-celegans-reads",
     section="dbg",
     paper=CF2,
@@ -381,7 +396,7 @@ ds(
     use="compacted graph of both mates, abundance >= 12 (CF2 Table 3); thread scaling from 1 thread",
 )
 
-ds(
+register_dataset(
     "cf2-grch38",
     section="dbg",
     paper=CF2,
@@ -463,28 +478,28 @@ OPT_IN_WHITE_SPRUCE = (
     "`fetch --only cf2-white-spruce`"
 )
 
-for c, (title, accs, f0, src, note, mem) in _CF2_READS.items():
-    ds(
-        f"cf2-{c}",
+for collection, (title, accs, cutoff, src, note, mem) in _CF2_READS.items():
+    register_dataset(
+        f"cf2-{collection}",
         section="dbg",
         paper=CF2,
         tier="L",
         title=title + ", k = 27",
         source="CF2 Table 1: " + src,
-        files=[{"ena": a} for a in accs],
+        files=[{"ena": acc} for acc in accs],
         k=[27],
-        cutoff=f0,
+        cutoff=cutoff,
         kind="reads",
         note=note,
-        mem={t: (gb, "CF2 Table 1, peak at k = 27") for t, gb in mem.items()},
+        mem={tool: (mem_gb, "CF2 Table 1, peak at k = 27") for tool, mem_gb in mem.items()},
         skip_tools={
             "bifrost": "CF2 did not run Bifrost here: it cannot take f0 = 11 (fixed f0 = 2)"
         }
-        if c == "white-spruce"
+        if collection == "white-spruce"
         else {},
-        use=f"compacted graph of all runs, f0 = {f0} at k = 27 (CF2 Table 1)",
+        use=f"compacted graph of all runs, f0 = {cutoff} at k = 27 (CF2 Table 1)",
         # 1.1 TB of reads is never fetched or run by default, whatever the free disk.
-        **({"opt_in": OPT_IN_WHITE_SPRUCE} if c == "white-spruce" else {}),
+        **({"opt_in": OPT_IN_WHITE_SPRUCE} if collection == "white-spruce" else {}),
     )
 
 # Cuttlefish 2's scaling experiments use HG004 "downsampled ... from 70x to 20x coverage".
@@ -493,7 +508,7 @@ for c, (title, accs, f0, src, note, mem) in _CF2_READS.items():
 # Run sizes vary.
 # On 2026-10-20 that was the first 28 runs, 32.6% of the bytes and about 23x, and the bench prints the share it uses.
 # The thread points run up to the machine's usable CPUs, and the k points are limited to optik's k <= 31, with odd k for Cuttlefish.
-ds(
+register_dataset(
     "scale-dbg-hg004-20x",
     section="dbg",
     paper=CF2 + "; " + CF3,
@@ -515,7 +530,7 @@ ds(
     "scaling is measured on the C. elegans sets)",
 )
 
-ds(
+register_dataset(
     "kscale-dbg-hg004-20x",
     section="dbg",
     paper=CF2 + "; " + CF3,
@@ -534,7 +549,7 @@ ds(
     use="optik and Cuttlefish at k = 15, 21, 27, 31 at 8 threads",
 )
 
-ds(
+register_dataset(
     "cf2-humgut",
     section="dbg",
     paper=CF2 + "; " + CF3,
@@ -545,7 +560,7 @@ ds(
     source="CF2 Table 2; CF3 Sec. 5.1",
 )
 
-ds(
+register_dataset(
     "cf3-bacteria",
     section="dbg",
     paper=CF3,
@@ -556,7 +571,7 @@ ds(
     source="CF3 Sec. 5.1-5.3",
 )
 
-ds(
+register_dataset(
     "bifrost-na12878",
     section="dbg",
     paper=BIFROST,
@@ -567,7 +582,7 @@ ds(
     source="Bifrost Results",
 )
 
-ds(
+register_dataset(
     "kmc3-sets",
     section="count",
     paper=KMC3,
@@ -579,7 +594,7 @@ ds(
 )
 
 # Mapping datasets
-ds(
+register_dataset(
     "bwamem-wgsim-hg38",
     section="map",
     paper=BWAMEM,
@@ -596,7 +611,7 @@ ds(
     "mapped paired and single-end; wgsim_eval.pl at 20 bp",
 )
 
-ds(
+register_dataset(
     "mm2-pbsim2-chm13",
     section="map",
     paper=MM2_21,
@@ -613,7 +628,7 @@ ds(
     "names rewritten by paftools.js pbsim2fq, mapped by optik and minimap2 -x map-ont, mapeval",
 )
 
-ds(
+register_dataset(
     "bwamem-ecoli-asm",
     section="map",
     paper=BWAMEM,
@@ -626,7 +641,7 @@ ds(
     "(the paper: nucmer 105,505, BWA-MEM 104,321)",
 )
 
-ds(
+register_dataset(
     "mm2-mason2",
     section="map",
     paper=MM2_18,
@@ -645,7 +660,7 @@ ds(
     "(no such option) infer the insert size from the reads, their defaults",
 )
 
-ds(
+register_dataset(
     "sweep-pbsim2-chm13",
     section="map",
     paper=MM2_21,
@@ -662,7 +677,7 @@ ds(
     use="optik and minimap2 -ax map-ont at the same k (w = 10) and thread count; paftools.js mapeval",
 )
 
-ds(
+register_dataset(
     "sweep-mason2-hg38",
     section="map",
     paper=MM2_18,
@@ -680,7 +695,7 @@ ds(
     "same thread count; paftools.js mapeval",
 )
 
-ds(
+register_dataset(
     "mm2-winnowmap-truth",
     section="map",
     paper=MM2_21,
@@ -695,7 +710,7 @@ ds(
     "optik and minimap2 -x map-hifi compared by paftools.js pafcmp",
 )
 
-ds(
+register_dataset(
     "mm2-real-short",
     section="map",
     paper=MM2_18,
@@ -706,7 +721,7 @@ ds(
     source="minimap2 2018 Sec. 3.3",
 )
 
-ds(
+register_dataset(
     "mm2-pbsim-chm1",
     section="map",
     paper=MM2_18,
@@ -718,14 +733,14 @@ ds(
 )
 
 # Pairwise alignment datasets
-ds(
+register_dataset(
     "biwfa-ont-ul48",
     section="align",
     paper=BIWFA,
     tier="S",
     title="48 Nanopore read pairs of 500 kbp to 1 Mbp",
     source="BiWFA Sec. 3.1: 'ONT MinION reads from Bowden et al. (2019) ... at least 500 kbp long, for a "
-    f"total number of 48 sequence pairs'; file from github.com/smarco/BiWFA-paper @ {BIWFA_REV[:7]}",
+    f"total number of 48 sequence pairs'; file from github.com/smarco/BiWFA-paper @ {BIWFA_REV[:GIT_SHORT_HASH_LEN]}",
     files=[
         {
             "url": f"https://github.com/smarco/BiWFA-paper/raw/{BIWFA_REV}/evaluation/data/"
@@ -735,7 +750,7 @@ ds(
     use="all 48 pairs, optik's BiWFA vs WFA2-lib's (MemoryUltralow), penalties 4,6,2",
 )
 
-ds(
+register_dataset(
     "biwfa-sim",
     section="align",
     paper=BIWFA,
@@ -755,7 +770,7 @@ ds(
     use="one pair per cell as in the paper's script; optik's BiWFA vs WFA2-lib's (MemoryUltralow)",
 )
 
-ds(
+register_dataset(
     "biwfa-hprc-chr12",
     section="align",
     paper=BIWFA,

@@ -35,6 +35,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from units import KIB_PER_GIB
+
+# hex characters of the binary's sha256 shown in provenance lines
+SHA_PREFIX_LEN = 12
+# leading non-blank lines of a section: its title and up to two provenance lines
+SECTION_HEAD_LINES = 3
+# a table subtitle line starts with this
+SUBTITLE_PREFIX = "### "
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_PATH = os.path.join(ROOT, "bench", "results", "RESULTS.md")
 HEADER = """# optik benchmark results
@@ -46,13 +55,19 @@ A section's provenance line records the date, commit, optik binary and machine o
 OPEN = "<!-- section: {} -->"
 CLOSE = "<!-- end: {} -->"
 SECTION_RE = re.compile(
-    r"^<!-- section: (\S+) -->\n(.*?)^<!-- end: \1 -->\n?", re.MULTILINE | re.DOTALL
+    r"^<!-- section: (?P<key>\S+) -->\n(?P<body>.*?)^<!-- end: (?P=key) -->\n?", re.MULTILINE | re.DOTALL
 )
 
 
-def add_argument(ap):
+# A Markdown table starts with its header row and the |---| rule under it.
+TABLE_HEAD_LINES = 2
+# A repeated table title gets " (2)", then " (3)" and so on.
+FIRST_REPEAT_SUFFIX = 2
+
+
+def add_argument(parser):
     """Adds --report PATH to a bench's argument parser."""
-    ap.add_argument(
+    parser.add_argument(
         "--report",
         default=DEFAULT_PATH,
         help="sectioned results file this bench writes its section into "
@@ -60,20 +75,20 @@ def add_argument(ap):
     )
 
 
-def cell(v):
+def cell(value):
     """Text of one table cell.
 
     A measurement dict prints as its mean with the sd, a float with four significant digits, a bool as PASS or FAIL, and None as empty."""
-    if v is None:
+    if value is None:
         return ""
-    if isinstance(v, bool):
-        return "PASS" if v else "FAIL"
-    if isinstance(v, dict) and "mean" in v:
-        sd = v.get("sd")
-        return f"{v['mean']:.4g}" + (f" ± {sd:.2g}" if sd is not None else "")
-    if isinstance(v, float):
-        return f"{v:.4g}"
-    return str(v).replace("|", "\\|").replace("\n", " ")
+    if isinstance(value, bool):
+        return "PASS" if value else "FAIL"
+    if isinstance(value, dict) and "mean" in value:
+        std_dev = value.get("sd")
+        return f"{value['mean']:.4g}" + (f" ± {std_dev:.2g}" if std_dev is not None else "")
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def table(rows, cols=None, drop=()):
@@ -84,10 +99,10 @@ def table(rows, cols=None, drop=()):
         return []
     if cols is None:
         cols = []
-        for r in rows:
-            cols += [k for k in r if k not in cols and k not in drop]
+        for row in rows:
+            cols += [key for key in row if key not in cols and key not in drop]
     lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    lines += ["| " + " | ".join(cell(r.get(k)) for k in cols) + " |" for r in rows]
+    lines += ["| " + " | ".join(cell(row.get(col)) for col in cols) + " |" for row in rows]
     return lines
 
 
@@ -107,23 +122,23 @@ def _git_rev():
 def _mem_gib():
     """MemTotal in GiB, or None when /proc/meminfo is unreadable."""
     try:
-        with open("/proc/meminfo") as f:
-            for line in f:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
                 if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) >> 20
+                    return int(line.split()[1]) // KIB_PER_GIB
     except OSError:
-        pass
+        pass  # fall through to None
     return None
 
 
 def provenance(optik=None, extra=""):
     """One line naming when, from which commit and binary, and on what machine a run was made."""
-    when = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    when = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     parts = [f"Run {when}", f"git {_git_rev() or 'unknown'}"]
     optik = optik or os.path.join(ROOT, "target", "release", "optik")
     if os.path.exists(optik):
-        with open(optik, "rb") as f:
-            parts.append(f"optik sha256 {hashlib.sha256(f.read()).hexdigest()[:12]}")
+        with open(optik, "rb") as handle:
+            parts.append(f"optik sha256 {hashlib.sha256(handle.read()).hexdigest()[:SHA_PREFIX_LEN]}")
     parts.append(f"{len(os.sched_getaffinity(0))} CPUs")
     mem = _mem_gib()
     if mem is not None:
@@ -132,7 +147,7 @@ def provenance(optik=None, extra=""):
     if extra:
         parts.append(extra)
     argv = " ".join(
-        os.path.relpath(x, ROOT) if x.startswith(ROOT + os.sep) else x for x in sys.argv
+        os.path.relpath(arg, ROOT) if arg.startswith(ROOT + os.sep) else arg for arg in sys.argv
     )
     return ", ".join(parts) + f",\n`python3 {argv}`"
 
@@ -146,9 +161,9 @@ def write_section(path, key, title, tables, notes=(), optik=None, extra=""):
     if not path:
         return
     body = [OPEN.format(key), f"## {key}", title, "", provenance(optik, extra), ""]
-    for t in tables:
-        sub, rows = t[0], t[1]
-        cols = t[2] if len(t) > 2 else None
+    for table_spec in tables:
+        sub, rows, *optional = table_spec
+        cols = optional[0] if optional else None
         if not rows:
             continue
         if sub:
@@ -164,19 +179,19 @@ def write_section(path, key, title, tables, notes=(), optik=None, extra=""):
     body.append(CLOSE.format(key))
     text = "\n".join(body) + "\n"
     old = Path(path).read_text() if os.path.exists(path) else HEADER
-    m = re.search(
+    match = re.search(
         rf"^{re.escape(OPEN.format(key))}\n.*?^{re.escape(CLOSE.format(key))}\n?",
         old,
         re.MULTILINE | re.DOTALL,
     )
-    if m:
-        new = old[: m.start()] + text + old[m.end() :]
+    if match:
+        new = old[: match.start()] + text + old[match.end() :]
     else:
         new = old.rstrip("\n") + "\n\n" + text
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".part"
-    with open(tmp, "w") as f:
-        f.write(new)
+    with open(tmp, "w") as handle:
+        handle.write(new)
     os.replace(tmp, path)
     print(f"report: section '{key}' written to {path}", file=sys.stderr)
 
@@ -184,7 +199,7 @@ def write_section(path, key, title, tables, notes=(), optik=None, extra=""):
 def _split_row(line):
     """Cells of one pipe-table row, with escaped pipes restored."""
     cells = re.split(r"(?<!\\)\|", line.strip())[1:-1]
-    return [c.strip().replace("\\|", "|") for c in cells]
+    return [cell_text.strip().replace("\\|", "|") for cell_text in cells]
 
 
 def read_report(path=DEFAULT_PATH):
@@ -192,32 +207,33 @@ def read_report(path=DEFAULT_PATH):
 
     `tables` maps each table's subtitle, '' for an untitled one, to its rows as dicts of column name to cell text."""
     out = {}
-    for m in SECTION_RE.finditer(Path(path).read_text()):
-        key, lines = m.group(1), m.group(2).splitlines()
+    for match in SECTION_RE.finditer(Path(path).read_text()):
+        key, lines = match.group("key"), match.group("body").splitlines()
         sec = {"title": "", "provenance": "", "tables": {}}
         sub, i = "", 0
-        head = [x for x in lines[1:] if x.strip()][:3]
+        head = [line for line in lines[1:] if line.strip()][:SECTION_HEAD_LINES]
         sec["title"] = head[0] if head else ""
         sec["provenance"] = " ".join(
-            x for x in head[1:3] if not x.startswith(("|", "###"))
+            line for line in head[1:SECTION_HEAD_LINES] if not line.startswith(("|", "###"))
         )
         while i < len(lines):
             line = lines[i]
-            if line.startswith("### "):
-                sub = line[4:].strip()
+            if line.startswith(SUBTITLE_PREFIX):
+                sub = line[len(SUBTITLE_PREFIX):].strip()
+            # A table is a pipe row followed by a |--- divider. Its rows run until the first line that is not a pipe row.
             elif (
                 line.startswith("|")
                 and i + 1 < len(lines)
                 and lines[i + 1].startswith("|---")
             ):
                 cols = _split_row(line)
-                rows, i = [], i + 2
+                rows, i = [], i + TABLE_HEAD_LINES
                 while i < len(lines) and lines[i].startswith("|"):
                     rows.append(dict(zip(cols, _split_row(lines[i]), strict=False)))
                     i += 1
-                name, n = sub, 2
+                name, suffix_num = sub, FIRST_REPEAT_SUFFIX
                 while name in sec["tables"]:
-                    name, n = f"{sub} ({n})", n + 1
+                    name, suffix_num = f"{sub} ({suffix_num})", suffix_num + 1
                 sec["tables"][name] = rows
                 continue
             i += 1
@@ -227,18 +243,18 @@ def read_report(path=DEFAULT_PATH):
 
 def main():
     """Lists the sections of a results file, or prints them as JSON."""
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("file", nargs="?", default=DEFAULT_PATH)
-    ap.add_argument("--json", action="store_true", help="print every section as JSON")
-    a = ap.parse_args()
-    if not os.path.exists(a.file):
+    parser.add_argument("file", nargs="?", default=DEFAULT_PATH)
+    parser.add_argument("--json", action="store_true", help="print every section as JSON")
+    args = parser.parse_args()
+    if not os.path.exists(args.file):
         sys.exit(
-            f"{a.file}: no results yet (run a bench, see bench/run_benchmarks.py list)"
+            f"{args.file}: no results yet (run a bench, see bench/run_benchmarks.py list)"
         )
-    rep = read_report(a.file)
-    if a.json:
+    rep = read_report(args.file)
+    if args.json:
         json.dump(rep, sys.stdout, indent=1)
         print()
         return

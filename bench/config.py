@@ -20,7 +20,7 @@ import hw
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # With TOOL_BENCH_TOOLS_DIR set, every external tool is resolved inside that directory, the output of build_tools.sh.
-# Otherwise the older layout applies, where each tool lives in a sibling directory of optik/ under the bio/ parent (../sshash/, ../bifrost/ and so on).
+# Otherwise the older layout applies, where each tool is in a sibling directory of optik/ under the bio/ parent (../sshash/, ../bifrost/ and so on).
 #
 # optik itself is always built locally with cargo.
 #
@@ -49,6 +49,7 @@ if _TOOLS_DIR:
         "wgatools": _td / "wgatools/target/release/wgatools",
     }
 else:
+    # Without a tools directory the competitors are expected beside the project checkout.
     PATHS = {
         "optik": PROJECT_ROOT / "target/release/optik",
         "sshash": PROJECT_ROOT.parent / "sshash/build/sshash",
@@ -75,8 +76,8 @@ def _sshash_data(relpath):
     Without TOOL_BENCH_TOOLS_DIR the older sibling path is used.
     """
     if _TOOLS_DIR:
-        td = Path(_TOOLS_DIR)
-        return td / "sshash" / "data" / relpath
+        tools_dir = Path(_TOOLS_DIR)
+        return tools_dir / "sshash" / "data" / relpath
     return PROJECT_ROOT.parent / "sshash" / "data" / relpath
 
 

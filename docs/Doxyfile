@@ -1,0 +1,52 @@
+# Doxygen configuration for optik's C++ core (include/ and src/).
+# Only settings that differ from Doxygen's defaults are listed.
+# docs/build.sh runs Doxygen from the repository root, so paths are relative to it.
+# The XML output feeds Breathe in the Sphinx site, and the HTML output is a standalone reference with source and call graphs.
+
+PROJECT_NAME           = "optik"
+PROJECT_BRIEF          = "Compact k-mer indexes, de Bruijn graphs and read mapping"
+OUTPUT_DIRECTORY       = docs/_build/doxygen
+
+INPUT                  = include src
+FILE_PATTERNS          = *.hpp *.cpp *.h
+RECURSIVE              = NO
+
+# Comments are /// lines whose first sentence is the brief description.
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+
+# The core is internal to the optik binary, so private members and file-local helpers are documented too.
+# Their layouts are where most of the data representation lives.
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+EXTRACT_ANON_NSPACES   = YES
+SORT_MEMBER_DOCS       = NO
+
+# The SIMD and Linux paths are what optik builds, so their branches are the ones documented.
+# Sphinx's C++ parser knows neither compiler extension below.
+# Left in, __attribute__((packed)) makes the spill records read as functions and __restrict breaks the WFA kernel's signature.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = __AVX2__=1 __BMI2__=1 __linux__=1 _OPENMP=1 MADV_HUGEPAGE=1 MADV_NOHUGEPAGE=1 O_TMPFILE=1 \
+                         "__attribute__(x)=" __restrict=
+
+SOURCE_BROWSER         = YES
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_XML           = YES
+
+HAVE_DOT               = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_NO_PARAMDOC       = NO
+WARN_LOGFILE           = docs/_build/doxygen/warnings.log

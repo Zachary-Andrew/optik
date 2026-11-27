@@ -40,13 +40,13 @@ run_ok() { # name status
 # run_test NAME LOG CMD... runs CMD with stdout and stderr going to LOG, without letting `set -e` abort the script, then reports PASS or FAIL and the log's last line.
 run_test() {
     local name="$1" log="$2"; shift 2
-    local st=0
-    "$@" > "$log" 2>&1 || st=$?
-    run_ok "$name" "$st"
+    local status=0
+    "$@" > "$log" 2>&1 || status=$?
+    run_ok "$name" "$status"
     tail -1 "$log"
 }
 INC=(-I "$ROOT/include" -I "$ROOT/src" -I "$SCRIPT_DIR")
-KC="$ROOT/src/kmer_count.cpp"
+KMER_COUNT_SRC="$ROOT/src/kmer_count.cpp"
 
 echo "=============================================="
 echo "  optik C++ kernel exactness stress"
@@ -54,32 +54,32 @@ echo "=============================================="
 
 # dBG unitig batteries against the independent bidirected oracle (dbg_oracle.hpp).
 # dbg_stress covers counter records and masks, mask queries, the unitig multiset, partition, coverage and thread-count invariance, on dense K=4..7 inputs and genomes or reads at K=15..31.
-for t in dbg_stress; do
-    if [ -f "$SCRIPT_DIR/$t.cpp" ]; then
-        echo "[build] $t"
+for test_name in dbg_stress; do
+    if [ -f "$SCRIPT_DIR/$test_name.cpp" ]; then
+        echo "[build] $test_name"
         "$CXX" -std=c++17 -O2 -march=native -fopenmp "${INC[@]}" \
-            "$SCRIPT_DIR/$t.cpp" "$KC" -o "$TMP/$t" -lz
-        run_test "$t" "$TMP/$t.log" "$TMP/$t"
+            "$SCRIPT_DIR/$test_name.cpp" "$KMER_COUNT_SRC" -o "$TMP/$test_name" -lz
+        run_test "$test_name" "$TMP/$test_name.log" "$TMP/$test_name"
     fi
 done
 
 # Index exactness batteries
-for t in minimizer_stress reader_stress; do
-    if [ -f "$SCRIPT_DIR/$t.cpp" ]; then
-        echo "[build] $t"
+for test_name in minimizer_stress reader_stress; do
+    if [ -f "$SCRIPT_DIR/$test_name.cpp" ]; then
+        echo "[build] $test_name"
         "$CXX" -std=c++17 -O2 -march=native -fopenmp "${INC[@]}" \
-            "$SCRIPT_DIR/$t.cpp" -o "$TMP/$t" -lz
-        run_test "$t" "$TMP/$t.log" "$TMP/$t"
+            "$SCRIPT_DIR/$test_name.cpp" -o "$TMP/$test_name" -lz
+        run_test "$test_name" "$TMP/$test_name.log" "$TMP/$test_name"
     fi
 done
 
 # SPSS core, MPHF, spss-update deltas, seed index and optik's own gap-affine WFA
-for t in mphf_stress spss_stress delta_stress dyn_spss_stress wfa_affine_stress seed_index_stress kernels_stress; do
-    if [ -f "$SCRIPT_DIR/$t.cpp" ]; then
-        echo "[build] $t"
+for test_name in mphf_stress spss_stress delta_stress dyn_spss_stress wfa_affine_stress seed_index_stress kernels_stress; do
+    if [ -f "$SCRIPT_DIR/$test_name.cpp" ]; then
+        echo "[build] $test_name"
         "$CXX" -std=c++17 -O2 -march=native -fopenmp -pthread "${INC[@]}" \
-            "$SCRIPT_DIR/$t.cpp" "$KC" -o "$TMP/$t" -lz
-        run_test "$t" "$TMP/$t.log" "$TMP/$t"
+            "$SCRIPT_DIR/$test_name.cpp" "$KMER_COUNT_SRC" -o "$TMP/$test_name" -lz
+        run_test "$test_name" "$TMP/$test_name.log" "$TMP/$test_name"
     fi
 done
 

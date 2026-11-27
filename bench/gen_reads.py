@@ -34,62 +34,45 @@ import contextlib
 import random
 import sys
 
+from dna import read_fasta, revcomp
 
-def read_fasta(path):
-    """Read a FASTA file into a list of (name, sequence) tuples.
-
-    Sequence lines are joined up to the next header, and only the first whitespace-delimited token of a header is kept as the name.
-    Empty headers (a bare '>') get sequential names seq_0, seq_1 and so on.
-    """
-    sequences = []
-    name = None
-    seq_parts = []
-    seq_idx = 0
-    with open(path) as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                # A new record header, so the previous record is saved first.
-                if name is not None:
-                    sequences.append((name, "".join(seq_parts)))
-                tokens = line[1:].split()
-                name = tokens[0] if tokens else f"seq_{seq_idx}"
-                seq_idx += 1
-                seq_parts = []
-            else:
-                seq_parts.append(line)
-    # The last record
-    if name is not None:
-        sequences.append((name, "".join(seq_parts)))
-    return sequences
+# Lemire draws are 64-bit, and a substitution picks one of the other NUM_BASES - 1 bases
+RNG_WORD_BITS = 64
+NUM_BASES = 4
+# fraction of reads taken from the reverse strand by default
+DEFAULT_RC_FRAC = 0.5
+# log-normal read lengths are at least this long
+MIN_READ_SPAN = 50
+# N-free placements tried per read before giving up
+MAX_PLACEMENT_TRIES = 200
+# command-line defaults
+DEFAULT_NUM_READS = 10000
+DEFAULT_READ_LEN = 150
+DEFAULT_SEED = 42
 
 
-def lemire_randbelow(rng, n):
+# A log-normal factor with mu = -sigma^2 / 2 has mean 1, so read lengths average the requested length.
+LOGNORMAL_MEAN_DEN = 2
+
+
+def lemire_randbelow(rng, bound):
     """Unbiased random integer in [0, n) by Lemire's method (Lemire 2019).
 
     ``x % n`` carries modulo bias whenever n does not divide the PRNG range.
     Lemire's scheme maps the 64-bit draw into [0, n) uniformly and redraws only on a rare threshold collision.
     A power-of-two n reduces to a masked draw.
     """
-    if n <= 0:
+    if bound <= 0:
         raise ValueError("n must be >= 1")
-    if n & (n - 1) == 0:
-        return rng.getrandbits(n.bit_length() - 1)
-    t = (-n) % n
-    mask64 = (1 << 64) - 1
+    if bound & (bound - 1) == 0:
+        return rng.getrandbits(bound.bit_length() - 1)
+    threshold = (-bound) % bound
+    mask64 = (1 << RNG_WORD_BITS) - 1
     while True:
-        x = rng.getrandbits(64)
-        m = x * n
-        if (m & mask64) >= t:
-            return m >> 64
-
-
-COMP = str.maketrans("ACGTacgt", "TGCAtgca")
-
-
-def revcomp(seq):
-    """Reverse complement of seq."""
-    return seq.translate(COMP)[::-1]
+        draw = rng.getrandbits(RNG_WORD_BITS)
+        product = draw * bound
+        if (product & mask64) >= threshold:
+            return product >> RNG_WORD_BITS
 
 
 def mutate(read, rng, sub, ins, dele):
@@ -97,33 +80,35 @@ def mutate(read, rng, sub, ins, dele):
     if sub <= 0 and ins <= 0 and dele <= 0:
         return read
     out = []
-    for c in read:
-        x = rng.random()
-        if x < dele:
+    for base in read:
+        # One roll picks deletion, substitution or keep. An insertion is drawn separately after the base.
+        roll = rng.random()
+        if roll < dele:
             continue
-        if x < dele + sub:
-            alt = "ACGT".replace(c.upper(), "")
+        if roll < dele + sub:
+            alt = "ACGT".replace(base.upper(), "")
             out.append(
                 alt[lemire_randbelow(rng, len(alt))]
-                if len(alt) == 3
-                else "ACGT"[lemire_randbelow(rng, 4)]
+                # An ambiguous base has no defined alternative, so any base may replace it.
+                if len(alt) == NUM_BASES - 1
+                else "ACGT"[lemire_randbelow(rng, NUM_BASES)]
             )
         else:
-            out.append(c)
+            out.append(base)
         if rng.random() < ins:
-            out.append("ACGT"[lemire_randbelow(rng, 4)])
+            out.append("ACGT"[lemire_randbelow(rng, NUM_BASES)])
     return "".join(out)
 
 
 def generate_reads(
     sequences,
-    n,
+    num_reads,
     read_len,
     error_rate,
     seed,
     ins_rate=0.0,
     del_rate=0.0,
-    rc_frac=0.5,
+    rc_frac=DEFAULT_RC_FRAC,
     len_sd=0.0,
 ):
     """Generate reads and return (reads, ground_truth).
@@ -133,22 +118,22 @@ def generate_reads(
     import math
 
     rng = random.Random(seed)
-    sequences = [s for s in sequences if len(s[1]) >= read_len]
+    sequences = [entry for entry in sequences if len(entry[1]) >= read_len]
     if not sequences:
         raise ValueError("no reference sequence is long enough for the read length")
 
     reads = []
     ground_truth = []
-    for i in range(n):
+    for i in range(num_reads):
         span = read_len
         if len_sd > 0:
             span = max(
-                50,
-                round(read_len * math.exp(rng.gauss(-len_sd * len_sd / 2, len_sd))),
+                MIN_READ_SPAN,
+                round(read_len * math.exp(rng.gauss(-len_sd * len_sd / LOGNORMAL_MEAN_DEN, len_sd))),
             )
         read = None
         seq_name = seq = pos = None
-        for _ in range(200):
+        for _ in range(MAX_PLACEMENT_TRIES):
             seq_name, seq = sequences[lemire_randbelow(rng, len(sequences))]
             if len(seq) < span:
                 continue
@@ -174,25 +159,25 @@ def main():
         description="Generate random reads from a reference"
     )
     parser.add_argument("-r", required=True, help="Reference FASTA")
-    parser.add_argument("-n", type=int, default=10000, help="Number of reads")
-    parser.add_argument("-l", type=int, default=150, help="Read length")
+    parser.add_argument("-n", type=int, default=DEFAULT_NUM_READS, help="Number of reads")
+    parser.add_argument("-l", type=int, default=DEFAULT_READ_LEN, help="Read length")
     parser.add_argument("-e", type=float, default=0.0, help="Substitution rate")
     parser.add_argument("--ins", type=float, default=0.0, help="Insertion rate")
     parser.add_argument(
         "--del", dest="dele", type=float, default=0.0, help="Deletion rate"
     )
-    parser.add_argument("--rc", type=float, default=0.5, help="Reverse-strand fraction")
+    parser.add_argument("--rc", type=float, default=DEFAULT_RC_FRAC, help="Reverse-strand fraction")
     parser.add_argument(
         "--len-sd", type=float, default=0.0, help="Log-normal length sigma"
     )
     parser.add_argument("-o", default=None, help="Output FASTA")
-    parser.add_argument("-s", type=int, default=42, help="Random seed")
+    parser.add_argument("-s", type=int, default=DEFAULT_SEED, help="Random seed")
     parser.add_argument("-c", type=float, default=0.0, help="Target coverage")
     parser.add_argument("--gt", default=None, help="Ground truth TSV output")
     args = parser.parse_args()
 
-    sequences = read_fasta(args.r)
-    total_len = sum(len(s) for _, s in sequences)
+    sequences = list(read_fasta(args.r))
+    total_len = sum(len(seq) for _, seq in sequences)
 
     # With a coverage given, the read count follows from coverage = n * read_len / total_len, so n = coverage * total_len / read_len.
     if args.c > 0:
@@ -217,10 +202,10 @@ def main():
 
     if args.gt:
         gt_path = args.gt
-        with open(gt_path, "w") as f:
-            f.write("read_name\tref_name\tpos\tstrand\tread_length\n")
+        with open(gt_path, "w") as handle:
+            handle.write("read_name\tref_name\tpos\tstrand\tread_length\n")
             for name, ref_name, pos, strand, length in ground_truth:
-                f.write(f"{name}\t{ref_name}\t{pos}\t{strand}\t{length}\n")
+                handle.write(f"{name}\t{ref_name}\t{pos}\t{strand}\t{length}\n")
 
 
 if __name__ == "__main__":

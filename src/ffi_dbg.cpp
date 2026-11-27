@@ -1,10 +1,12 @@
-/*
- * ffi_dbg.cpp - C ABI of the de Bruijn graph builder (dbruijn), the okdbg_* functions.
+/**
+ * @file
+ * @brief The `okdbg_*` C ABI behind dbruijn.
  *
- * okdbg_build_from_fasta() counts k-mers into one of three graph forms (DbgGraph table, DbgGraphEF compact keys, or PartUnitigs from partitioned compaction).
- * okdbg_write_gfa() writes the maximal unitigs as GFA1 (S and L lines, GFA spec) or as unitig FASTA with BCALM-style headers.
- * The output is identical at every thread count and in every graph form.
+ * okdbg_build_from_fasta() counts k-mers into one of three graph forms: the DbgGraph table, DbgGraphEF's compact keys, or PartUnitigs from partitioned compaction.
+ * okdbg_write_gfa() then writes the maximal unitigs either as GFA1 (S and L lines) or as unitig FASTA with BCALM-style headers.
+ * Output is identical at every thread count and across all three graph forms.
  */
+#include "../include/bits.hpp"
 #include "../include/thread_budget.hpp"
 #include <algorithm>
 #include <charconv>
@@ -22,54 +24,93 @@
 #include "../include/spill.hpp"
 #include "kmer_count.hpp"
 #include "ffi_error.hpp"
+#include "../include/kmer.hpp"
+
+using tpoptoa::ffi::kStatusFailed;
+using tpoptoa::ffi::kStatusOk;
+
+constexpr std::size_t kGfaBufSlack = 4096;   // headroom GfaOut keeps past its flush threshold
+/// Fmt formats a decimal u64, a fixed-point double and the "<k-1>M" overlap CIGAR in buffers of these sizes.
+constexpr std::size_t kU64DigitsBuf = 24;
+constexpr std::size_t kDoubleDigitsBuf = 64;
+constexpr std::size_t kOverlapCigarBuf = 16;
+constexpr int kKmDecimals = 2;               // decimals of km:f
+/// Byte lengths of two fixed GFA pieces, an orientation with its tabs ("\t+\t") and an S-line tag prefix (" LN:i:").
+constexpr std::size_t kOrientFieldLen = 3;
+constexpr std::size_t kTagPrefixLen = 6;
+/// Lines are formatted in nthreads * kSlicesPerThread slices, of which nthreads * kWindowPerThread are in flight.
+constexpr std::size_t kSlicesPerThread = 16;
+constexpr std::size_t kWindowPerThread = 4;
+/// Every segment has two oriented ends, so link endpoints stay below 2n.
+constexpr uint64_t kOrientations = 2;
+/// OpenMP chunk sizes of the per-end loops and of the node-word sweep.
+constexpr int kEndSchedChunk = 256;
+constexpr int kNodeSweepChunk = 65536;
+/// The in-graph entry index is faster once the ends are at least an eighth (kInGraphMinShare) of the nodes.
+constexpr uint64_t kInGraphMinShare = 8;
+/// The separate entry index gets kEntrySlotsPerEnd slots per end, plus kEntryExtraNum/kEntryExtraDen more and kEntrySlackSlots.
+constexpr uint64_t kEntrySlotsPerEnd = 2;
+constexpr uint64_t kEntryExtraNum = 6;
+constexpr uint64_t kEntryExtraDen = 7;
+constexpr uint64_t kEntrySlackSlots = 16;
 
 using tpoptoa::ffi::set_error;
 
 namespace {
 
-/// GfaOut - buffered GFA text writer.
-/// Small pieces collect in a large buffer flushed with fwrite, and block() writes the text that Fmt chunks produce, in order, instead of one fprintf parse per line.
+/// Buffered GFA writer.
+/// Small pieces collect in a large buffer that is flushed with fwrite.
+/// block() writes whole chunks produced by Fmt, in order, which avoids one fprintf parse per line.
 class GfaOut {
 public:
-    explicit GfaOut(std::FILE* f) : f_(f) { buf_.reserve(kFlushBytes + 4096); }
+    explicit GfaOut(std::FILE* file) : file_(file) { buf_.reserve(kFlushBytes + kGfaBufSlack); }
+
     ~GfaOut() { flush(); }
-    void put(const char* s, std::size_t n) {
-        buf_.append(s, n);
+    void put(const char* text, std::size_t len) {
+        buf_.append(text, len);
+
         if (buf_.size() >= kFlushBytes) flush();
     }
-    void put(const char* s) { put(s, std::strlen(s)); }
+    void put(const char* text) { put(text, std::strlen(text)); }
+
     bool flush() {
-        if (!buf_.empty() && std::fwrite(buf_.data(), 1, buf_.size(), f_) != buf_.size()) ok_ = false;
+        // GfaOut records the first write failure instead of throwing, and okdbg_write_gfa checks it once after the last block.
+        if (!buf_.empty() && std::fwrite(buf_.data(), 1, buf_.size(), file_) != buf_.size()) write_ok_ = false;
+
         buf_.clear();
-        return ok_;
+        return write_ok_;
     }
-    /// block() - write a pre-formatted block, keeping buffer order.
-    void block(const std::string& t) {
+    void block(const std::string& text) {
+        // Buffered small writes are flushed first so the large block lands after them in file order.
         flush();
-        if (!t.empty() && std::fwrite(t.data(), 1, t.size(), f_) != t.size()) ok_ = false;
+
+        if (!text.empty() && std::fwrite(text.data(), 1, text.size(), file_) != text.size()) write_ok_ = false;
     }
 private:
-    static constexpr std::size_t kFlushBytes = std::size_t(8) << 20;   // flush threshold, bytes
-    std::FILE* f_;
+    static constexpr std::size_t kFlushBytes = std::size_t(8) << 20;
+    std::FILE* file_;
     std::string buf_;
-    bool ok_ = true;
+    bool write_ok_ = true;
 };
 
-/// Fmt - append-only text formatter, one per thread chunk, whose string GfaOut emits in order.
-/// Numbers go through std::to_chars, which is exact, locale-free and identical to %.2f for doubles.
+/// Append-only formatter, one per thread chunk, whose text GfaOut later emits in order.
+/// Numbers go through std::to_chars, which is exact, locale-free and matches %.2f for doubles.
 struct Fmt {
-    std::string b;
-    void put(char c) { b.push_back(c); }
-    void put(const char* s, std::size_t n) { b.append(s, n); }
-    void num(uint64_t v) {
-        char t[24];
-        const auto r = std::to_chars(t, t + sizeof(t), v);
-        b.append(t, r.ptr);
+    std::string text;
+    void put(char ch) { text.push_back(ch); }
+    void put(const char* chars, std::size_t len) { text.append(chars, len); }
+
+    void num(uint64_t value) {
+        char digits[kU64DigitsBuf];
+        const auto result = std::to_chars(digits, digits + sizeof(digits), value);
+
+        text.append(digits, result.ptr);
     }
-    void fixed2(double v) {
-        char t[64];
-        const auto r = std::to_chars(t, t + sizeof(t), v, std::chars_format::fixed, 2);
-        b.append(t, r.ptr);
+    void fixed2(double value) {
+        char digits[kDoubleDigitsBuf];
+        const auto result = std::to_chars(digits, digits + sizeof(digits), value, std::chars_format::fixed, kKmDecimals);
+
+        text.append(digits, result.ptr);
     }
 };
 
@@ -77,121 +118,137 @@ struct Fmt {
 
 extern "C" {
 
-/// OkDbg - a built graph in one of three forms.
-/// g is the open-addressing table, ef the compact graph the counter builds instead when the table would not fit the memory limit (dbg_graph_ef.hpp), and pu the unitigs of partitioned compaction (dbg_part.hpp).
-/// g is always allocated, while ef and pu are set only when used.
-struct OkDbg { tpoptoa::DbgGraph* g; std::unique_ptr<tpoptoa::DbgGraphEF> ef;
-               std::unique_ptr<tpoptoa::PartUnitigs> pu; };
-uint64_t okdbg_core_size(const OkDbg* h);
+/// A built graph in one of three forms.
+/// The table is always allocated.
+/// The compact graph (dbg_graph_ef.hpp) replaces it when the table won't fit the memory limit, and partitioned unitigs (dbg_part.hpp) skip it altogether.
+struct OkDbg { tpoptoa::DbgGraph* graph; std::unique_ptr<tpoptoa::DbgGraphEF> ef_graph;
+               std::unique_ptr<tpoptoa::PartUnitigs> part_unitigs; };
+uint64_t okdbg_core_size(const OkDbg* handle);
 
-/// okdbg_build_from_fasta() - count the k-mers of @fasta_path (abundance at least @min_count) straight into a graph.
-/// @keep_nodes keeps the node table (needed for the -s archive), which rules out partitioned compaction.
-/// Returns nullptr with a message in @errbuf on failure.
-OkDbg* okdbg_build_from_fasta(const char* fasta_path, uint64_t k,
+/// @p keep_nodes keeps the node table for the -s archive, which rules out partitioned compaction.
+/// Failures return nullptr with a message in @p errbuf.
+OkDbg* okdbg_build_from_fasta(const char* fasta_path, uint64_t kmer_len,
                               uint64_t min_count, unsigned nthreads, int keep_nodes,
                               char* errbuf, uint64_t errbuf_len) {
     try {
-        auto* h = new OkDbg();
-        h->g = new tpoptoa::DbgGraph(static_cast<unsigned>(k));
-        // Single-parse lock-free counting straight into the graph's table.
-        // Edge masks come from the observed (K+1)-windows around each occurrence, restricted to solid neighbours, which gives the edge-centric graph over the min_count-solid k-mers.
+        auto* handle = new OkDbg();
+
+        handle->graph = new tpoptoa::DbgGraph(static_cast<unsigned>(kmer_len));
+        // Lock-free counting in a single parse, straight into the graph's table.
+        // Edge masks come from the (K+1)-windows observed around each occurrence and are trimmed to solid neighbours.
+        // The result is the edge-centric graph over the min_count-solid k-mers.
         tpoptoa::detail::count_into_graph(fasta_path,
-            static_cast<std::size_t>(k), static_cast<uint32_t>(min_count),
-            nthreads, *h->g, &h->ef,
-            // the node table is kept when its archive is asked for (-s)
-            !keep_nodes && tpoptoa::part_mode_wanted(static_cast<unsigned>(k)) ? &h->pu : nullptr);
-        if (okdbg_core_size(h) == 0) {
-            delete h->g; delete h;
+            static_cast<std::size_t>(kmer_len), static_cast<uint32_t>(min_count),
+            nthreads, *handle->graph, &handle->ef_graph,
+            !keep_nodes && tpoptoa::part_mode_wanted(static_cast<unsigned>(kmer_len)) ? &handle->part_unitigs : nullptr);
+        if (okdbg_core_size(handle) == 0) {
+            delete handle->graph; delete handle;
             set_error(errbuf, errbuf_len, "no k-mers extracted from input");
             return nullptr;
         }
-        return h;
-    } catch (const std::exception& e) {
-        set_error(errbuf, errbuf_len, e.what());
+
+        return handle;
+    } catch (const std::exception& err) {
+        set_error(errbuf, errbuf_len, err.what());
         return nullptr;
     }
 }
 
-/// okdbg_save() - write the kdbg archive (DbgGraph::save()); -1 for a graph without a node table or on an I/O error.
-int okdbg_save(const OkDbg* h, const char* path) {
+/// Fails for a graph without a node table, and on I/O errors.
+int okdbg_save(const OkDbg* handle, const char* path) {
     try {
-        if (h->pu) return -1;                    // no node table (built without -s)
-        return (h->ef ? h->ef->save(path) : h->g->save(path)) ? 0 : -1;
+        if (handle->part_unitigs) return kStatusFailed;                    // built without -s, so there's no node table
+
+        return (handle->ef_graph ? handle->ef_graph->save(path) : handle->graph->save(path)) ? kStatusOk : kStatusFailed;
     } catch (...) {
-        return -1;
+        return kStatusFailed;
     }
 }
 
-void okdbg_free(OkDbg* h) { delete h->g; delete h; }
+void okdbg_free(OkDbg* handle) { delete handle->graph; delete handle; }
 
-uint64_t okdbg_core_size(const OkDbg* h)  {
-    return h->pu ? h->pu->core_size() : h->ef ? h->ef->core_size() : h->g->core_size();
+uint64_t okdbg_core_size(const OkDbg* handle)  {
+    return handle->part_unitigs ? handle->part_unitigs->core_size() : handle->ef_graph ? handle->ef_graph->core_size() : handle->graph->core_size();
 }
 
 typedef void (*DbgUnitigCb)(void* cookie, const char* seq, uint32_t len,
                             uint64_t coverage);
 
-/// Summary of a written GFA, which okdbg_write_gfa fills.
 struct OkDbgGfaStats {
     uint64_t n_unitigs;
     uint64_t total_bp;      // sum of segment lengths, with overlaps counted twice
     uint64_t n_kmers;       // sum of len - k + 1 over segments
     uint64_t max_len, min_len, n50;
     uint64_t n_links;       // distinct L lines written
-    uint64_t n_dangling;    // graph edges whose target is not a segment end, a validation
-                            // signal, since nonzero means the unitig decomposition is not maximal or not a partition
+    uint64_t n_dangling;    // edges whose target isn't a segment end, where nonzero means the unitigs aren't a maximal partition
 };
 
 }  // extern "C"
 
 namespace {
 
-/// SegmentLengths - segment lengths for the GFA summary, as a histogram where lengths below kHistLimit are counted, longer ones listed, so memory does not grow by one word per segment.
+/// Segment lengths for the GFA summary.
+/// Lengths below kHistLimit go into a histogram and only longer ones are listed, so memory doesn't grow by a word per segment.
 struct SegmentLengths {
     static constexpr std::size_t kHistLimit = std::size_t(1) << 16;
     std::vector<uint64_t> hist = std::vector<uint64_t>(kHistLimit, 0);
     std::vector<uint32_t> big;
+
     void add(uint32_t len) {
         if (len < hist.size()) ++hist[len];
         else big.push_back(len);
     }
 };
 
-/// fill_gfa_stats() - the summary of a written graph, i.e. the count, total, minimum, maximum and N50 of the segment lengths.
-/// Sorts @lens.big.
-/// Does nothing if @st is null.
-void fill_gfa_stats(OkDbgGfaStats* st, SegmentLengths& lens, std::size_t n_seg, uint64_t nk,
+/// Fills count, total, min, max and N50 of the segment lengths, sorting @p lens.big on the way.
+/// A null @p stats makes it a no-op.
+void fill_gfa_stats(OkDbgGfaStats* stats, SegmentLengths& lens, std::size_t n_seg, uint64_t num_kmers,
                     uint64_t n_links, uint64_t dangling) {
-    if (!st) return;
+    if (!stats) return;
+
     std::vector<uint64_t>& len_hist = lens.hist;
     std::vector<uint32_t>& len_big = lens.big;
-    std::memset(st, 0, sizeof(*st));
-    st->n_unitigs = n_seg;
-    st->n_kmers = nk;
-    st->n_links = n_links;
-    st->n_dangling = dangling;
+
+    std::memset(stats, 0, sizeof(*stats));
+    stats->n_unitigs = n_seg;
+    stats->n_kmers = num_kmers;
+    stats->n_links = n_links;
+    stats->n_dangling = dangling;
+
     if (n_seg) {
-        // Lengths in decreasing order, the long ones sorted and then the histogram
+        // Lengths are walked in decreasing order, so the sorted long ones come first and the histogram follows.
         std::sort(len_big.begin(), len_big.end(), std::greater<uint32_t>());
         uint64_t tot = 0;
-        for (const uint32_t l : len_big) tot += l;
-        for (std::size_t l = 0; l < len_hist.size(); ++l) tot += len_hist[l] * l;
-        st->total_bp = tot;
-        std::size_t lo = 0;
-        while (lo < len_hist.size() && !len_hist[lo]) ++lo;
-        std::size_t hi = len_hist.size();
-        while (hi > 0 && !len_hist[hi - 1]) --hi;
-        st->max_len = len_big.empty() ? hi - 1 : len_big.front();
-        st->min_len = lo < len_hist.size() ? lo : len_big.back();
+
+        for (const uint32_t seg_len : len_big) tot += seg_len;
+
+        for (std::size_t seg_len = 0; seg_len < len_hist.size(); ++seg_len) tot += len_hist[seg_len] * seg_len;
+
+        stats->total_bp = tot;
+        std::size_t hist_start = 0;
+
+        while (hist_start < len_hist.size() && !len_hist[hist_start]) ++hist_start;
+
+        std::size_t hist_end = len_hist.size();
+
+        while (hist_end > 0 && !len_hist[hist_end - 1]) --hist_end;
+
+        stats->max_len = len_big.empty() ? hist_end - 1 : len_big.front();
+        stats->min_len = hist_start < len_hist.size() ? hist_start : len_big.back();
         uint64_t cum = 0;
         bool found = false;
-        for (const uint32_t l : len_big) {
-            cum += l;
-            if (cum * 2 >= tot) { st->n50 = l; found = true; break; }
+
+        for (const uint32_t seg_len : len_big) {
+            cum += seg_len;
+
+            // N50 is reached once the lengths seen so far cover at least half the total.
+            if (cum >= tot - cum) { stats->n50 = seg_len; found = true; break; }
         }
-        for (std::size_t l = hi; !found && l-- > lo;) {
-            cum += len_hist[l] * l;
-            if (len_hist[l] && cum * 2 >= tot) { st->n50 = l; found = true; }
+
+        for (std::size_t seg_len = hist_end; !found && seg_len-- > hist_start;) {
+            cum += len_hist[seg_len] * seg_len;
+
+            if (len_hist[seg_len] && cum >= tot - cum) { stats->n50 = seg_len; found = true; }
         }
     }
 }
@@ -199,460 +256,570 @@ void fill_gfa_stats(OkDbgGfaStats* st, SegmentLengths& lens, std::size_t n_seg, 
 /// A link (from, tgt), where from = segment << 1 | leaves reversed and tgt = segment << 1 | entered reversed.
 using Link = std::pair<uint64_t, uint64_t>;
 
-/// write_link_lines() - write the L lines, the sorted, duplicate-free union of the per-thread sorted link lists @part.
-/// Returns the lines written.
+/// Writes the sorted, duplicate-free union of the per-thread link lists and returns the line count.
 ///
-/// The lists are cut into slices by source end.
-/// A slice merges its part of all lists and is formatted by one thread, and the slices are written in order.
-/// Repeats share their source, so they meet in one slice, and the text equals one global merge's.
+/// The lists are cut into slices by source end, and each slice is merged and formatted by one thread before being written in order.
+/// Duplicates share their source, so they always meet in the same slice, and the text equals what one global merge would produce.
 uint64_t write_link_lines(GfaOut& out, const std::vector<std::vector<Link>>& part, std::size_t n_seg,
-                          unsigned nthreads, unsigned K) {
+                          unsigned nthreads, unsigned kmer_len) {
     uint64_t n_links = 0;
-    char ov[16];
-    const auto ovl = std::to_chars(ov, ov + sizeof(ov), K - 1);
-    const uint64_t span = uint64_t(n_seg) * 2;                  // from < 2n
-    const std::size_t NS = std::max<std::size_t>(1, std::size_t(nthreads) * 16);
-    const std::size_t WIN = std::size_t(nthreads) * 4;
-    std::vector<Fmt> buf(WIN);
-    const std::size_t P = part.size();
-    for (std::size_t w0 = 0; w0 < NS; w0 += WIN) {
-        const std::size_t w1 = std::min(NS, w0 + WIN);
-        uint64_t wl = 0;
+    char overlap_cigar[kOverlapCigarBuf];
+    const auto ovl = std::to_chars(overlap_cigar, overlap_cigar + sizeof(overlap_cigar), kmer_len - 1);
+    const uint64_t span = uint64_t(n_seg) * kOrientations;
+    const std::size_t num_slices = std::max<std::size_t>(1, std::size_t(nthreads) * kSlicesPerThread);
+    const std::size_t window_slices = std::size_t(nthreads) * kWindowPerThread;
+    std::vector<Fmt> buf(window_slices);
+    const std::size_t num_parts = part.size();
+
+    for (std::size_t win_start = 0; win_start < num_slices; win_start += window_slices) {
+        const std::size_t win_end = std::min(num_slices, win_start + window_slices);
+        uint64_t win_links = 0;
+
 #ifdef _OPENMP
-        #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1) reduction(+ : wl)
+        #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1) reduction(+ : win_links)
 #endif
-        for (int64_t sl = int64_t(w0); sl < int64_t(w1); ++sl) {
-            Fmt& o = buf[std::size_t(sl) - w0];
-            o.b.clear();
-            const uint64_t flo = span * uint64_t(sl) / NS, fhi = span * uint64_t(sl + 1) / NS;
-            std::vector<std::size_t> at(P), end(P);
-            for (std::size_t t = 0; t < P; ++t) {
-                at[t] = std::lower_bound(part[t].begin(), part[t].end(), Link{flo, 0}) - part[t].begin();
+        for (int64_t sl = int64_t(win_start); sl < int64_t(win_end); ++sl) {
+            Fmt& fmt = buf[std::size_t(sl) - win_start];
+
+            fmt.text.clear();
+            // A slice is a range of source ends, located in each sorted thread list by binary search.
+            const uint64_t flo = span * uint64_t(sl) / num_slices, fhi = span * uint64_t(sl + 1) / num_slices;
+            std::vector<std::size_t> cursor(num_parts), end(num_parts);
+
+            for (std::size_t t = 0; t < num_parts; ++t) {
+                cursor[t] = std::lower_bound(part[t].begin(), part[t].end(), Link{flo, 0}) - part[t].begin();
                 end[t] = std::lower_bound(part[t].begin(), part[t].end(), Link{fhi, 0}) - part[t].begin();
             }
+
             bool have_prev = false;
             Link prev{0, 0};
+
+            // A k-way merge over the thread lists yields the slice's links in order, and a repeat of the previous link is skipped.
             for (;;) {
-                std::size_t best = P;
-                for (std::size_t t = 0; t < P; ++t)
-                    if (at[t] < end[t] && (best == P || part[t][at[t]] < part[best][at[best]]))
+                std::size_t best = num_parts;
+
+                for (std::size_t t = 0; t < num_parts; ++t)
+                    if (cursor[t] < end[t] && (best == num_parts || part[t][cursor[t]] < part[best][cursor[best]]))
                         best = t;
-                if (best == P) break;
-                const Link l = part[best][at[best]++];
-                if (have_prev && l == prev) continue;
-                prev = l; have_prev = true;
-                o.put("L\t", 2); o.num(l.first >> 1);
-                o.put((l.first & 1) ? "\t-\t" : "\t+\t", 3);
-                o.num(l.second >> 1);
-                o.put((l.second & 1) ? "\t-\t" : "\t+\t", 3);
-                o.put(ov, static_cast<std::size_t>(ovl.ptr - ov));
-                o.put("M\n", 2);
-                ++wl;
+
+                if (best == num_parts) break;
+
+                const Link link = part[best][cursor[best]++];
+
+                if (have_prev && link == prev) continue;
+
+                // An end id holds the segment in its high bits and the orientation in bit 0, and every link overlaps by k - 1 bases.
+                prev = link; have_prev = true;
+                fmt.put("L\t", sizeof("L\t") - 1); fmt.num(link.first >> 1);
+                fmt.put((link.first & 1) ? "\t-\t" : "\t+\t", kOrientFieldLen);
+                fmt.num(link.second >> 1);
+                fmt.put((link.second & 1) ? "\t-\t" : "\t+\t", kOrientFieldLen);
+                fmt.put(overlap_cigar, static_cast<std::size_t>(ovl.ptr - overlap_cigar));
+                fmt.put("M\n", sizeof("M\n") - 1);
+                ++win_links;
             }
         }
-        n_links += wl;
-        for (std::size_t c = w0; c < w1; ++c) out.block(buf[c - w0].b);
+
+        n_links += win_links;
+
+        for (std::size_t c = win_start; c < win_end; ++c) out.block(buf[c - win_start].text);
     }
+
     return n_links;
 }
 
 }
 
-/// write_gfa_impl() - the GFA and FASTA writer over any graph form, described at okdbg_write_gfa().
+/// Shared by every graph form, with the output documented at okdbg_write_gfa().
 template <typename G>
-static int write_gfa_impl(G& g, const char* path, unsigned nthreads, OkDbgGfaStats* st, int fasta)
+static int write_gfa_impl(G& graph, const char* path, unsigned nthreads, OkDbgGfaStats* stats, int fasta)
 {
     try {
-        const unsigned K = g.k();
-        const uint64_t mask = K >= 32 ? ~uint64_t(0)
-                                      : ((uint64_t(1) << (2u * K)) - 1);
-        std::FILE* f = std::fopen(path, "w");
-        if (!f) return -1;
+        const unsigned kmer_len = graph.kmer_len();
+        const uint64_t mask = tpoptoa::kmer_mask(kmer_len);
+        std::FILE* file = std::fopen(path, "w");
 
-        auto enc = [](uint8_t c) -> uint64_t {
-            switch (c) { case 'A': return 0; case 'C': return 1;
-                         case 'G': return 2; default: return 3; }
-        };
-        auto pack = [&](const uint8_t* s) {
-            uint64_t v = 0;
-            for (unsigned i = 0; i < K; ++i) v = (v << 2) | enc(s[i]);
-            return v;
-        };
-        auto rc = [&](uint64_t v) { return tpoptoa::reverse_complement(v, K); };
+        if (!file) return kStatusFailed;
 
-        // Oriented end k-mers -> (segment id << 1 | entered_reverse)
-        //   first k-mer of S   enters the segment in '+'
-        //   rc(last k-mer of S) enters the segment in '-'
-        tpoptoa::PhaseTimer pt;
+        auto enc = [](uint8_t ch) -> uint64_t { return tpoptoa::base_encode(static_cast<char>(ch)); };   // unitigs are pure ACGT
+        auto pack = [&](const uint8_t* seq) {
+            uint64_t packed = 0;
+
+            for (unsigned i = 0; i < kmer_len; ++i) packed = (packed << tpoptoa::kBitsPerBase) | enc(seq[i]);
+
+            return packed;
+        };
+        auto rev_comp = [&](uint64_t kmer) { return tpoptoa::reverse_complement(kmer, kmer_len); };
+
+        // Maps oriented end k-mers to (segment id << 1 | entered_reverse):
+        //   the first k-mer of S enters the segment in '+'
+        //   rc(last k-mer of S) enters it in '-'
+        tpoptoa::PhaseTimer timer;
+
         struct Ends { uint64_t first, last; };
-        std::vector<Ends> ends;                 // GFA only, since the links match segment ends
-        SegmentLengths seg_lengths;             // for the statistics
+        std::vector<Ends> ends;                 // GFA only, because links are matched on segment ends
+        SegmentLengths seg_lengths;
         std::size_t n_seg = 0;
-        uint64_t nk = 0;
-        GfaOut out(f);
+        uint64_t num_kmers = 0;
+        GfaOut out(file);
+
         if (!fasta) out.put("H\tVN:Z:1.0\n");
+
         nthreads = tpoptoa::resolve_threads(nthreads);
-        // S lines come from chunks of the sorted unitigs, formatted on all threads and written in order, so the file is the same at any thread count.
-        // Working through a window of chunks at a time bounds the text held in memory.
-        g.unitigs_sorted([&](std::size_t n, const auto& at) {
-            n_seg = n;
-            if (!fasta) ends.resize(n);
+        // S lines come from chunks of the sorted unitigs, formatted on all threads and written in order, so the file never depends on the thread count.
+        // Working through a window of chunks at a time also bounds the text held in memory.
+        graph.unitigs_sorted([&](std::size_t count, const auto& unitig_at) {
+            n_seg = count;
+
+            if (!fasta) ends.resize(count);
+
             constexpr std::size_t kSLineChunk = std::size_t(1) << 15;
-            const std::size_t nch = (n + kSLineChunk - 1) / kSLineChunk;
-            const std::size_t WIN = std::size_t(nthreads) * 4;
-            std::vector<Fmt> buf(WIN);
-            std::vector<std::vector<uint32_t>> clen(WIN);    // each chunk's segment lengths
-            for (std::size_t w0 = 0; w0 < nch; w0 += WIN) {
-                const std::size_t w1 = std::min(nch, w0 + WIN);
-                uint64_t wk = 0;
+            const std::size_t nch = (count + kSLineChunk - 1) / kSLineChunk;
+            const std::size_t window_chunks = std::size_t(nthreads) * kWindowPerThread;
+            std::vector<Fmt> buf(window_chunks);
+            std::vector<std::vector<uint32_t>> clen(window_chunks);    // each chunk's segment lengths
+
+            // Chunks are formatted in parallel a window at a time, then written in id order, so the output is the same at every thread count while memory stays bounded by the window.
+            for (std::size_t win_start = 0; win_start < nch; win_start += window_chunks) {
+                const std::size_t win_end = std::min(nch, win_start + window_chunks);
+                uint64_t win_kmers = 0;
+
 #ifdef _OPENMP
-                #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1) reduction(+ : wk)
+                #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1) reduction(+ : win_kmers)
 #endif
-                for (int64_t c = int64_t(w0); c < int64_t(w1); ++c) {
-                    Fmt& o = buf[std::size_t(c) - w0];
-                    o.b.clear();
-                    std::vector<uint32_t>& cl = clen[std::size_t(c) - w0];
-                    cl.clear();
-                    const std::size_t lo = std::size_t(c) * kSLineChunk, hi = std::min(n, lo + kSLineChunk);
-                    for (std::size_t id = lo; id < hi; ++id) {
-                        const auto u = at(id);
-                        const uint8_t* seq = u.seq;
-                        const uint32_t len = u.len;
-                        const uint64_t kmers = len >= K ? len - K + 1 : 0;
+                for (int64_t c = int64_t(win_start); c < int64_t(win_end); ++c) {
+                    Fmt& fmt = buf[std::size_t(c) - win_start];
+
+                    fmt.text.clear();
+                    std::vector<uint32_t>& chunk_lens = clen[std::size_t(c) - win_start];
+
+                    chunk_lens.clear();
+                    const std::size_t chunk_lo = std::size_t(c) * kSLineChunk, chunk_hi = std::min(count, chunk_lo + kSLineChunk);
+
+                    for (std::size_t id = chunk_lo; id < chunk_hi; ++id) {
+                        const auto unitig = unitig_at(id);
+                        const uint8_t* seq = unitig.seq;
+                        const uint32_t len = unitig.len;
+                        const uint64_t kmers = len >= kmer_len ? len - kmer_len + 1 : 0;
+
+                        // SSHash, SBWT and FMSI expect BCALM-style tags in the FASTA header. GFA puts them after the sequence.
                         if (fasta) {
-                            o.put('>'); o.num(id);
-                            o.put(" LN:i:", 6); o.num(len);
-                            o.put(" KC:i:", 6); o.num(u.cov);
-                            o.put(" km:f:", 6); o.fixed2(kmers ? static_cast<double>(u.cov) / kmers : 0.0);
-                            o.put('\n');
-                            o.put(reinterpret_cast<const char*>(seq), len);
-                            o.put('\n');
+                            fmt.put('>'); fmt.num(id);
+                            fmt.put(" LN:i:", kTagPrefixLen); fmt.num(len);
+                            fmt.put(" KC:i:", kTagPrefixLen); fmt.num(unitig.cov);
+                            fmt.put(" km:f:", kTagPrefixLen); fmt.fixed2(kmers ? static_cast<double>(unitig.cov) / kmers : 0.0);
+                            fmt.put('\n');
+                            fmt.put(reinterpret_cast<const char*>(seq), len);
+                            fmt.put('\n');
                         } else {
-                            o.put("S\t", 2); o.num(id); o.put('\t');
-                            o.put(reinterpret_cast<const char*>(seq), len);
-                            o.put("\tLN:i:", 6); o.num(len);
-                            o.put("\tKC:i:", 6); o.num(u.cov);
-                            o.put("\tkm:f:", 6); o.fixed2(kmers ? static_cast<double>(u.cov) / kmers : 0.0);
-                            o.put('\n');
+                            fmt.put("S\t", sizeof("S\t") - 1); fmt.num(id); fmt.put('\t');
+                            fmt.put(reinterpret_cast<const char*>(seq), len);
+                            fmt.put("\tLN:i:", kTagPrefixLen); fmt.num(len);
+                            fmt.put("\tKC:i:", kTagPrefixLen); fmt.num(unitig.cov);
+                            fmt.put("\tkm:f:", kTagPrefixLen); fmt.fixed2(kmers ? static_cast<double>(unitig.cov) / kmers : 0.0);
+                            fmt.put('\n');
                         }
-                        if (!fasta) ends[id] = Ends{pack(seq), pack(seq + len - K)};
-                        cl.push_back(len);
-                        wk += kmers;
+
+                        // GFA output also needs each segment's first and last k-mer, because the links are built from them afterwards.
+                        if (!fasta) ends[id] = Ends{pack(seq), pack(seq + len - kmer_len)};
+
+                        chunk_lens.push_back(len);
+                        win_kmers += kmers;
                     }
                 }
-                nk += wk;
-                for (std::size_t c = w0; c < w1; ++c) {
-                    out.block(buf[c - w0].b);
-                    for (const uint32_t l : clen[c - w0]) seg_lengths.add(l);
+
+                num_kmers += win_kmers;
+
+                for (std::size_t c = win_start; c < win_end; ++c) {
+                    out.block(buf[c - win_start].text);
+
+                    for (const uint32_t seg_len : clen[c - win_start]) seg_lengths.add(seg_len);
                 }
             }
         }, nthreads);
-        pt.lap("gfa: unitigs + S lines");
+        timer.lap("gfa: unitigs + S lines");
+
         if (fasta) {
             const bool wrote = out.flush();
-            const bool ok = std::fclose(f) == 0 && wrote;
-            fill_gfa_stats(st, seg_lengths, n_seg, nk, 0, 0);
-            return ok ? 0 : -1;
+            const bool closed = std::fclose(file) == 0 && wrote;
+
+            fill_gfa_stats(stats, seg_lengths, n_seg, num_kmers, 0, 0);
+            return closed ? kStatusOk : kStatusFailed;
         }
 
-        // Successor bases of an ORIENTED k-mer E per the canonical masks.
-        auto succ = [&](uint64_t E) -> unsigned {
-            const uint64_t r = rc(E);
-            const uint64_t c = E < r ? E : r;
-            unsigned m = 0;
-            if (E == c) m |= g.out_mask(c);
-            if (r == c) {                       // E is the reverse strand
-                const unsigned in = g.in_mask(c);
-                for (unsigned b = 0; b < 4; ++b)
-                    if (in & (1u << (b ^ 3u))) m |= 1u << b;
+        // Successor bases of an oriented k-mer E, read from the canonical masks.
+        auto succ = [&](uint64_t oriented) -> unsigned {
+            const uint64_t rev = rev_comp(oriented);
+            const uint64_t canon_kmer = oriented < rev ? oriented : rev;
+            unsigned succ_mask = 0;
+
+            if (oriented == canon_kmer) succ_mask |= graph.out_mask(canon_kmer);
+
+            if (rev == canon_kmer) {                       // E is on the reverse strand
+                const unsigned in_edges = graph.in_mask(canon_kmer);
+
+                for (unsigned b = 0; b < tpoptoa::kNumBases; ++b)
+                    if (in_edges & (1u << (b ^ tpoptoa::kComplementMask))) succ_mask |= 1u << b;
             }
-            return m;
+
+            return succ_mask;
         };
-        auto canon = [&](uint64_t x) { const uint64_t r = rc(x); return x < r ? x : r; };
+        auto canon = [&](uint64_t kmer) { const uint64_t rev = rev_comp(kmer); return kmer < rev ? kmer : rev; };
+
         nthreads = tpoptoa::resolve_threads(nthreads);
         const uint64_t n_ends = ends.size();
-        const int64_t ne = static_cast<int64_t>(n_ends);
+        const int64_t num_ends_signed = static_cast<int64_t>(n_ends);
 
-        // 1. Successor masks of every segment end, the only masks the links need.
-        //    The low nibble is the exit of i forward through its last k-mer, and the high nibble the exit of i reversed through rc of its first.
+        // 1. Successor masks of every segment end, which are the only masks the links need.
+        //    The low nibble is i's exit going forward through its last k-mer, and the high nibble its exit going reversed through rc of its first.
         std::vector<uint8_t> exit_mask(n_ends);
         constexpr bool kIsPartitioned = std::is_same_v<G, tpoptoa::PartUnitigs>;
+
         if constexpr (kIsPartitioned) {
-            // partitioned compaction kept every segment's exit masks
-            for (int64_t i = 0; i < ne; ++i) exit_mask[i] = g.exit_mask(static_cast<std::size_t>(i));
+            // Partitioned compaction already kept every segment's exit masks.
+            for (int64_t i = 0; i < num_ends_signed; ++i) exit_mask[i] = graph.exit_mask(static_cast<std::size_t>(i));
         } else {
-            // The loop steps one block of kBlk ends, in chunks of 256 blocks.
-            // A chunk of 65536 iterations was 4M ends, so chr1's 2.4M ends ran on one thread and a human genome's 71M on 9 of 16.
+            // The loop steps one block of kBlk ends at a time, in chunks of kEndSchedChunk blocks.
+            // A coarser chunk (65536 iterations, 4M ends) left chr1's 2.4M ends on one thread and a human genome's 71M on 9 of 16.
             constexpr int64_t kBlk = 64;
+
 #ifdef _OPENMP
-            #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 256)
+            #pragma omp parallel for num_threads(nthreads) schedule(dynamic, kEndSchedChunk)
 #endif
-            for (int64_t b0 = 0; b0 < ne; b0 += kBlk) {
-                const int64_t b1 = std::min(ne, b0 + kBlk);
-                for (int64_t i = b0; i < b1; ++i) {
-                    g.prefetch(canon(ends[i].last));
-                    g.prefetch(canon(ends[i].first));
+            for (int64_t block_start = 0; block_start < num_ends_signed; block_start += kBlk) {
+                const int64_t block_end = std::min(num_ends_signed, block_start + kBlk);
+
+                for (int64_t i = block_start; i < block_end; ++i) {
+                    graph.prefetch(canon(ends[i].last));
+                    graph.prefetch(canon(ends[i].first));
                 }
-                for (int64_t i = b0; i < b1; ++i)
-                    exit_mask[i] = static_cast<uint8_t>(succ(ends[i].last) | (succ(rc(ends[i].first)) << 4));
+
+                for (int64_t i = block_start; i < block_end; ++i)
+                    exit_mask[i] = static_cast<uint8_t>(succ(ends[i].last) | (succ(rev_comp(ends[i].first)) << tpoptoa::kOutEdgeBits));
             }
         }
-        pt.lap("gfa: links: end masks");
+
+        timer.lap("gfa: links: end masks");
 
         std::vector<std::vector<Link>> part(nthreads);
         std::vector<uint64_t> dang(nthreads, 0);
+
         if constexpr (kIsPartitioned) {
-            // Partitioned unitigs have no node table, and both ends of every link are segment ends, so links come from matching the ends' exit windows.
-            // End A's exit (k+1)-mer W_A and end B's W_B are the two traversals of one edge iff W_B = rc(W_A), with a palindromic W its own reverse (the self-mirrored link).
-            // A -> flip(B) is then the link, kept from the end whose (from, tgt) is the canonical representative, as below.
-            // Windows are grouped by canonical key in passes over ranges of a key hash, so memory stays bounded without an index of the end k-mers.
-            // An exit window holds its canonical key and from << 1 | (window == key).
-            // W_B = rc(W_A) iff the bits differ, or the key is its own reverse complement, in which case every exit of it pairs with every other.
-            struct XRec { uint64_t key, fb; };
-            auto canon1 = [&](uint64_t w) { const uint64_t r = tpoptoa::reverse_complement(w, K + 1); return w < r ? w : r; };
+            // Partitioned unitigs have no node table, but both ends of every link are segment ends.
+            // So links come from matching the ends' exit windows instead.
+            // End A's exit (k+1)-mer W_A and end B's W_B traverse the same edge iff W_B = rc(W_A), and a palindromic W is its own reverse (a self-mirrored link).
+            // The link is then A -> flip(B), recorded from whichever end holds the canonical representative, as below.
+            // Windows are grouped by canonical key in passes over ranges of a key hash, which bounds memory without indexing the end k-mers.
+            // Each exit window stores its canonical key plus from << 1 | (window == key).
+            // W_B = rc(W_A) iff those low bits differ, or the key is its own reverse complement, in which case every exit pairs with every other.
+            struct XRec { uint64_t key, from_bits; };
+            auto canon1 = [&](uint64_t window) { const uint64_t rev = tpoptoa::reverse_complement(window, kmer_len + 1); return window < rev ? window : rev; };
             constexpr std::size_t kExitBuckets = 4096;
             constexpr uint64_t kExitBucketSeed = 0x6A09E667F3BCC908ULL;
-            // 64 MB per thread in memory, the rest in the spill directory
+            // Each thread keeps 64 MB in memory and spills the rest.
             constexpr uint64_t kExitMemoryPerThread = uint64_t(64) << 20;
-            tpoptoa::spill::BucketSpill<XRec> xs(nthreads, kExitBuckets, kExitMemoryPerThread, tpoptoa::spill::spill_dir());
+            tpoptoa::spill::BucketSpill<XRec> exit_spill(nthreads, kExitBuckets, kExitMemoryPerThread, tpoptoa::spill::spill_dir());
+
             {
                 std::vector<std::exception_ptr> errs(nthreads);
-                tpoptoa::run_on_threads(nthreads, [&](unsigned t) {
+
+                tpoptoa::run_on_threads(nthreads, [&](unsigned thread_idx) {
                     try {
-                        for (uint64_t i = n_ends * t / nthreads; i < n_ends * (t + 1) / nthreads; ++i)
-                            for (unsigned o = 0; o < 2; ++o) {
-                                const uint64_t E = o == 0 ? ends[i].last : rc(ends[i].first);
-                                const unsigned sm = (exit_mask[i] >> (4 * o)) & 0xFu;
-                                for (unsigned b = 0; b < 4; ++b) {
-                                    if (!(sm & (1u << b))) continue;
-                                    const uint64_t w = (E << 2) | b;
-                                    const uint64_t key = canon1(w);
-                                    xs.add(t, tpoptoa::mix64(key, kExitBucketSeed) & (kExitBuckets - 1),
-                                           XRec{key, (((i << 1) | o) << 1) | (w == key ? 1u : 0u)});
+                        // Each thread takes a contiguous slice of the ends, and every successor of each oriented end becomes one exit record.
+                        for (uint64_t i = n_ends * thread_idx / nthreads; i < n_ends * (thread_idx + 1) / nthreads; ++i)
+                            for (unsigned o = 0; o < kOrientations; ++o) {
+                                const uint64_t oriented = o == 0 ? ends[i].last : rev_comp(ends[i].first);
+                                const unsigned succ_mask = (exit_mask[i] >> (tpoptoa::kOutEdgeBits * o)) & tpoptoa::kOutEdgeMask;
+
+                                for (unsigned b = 0; b < tpoptoa::kNumBases; ++b) {
+                                    if (!(succ_mask & (1u << b))) continue;
+
+                                    const uint64_t window = (oriented << tpoptoa::kBitsPerBase) | b;
+                                    const uint64_t key = canon1(window);
+
+                                    exit_spill.add(thread_idx, tpoptoa::mix64(key, kExitBucketSeed) & (kExitBuckets - 1),
+                                           // The record packs end i with its orientation and a bit for an already canonical window.
+                                           XRec{key, (((i << 1) | o) << 1) | (window == key ? 1u : 0u)});
                                 }
                             }
-                    } catch (...) { errs[t] = std::current_exception(); }
+                    } catch (...) { errs[thread_idx] = std::current_exception(); }
                 });
-                for (auto& e : errs) if (e) std::rethrow_exception(e);
+                for (auto& err : errs) if (err) std::rethrow_exception(err);
             }
             {
-                std::atomic<std::size_t> nb{0};
+                std::atomic<std::size_t> next_bucket{0};
                 std::vector<std::exception_ptr> errs(nthreads);
-                tpoptoa::run_on_threads(nthreads, [&](unsigned q) {
+
+                tpoptoa::run_on_threads(nthreads, [&](unsigned thread_idx) {
                     try {
                         std::vector<XRec> all;
-                        for (std::size_t bk; (bk = nb.fetch_add(1)) < kExitBuckets;) {
-                            xs.load(bk, all);
-                            std::sort(all.begin(), all.end(), [](const XRec& x, const XRec& y) {
-                                return x.key != y.key ? x.key < y.key : x.fb < y.fb; });
-                            for (std::size_t i = 0; i < all.size();) {
-                                std::size_t j = i + 1;
-                                while (j < all.size() && all[j].key == all[i].key) ++j;
-                                const bool pal = tpoptoa::reverse_complement(all[i].key, K + 1) == all[i].key;
-                                for (std::size_t x = i; x < j; ++x) {
+
+                        // Threads then claim whole buckets, and inside a bucket the records that share a key are the candidate pairs.
+                        for (std::size_t bucket; (bucket = next_bucket.fetch_add(1)) < kExitBuckets;) {
+                            exit_spill.load(bucket, all);
+                            std::sort(all.begin(), all.end(), [](const XRec& lhs, const XRec& rhs) {
+                                return lhs.key != rhs.key ? lhs.key < rhs.key : lhs.from_bits < rhs.from_bits; });
+                            for (std::size_t run_start = 0; run_start < all.size();) {
+                                std::size_t run_end = run_start + 1;
+
+                                while (run_end < all.size() && all[run_end].key == all[run_start].key) ++run_end;
+
+                                const bool pal = tpoptoa::reverse_complement(all[run_start].key, kmer_len + 1) == all[run_start].key;
+
+                                for (std::size_t x = run_start; x < run_end; ++x) {
                                     bool any = false;
-                                    for (std::size_t y = i; y < j; ++y) {
-                                        if (!pal && (all[y].fb & 1) == (all[x].fb & 1)) continue;
+
+                                    for (std::size_t y = run_start; y < run_end; ++y) {
+                                        if (!pal && (all[y].from_bits & 1) == (all[x].from_bits & 1)) continue;
+
                                         any = true;
-                                        const uint64_t from = all[x].fb >> 1, tgt = (all[y].fb >> 1) ^ 1;
+                                        const uint64_t from = all[x].from_bits >> 1, tgt = (all[y].from_bits >> 1) ^ 1;
+
+                                        // A link and its reverse describe the same edge, so only the smaller of the two is kept.
                                         if (std::make_pair(from, tgt) <= std::make_pair(tgt ^ 1, from ^ 1))
-                                            part[q].push_back({from, tgt});
+                                            part[thread_idx].push_back({from, tgt});
                                     }
-                                    if (!any) ++dang[q];
+
+                                    // An exit that pairs with no end leaves the graph, which the statistics count as a dangling edge.
+                                    if (!any) ++dang[thread_idx];
                                 }
-                                i = j;
+
+                                run_start = run_end;
                             }
                         }
-                    } catch (...) { errs[q] = std::current_exception(); }
+                    } catch (...) { errs[thread_idx] = std::current_exception(); }
                 });
-                for (auto& e : errs) if (e) std::rethrow_exception(e);
+                for (auto& err : errs) if (err) std::rethrow_exception(err);
             }
-            // each thread's list sorted (the L-line merge below expects it)
+            // The L-line merge below expects each thread's list to be sorted.
             {
-                tpoptoa::run_on_threads(nthreads, [&](unsigned t) { std::sort(part[t].begin(), part[t].end()); });
+                tpoptoa::run_on_threads(nthreads, [&](unsigned thread_idx) { std::sort(part[thread_idx].begin(), part[thread_idx].end()); });
             }
         } else {
-            // 2. Where a link lands, i.e. the segment that an oriented k-mer X enters.
-            //    The in-graph form serves fewer than 2^28 segments that make up at least 1/8 of the nodes.
-            //    The node words, free once the walk is done, are cleared and each boundary node gets its 28-bit segment id and the flags is-first, first-is-forward, is-last and last-is-forward.
-            //    A lookup is then one graph probe and no index is allocated, saving 2.7 GB on chr1 at k=15.
+            // 2. Where a link lands, meaning the segment an oriented k-mer X enters.
+            //    The in-graph form handles fewer than 2^kIdBits segments that make up at least an eighth of the nodes.
+            //    Once the walk is done the node words are free, so each boundary node gets its segment id plus four flags there.
+            //    The flags say is-first, first-is-forward, is-last and last-is-forward.
+            //    A lookup is then one graph probe with no extra index, which saved 2.7 GB on chr1 at k=15.
             //    Otherwise a separate open-addressing entry index is built.
             constexpr uint64_t kIdBits = 28;
             // Clearing the node words sweeps the whole table, which only pays when segments are a sizable share of the nodes.
-            // On chr1, k=15 has 60M segments over 112M nodes, and k=31 has 2.4M over 204M, where the separate index takes 0.1 GB and builds faster.
-            bool in_graph = !kIsPartitioned && n_ends < (uint64_t(1) << kIdBits) && n_ends * 8 >= g.core_size();
+            // On chr1, k=15 has 60M segments over 112M nodes, while k=31 has 2.4M over 204M, where the separate index needs only 0.1 GB and builds faster.
+            bool in_graph = !kIsPartitioned && n_ends < (uint64_t(1) << kIdBits) && n_ends * kInGraphMinShare >= graph.core_size();
+
             // OPTIK_DBG_LINKS=graph|index forces a path, so tests can compare both.
-            if (const char* e = std::getenv("OPTIK_DBG_LINKS")) {
-                if (std::strcmp(e, "graph") == 0) in_graph = !kIsPartitioned && n_ends < (uint64_t(1) << kIdBits);
-                else if (std::strcmp(e, "index") == 0) in_graph = false;
+            if (const char* env = std::getenv("OPTIK_DBG_LINKS")) {
+                if (std::strcmp(env, "graph") == 0) in_graph = !kIsPartitioned && n_ends < (uint64_t(1) << kIdBits);
+                else if (std::strcmp(env, "index") == 0) in_graph = false;
             }
-            // flags above the segment id in a boundary node's word
-            constexpr uint32_t kIsFirst = 1u << 28, kFirstForward = 1u << 29, kIsLast = 1u << 30, kLastForward = 1u << 31;
+
+            // Flags stored above the segment id in a boundary node's word.
+            constexpr uint32_t kIsFirst = 1u << kIdBits, kFirstForward = kIsFirst << 1, kIsLast = kIsFirst << 2, kLastForward = kIsFirst << 3;
+
             struct ESlot { uint64_t key1, val; };
             std::vector<ESlot> etab;
             std::size_t ecap = 0;
-            auto ehome = [&](uint64_t x) {
+            auto ehome = [&](uint64_t kmer) {
                 return static_cast<std::size_t>(
-                    (static_cast<__uint128_t>(tpoptoa::mix64(x, 0x9E3779B97F4A7C15ULL)) * ecap) >> 64);
+                    (static_cast<__uint128_t>(tpoptoa::mix64(kmer, tpoptoa::kGoldenRatio64)) * ecap) >> tpoptoa::kWordBits);
             };
+
+            // When the ends are at least an eighth of the nodes, their entries are stored in the node words, and a separate hash table serves otherwise.
             if (in_graph) {
-                g.aux_clear(nthreads);
+                graph.aux_clear(nthreads);
                 constexpr int64_t kBlk = 64;
+
     #ifdef _OPENMP
-                #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 256)
+                #pragma omp parallel for num_threads(nthreads) schedule(dynamic, kEndSchedChunk)
     #endif
-                for (int64_t b0 = 0; b0 < ne; b0 += kBlk) {
-                    const int64_t b1 = std::min(ne, b0 + kBlk);
-                    for (int64_t i = b0; i < b1; ++i) {
-                        g.prefetch(canon(ends[i].first));
-                        g.prefetch(canon(ends[i].last));
+                for (int64_t block_start = 0; block_start < num_ends_signed; block_start += kBlk) {
+                    const int64_t block_end = std::min(num_ends_signed, block_start + kBlk);
+
+                    // Prefetching the whole block before any write overlaps its misses.
+                    for (int64_t i = block_start; i < block_end; ++i) {
+                        graph.prefetch(canon(ends[i].first));
+                        graph.prefetch(canon(ends[i].last));
                     }
-                    for (int64_t i = b0; i < b1; ++i) {
-                        // One node per k-mer and one segment per node, so a node is written only by its own segment (both ends when the segment is a single k-mer).
-                        const uint64_t F = ends[i].first, L = ends[i].last;
-                        const uint64_t cf = canon(F), cl = canon(L);
-                        uint32_t wf = uint32_t(i) | kIsFirst | (F == cf ? kFirstForward : 0u);
-                        const uint32_t wl = uint32_t(i) | kIsLast | (L == cl ? kLastForward : 0u);
-                        if (cf == cl) wf |= wl;
-                        g.aux_set(g.rank(cf), wf);
-                        if (cf != cl) g.aux_set(g.rank(cl), wl);
+
+                    for (int64_t i = block_start; i < block_end; ++i) {
+                        // Each node belongs to exactly one segment, so only that segment writes it (from both ends when it's a single k-mer).
+                        const uint64_t first_kmer = ends[i].first, last_kmer = ends[i].last;
+                        const uint64_t canon_first = canon(first_kmer), canon_last = canon(last_kmer);
+                        uint32_t first_word = uint32_t(i) | kIsFirst | (first_kmer == canon_first ? kFirstForward : 0u);
+                        const uint32_t last_word = uint32_t(i) | kIsLast | (last_kmer == canon_last ? kLastForward : 0u);
+
+                        if (canon_first == canon_last) first_word |= last_word;
+
+                        graph.aux_set(graph.rank(canon_first), first_word);
+
+                        if (canon_first != canon_last) graph.aux_set(graph.rank(canon_last), last_word);
                     }
                 }
             } else {
-                ecap = n_ends * 2 + n_ends * 6 / 7 + 16;
+                ecap = n_ends * kEntrySlotsPerEnd + n_ends * kEntryExtraNum / kEntryExtraDen + kEntrySlackSlots;
                 etab.assign(ecap, ESlot{0, 0});
-                // In CAS-claimed slots, equal keys may sit in any order along a chain.
-                // Lookups visit every match and each end's links are ordered below, so the output does not depend on it.
-                auto eput = [&](uint64_t x, uint64_t v) {
-                    for (std::size_t i = ehome(x);; i = (i + 1 == ecap) ? 0 : i + 1) {
+                // CAS-claimed slots may hold equal keys in any order along a chain.
+                // Lookups visit every match and each end's links get ordered below, so the output never depends on that order.
+                auto eput = [&](uint64_t key, uint64_t value) {
+                    for (std::size_t slot = ehome(key);; slot = (slot + 1 == ecap) ? 0 : slot + 1) {
                         uint64_t expect = 0;
-                        if (__atomic_compare_exchange_n(&etab[i].key1, &expect, x + 1, false,
+
+                        if (__atomic_compare_exchange_n(&etab[slot].key1, &expect, key + 1, false,
                                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-                            etab[i].val = v;
+                            etab[slot].val = value;
                             return;
                         }
                     }
                 };
     #ifdef _OPENMP
-                #pragma omp parallel for num_threads(nthreads) schedule(static, 65536)
+                #pragma omp parallel for num_threads(nthreads) schedule(static, kNodeSweepChunk)
     #endif
-                for (int64_t i = 0; i < ne; ++i) {
+                for (int64_t i = 0; i < num_ends_signed; ++i) {
                     eput(ends[i].first, uint64_t(i) << 1);
-                    eput(rc(ends[i].last), (uint64_t(i) << 1) | 1);
+                    eput(rev_comp(ends[i].last), (uint64_t(i) << 1) | 1);
                 }
             }
-            pt.lap(in_graph ? "gfa: links: entry lookup (graph ids)" : "gfa: links: entry lookup (index)");
-            // tgt values, segment << 1 | entered reversed, of every segment entered through oriented k-mer X, at most kMaxEntries.
-            // n = 0 marks a dangling edge.
+
+            timer.lap(in_graph ? "gfa: links: entry lookup (graph ids)" : "gfa: links: entry lookup (index)");
+            // Collects the tgt values (segment << 1 | entered reversed) of every segment entered through X, up to kMaxEntries.
+            // An empty result marks a dangling edge.
             constexpr unsigned kMaxEntries = 8;
-            auto entries = [&](uint64_t X, uint64_t* out, unsigned& n) -> void {
-                n = 0;
+            auto entries = [&](uint64_t succ, uint64_t* out, unsigned& count) -> void {
+                count = 0;
+
                 if (in_graph) {
-                    const uint64_t c = canon(X);
-                    const std::size_t xi = g.rank(c);
-                    if (xi == G::kNpos) return;
-                    const uint32_t w = g.aux(xi);
-                    const uint64_t sid = w & ((uint32_t(1) << kIdBits) - 1);
-                    // first k-mer == X means it is entered forward
-                    if ((w & kIsFirst) && ((w & kFirstForward) ? X == c : X == rc(c))) out[n++] = sid << 1;
-                    // rc(last k-mer) == X, i.e. last == rc(X), means it is entered reversed
-                    if ((w & kIsLast) && ((w & kLastForward) ? X == rc(c) : X == c)) out[n++] = (sid << 1) | 1;
+                    const uint64_t canon_kmer = canon(succ);
+                    const std::size_t node = graph.rank(canon_kmer);
+
+                    if (node == G::kNpos) return;
+
+                    const uint32_t word = graph.aux(node);
+                    const uint64_t sid = word & ((uint32_t(1) << kIdBits) - 1);
+
+                    // A first k-mer equal to X enters the segment forward.
+                    if ((word & kIsFirst) && ((word & kFirstForward) ? succ == canon_kmer : succ == rev_comp(canon_kmer))) out[count++] = sid << 1;
+
+                    // rc(last k-mer) == X, in other words last == rc(X), enters it reversed.
+                    if ((word & kIsLast) && ((word & kLastForward) ? succ == rev_comp(canon_kmer) : succ == canon_kmer)) out[count++] = (sid << 1) | 1;
+
                     return;
                 }
-                for (std::size_t j = ehome(X); etab[j].key1; j = (j + 1 == ecap) ? 0 : j + 1)
-                    if (etab[j].key1 == X + 1 && n < kMaxEntries) out[n++] = etab[j].val;
+
+                for (std::size_t slot = ehome(succ); etab[slot].key1; slot = (slot + 1 == ecap) ? 0 : slot + 1)
+                    if (etab[slot].key1 == succ + 1 && count < kMaxEntries) out[count++] = etab[slot].val;
             };
 
             // 3. Each segment end's out-edges, split over threads.
-            //    Every link is recorded from its source end, and ends are visited in increasing order, so each thread's list is sorted by construction once an end's own few links are ordered.
+            //    Every link is recorded from its source end, and ends are visited in increasing order.
+            //    So once an end's own few links are ordered, each thread's list is sorted by construction.
             {
-                tpoptoa::run_on_threads(nthreads, [&](unsigned t) {
-                    auto& links = part[t];
-                    const uint64_t lo = n_ends * t / nthreads, hi = n_ends * (t + 1) / nthreads;
-                    links.reserve((hi - lo) * 2);
+                tpoptoa::run_on_threads(nthreads, [&](unsigned thread_idx) {
+                    auto& links = part[thread_idx];
+                    const uint64_t range_lo = n_ends * thread_idx / nthreads, range_hi = n_ends * (thread_idx + 1) / nthreads;
+
+                    links.reserve((range_hi - range_lo) * kOrientations);
                     constexpr uint64_t kBlk = 64;
-                    for (uint64_t b0 = lo; b0 < hi; b0 += kBlk) {
-                        const uint64_t b1 = std::min(hi, b0 + kBlk);
-                        for (uint64_t i = b0; i < b1; ++i)          // prefetch every target
-                            for (unsigned o = 0; o < 2; ++o) {
-                                const uint64_t E = o == 0 ? ends[i].last : rc(ends[i].first);
-                                const unsigned sm = (exit_mask[i] >> (4 * o)) & 0xFu;
-                                for (unsigned b = 0; b < 4; ++b) {
-                                    if (!(sm & (1u << b))) continue;
-                                    const uint64_t X = ((E << 2) | b) & mask;
-                                    if (in_graph) g.prefetch(canon(X));
-                                    else __builtin_prefetch(&etab[ehome(X)]);
+
+                    for (uint64_t block_start = range_lo; block_start < range_hi; block_start += kBlk) {
+                        const uint64_t block_end = std::min(range_hi, block_start + kBlk);
+
+                        for (uint64_t i = block_start; i < block_end; ++i)          // prefetch all targets first
+                            for (unsigned o = 0; o < kOrientations; ++o) {
+                                const uint64_t oriented = o == 0 ? ends[i].last : rev_comp(ends[i].first);
+                                const unsigned succ_mask = (exit_mask[i] >> (tpoptoa::kOutEdgeBits * o)) & tpoptoa::kOutEdgeMask;
+
+                                for (unsigned b = 0; b < tpoptoa::kNumBases; ++b) {
+                                    if (!(succ_mask & (1u << b))) continue;
+
+                                    const uint64_t succ = ((oriented << tpoptoa::kBitsPerBase) | b) & mask;
+
+                                    if (in_graph) graph.prefetch(canon(succ));
+                                    else __builtin_prefetch(&etab[ehome(succ)]);
                                 }
                             }
-                        for (uint64_t i = b0; i < b1; ++i)
-                            for (unsigned o = 0; o < 2; ++o) {
-                                // exit k-mer of segment i traversed in orientation o
-                                const uint64_t E = o == 0 ? ends[i].last : rc(ends[i].first);
-                                const unsigned sm = (exit_mask[i] >> (4 * o)) & 0xFu;
+
+                        for (uint64_t i = block_start; i < block_end; ++i)
+                            for (unsigned o = 0; o < kOrientations; ++o) {
+                                const uint64_t oriented = o == 0 ? ends[i].last : rev_comp(ends[i].first);
+                                const unsigned succ_mask = (exit_mask[i] >> (tpoptoa::kOutEdgeBits * o)) & tpoptoa::kOutEdgeMask;
                                 const uint64_t from = (i << 1) | o;
-                                const std::size_t g0 = links.size();
-                                for (unsigned b = 0; b < 4; ++b) {
-                                    if (!(sm & (1u << b))) continue;
-                                    const uint64_t X = ((E << 2) | b) & mask;
-                                    uint64_t tg[kMaxEntries]; unsigned nt;
-                                    entries(X, tg, nt);
-                                    if (!nt) { ++dang[t]; continue; }
-                                    for (unsigned q = 0; q < nt; ++q) {
-                                        // Canonical representative of the bidirected
-                                        // edge, (from -> tgt) == (flip(tgt) -> flip(from)).
-                                        // Each edge is found from both of its ends, and only the end whose (from, tgt) is the representative records it (a self-mirrored edge has one form and is found once).
-                                        const uint64_t tgt = tg[q], rfrom = tgt ^ 1, rto = from ^ 1;
+                                const std::size_t sorted_from = links.size();
+
+                                for (unsigned b = 0; b < tpoptoa::kNumBases; ++b) {
+                                    if (!(succ_mask & (1u << b))) continue;
+
+                                    const uint64_t succ = ((oriented << tpoptoa::kBitsPerBase) | b) & mask;
+                                    uint64_t targets[kMaxEntries]; unsigned num_targets;
+
+                                    entries(succ, targets, num_targets);
+
+                                    // This successor is not a segment end in the graph. The link would dangle, and n_dangling counts it instead.
+                                    if (!num_targets) { ++dang[thread_idx]; continue; }
+
+                                    for (unsigned q = 0; q < num_targets; ++q) {
+                                        // (from -> tgt) and (flip(tgt) -> flip(from)) are the same bidirected edge.
+                                        // Each edge is found from both ends, so only the end holding the smaller form records it, and a self-mirrored edge has just one form anyway.
+                                        const uint64_t tgt = targets[q], rfrom = tgt ^ 1, rto = from ^ 1;
+
                                         if (std::make_pair(from, tgt) <= std::make_pair(rfrom, rto))
                                             links.push_back({from, tgt});
                                     }
                                 }
-                                for (std::size_t a2 = g0 + 1; a2 < links.size(); ++a2)
-                                    for (std::size_t b2 = a2; b2 > g0 && links[b2] < links[b2 - 1]; --b2)
+
+                                // Each oriented end adds only a few links, so an insertion sort keeps the list ordered as it grows.
+                                for (std::size_t a2 = sorted_from + 1; a2 < links.size(); ++a2)
+                                    for (std::size_t b2 = a2; b2 > sorted_from && links[b2] < links[b2 - 1]; --b2)
                                         std::swap(links[b2], links[b2 - 1]);
                             }
                     }
-                    // sorted by construction in O(n) without a sort, and checked in one linear pass, with a full sort as the fallback
+
+                    // Construction already sorted the list in O(n), and one linear pass confirms it, with a full sort as a fallback.
                     if (!std::is_sorted(links.begin(), links.end()))
                         std::sort(links.begin(), links.end());
                 });
             }
             std::vector<ESlot>().swap(etab);
         }
-        pt.lap("gfa: links: find + sort");
-        // The entry index is not needed past this point.
+
+        timer.lap("gfa: links: find + sort");
         std::vector<uint8_t>().swap(exit_mask);
         std::vector<Ends>().swap(ends);
         uint64_t dangling = 0;
-        for (uint64_t d : dang) dangling += d;
-        const uint64_t n_links = write_link_lines(out, part, n_seg, nthreads, K);
-        const bool wrote = out.flush();
-        const bool ok = std::fclose(f) == 0 && wrote;
-        pt.lap("gfa: links + L lines");
 
-        fill_gfa_stats(st, seg_lengths, n_seg, nk, n_links, dangling);
-        return ok ? 0 : -1;
+        for (uint64_t count : dang) dangling += count;
+
+        const uint64_t n_links = write_link_lines(out, part, n_seg, nthreads, kmer_len);
+        const bool wrote = out.flush();
+        const bool closed = std::fclose(file) == 0 && wrote;
+
+        timer.lap("gfa: links + L lines");
+
+        fill_gfa_stats(stats, seg_lengths, n_seg, num_kmers, n_links, dangling);
+        return closed ? kStatusOk : kStatusFailed;
     } catch (...) {
-        return -1;
+        return kStatusFailed;
     }
 }
 
 extern "C" {
 
-/// okdbg_write_gfa() - write the maximal unitigs of @h to @path as GFA1
-///   S <id> <seq> LN:i KC:i km:f   KC is the summed k-mer abundance and km the
-///                                 mean abundance per k-mer
-///   L <a> <+/-> <b> <+/-> <k-1>M  one line per bidirected edge
-/// Links come from the graph's own canonical in/out masks, so they are exactly the edge set the unitigs were compacted over.
-/// Segments are written in the walker's deterministic order.
+/// Writes the maximal unitigs as GFA1, an S line per unitig and an L line per bidirected edge.
 ///
-/// With @fasta != 0 it writes unitig FASTA instead, which SSHash, SBWT and FMSI pipelines index, with BCALM-style headers ">id LN:i:.. KC:i:.. km:f:.." and no links.
-/// Fills @st if given.
-/// Returns 0 on success, -1 on I/O or allocation failure.
-int okdbg_write_gfa(OkDbg* h, const char* path, unsigned nthreads,
-                    OkDbgGfaStats* st, int fasta) {
-    return h->pu ? write_gfa_impl(*h->pu, path, nthreads, st, fasta)
-         : h->ef ? write_gfa_impl(*h->ef, path, nthreads, st, fasta)
-                 : write_gfa_impl(*h->g, path, nthreads, st, fasta);
+///     S <id> <seq> LN:i KC:i km:f
+///     L <a> <+/-> <b> <+/-> <k-1>M
+///
+/// KC sums the abundances of the unitig's k-mers, while km is their mean.
+/// Links come from the graph's own canonical masks, so they are exactly the edges the unitigs were compacted over.
+/// Segments appear in the walker's deterministic order.
+///
+/// With @p fasta != 0 it writes unitig FASTA instead, the input SSHash, SBWT and FMSI pipelines expect.
+/// Those records have BCALM-style headers (">id LN:i:.. KC:i:.. km:f:..") and no links.
+/// I/O and allocation failures return kStatusFailed.
+int okdbg_write_gfa(OkDbg* handle, const char* path, unsigned nthreads,
+                    OkDbgGfaStats* stats, int fasta) {
+    return handle->part_unitigs ? write_gfa_impl(*handle->part_unitigs, path, nthreads, stats, fasta)
+         : handle->ef_graph ? write_gfa_impl(*handle->ef_graph, path, nthreads, stats, fasta)
+                 : write_gfa_impl(*handle->graph, path, nthreads, stats, fasta);
 }
 
 }  // extern "C"

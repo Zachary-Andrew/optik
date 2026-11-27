@@ -2,13 +2,11 @@
 """run_benchmarks.py - one entry point for optik's validations and benchmarks.
 
   python3 bench/run_benchmarks.py list
-      every bench, what it checks or measures, what it needs, and the
-      section it writes in the results file
+      lists every bench, what it checks or measures, what it needs, and the section it writes in the results file
   python3 bench/run_benchmarks.py run --only small_sets,scaling [--warmup 1 --runs 3]
   python3 bench/run_benchmarks.py run --all
-      runs the named benches one after another, each with its usual defaults,
-      and all of them write their sections into one results file
-      (bench/results/RESULTS.md, or --report PATH)
+      runs the named benches one after another, each with its usual defaults
+      and collects all of their sections in one results file (bench/results/RESULTS.md, or --report PATH)
   python3 bench/run_benchmarks.py run --only wgsim -- --pairs 100000
       passes everything after -- to each selected bench
 
@@ -30,6 +28,7 @@ sys.path.insert(0, HERE)
 import genomes
 import hw
 import report as results_file
+from units import SECONDS_PER_MINUTE
 
 # Fetched into temp/genomes/ by bench/genomes.py before a bench that reads it runs
 ECOLI = os.path.join(genomes.DEST, genomes.GENOMES["ecoli"][0])
@@ -45,9 +44,9 @@ def exe(name):
     return shutil.which(name) is not None
 
 
-def path(p):
+def path(target):
     """True when the file or directory `p` exists."""
-    return os.path.exists(p)
+    return os.path.exists(target)
 
 
 # Each bench names its script and arguments, the shared flags it takes, what it needs as (check, what, how to get it), the results-file sections it writes, and the wall time of its last full run on a 16-CPU, 31 GiB machine (temp/audit/chain.log and temp/run_benchmarks/validations.log, 2026-10-23), where one was timed.
@@ -235,12 +234,12 @@ BENCHES = {
 }
 
 
-def missing(b, extra):
+def missing(bench, extra):
     """The needs of bench `b` that are not met, as 'what (how)' strings.
 
     A need whose check cannot be met by files on disk, such as real reads given after --, counts as met when extra arguments were given."""
     out = []
-    for check, what, how in b["needs"]:
+    for check, what, how in bench["needs"]:
         if check():
             continue
         if extra and what.endswith("after --"):
@@ -251,24 +250,24 @@ def missing(b, extra):
 
 def cmd_list():
     """Prints every bench with what it does, what it needs and the section it writes."""
-    for name, b in BENCHES.items():
+    for name, bench in BENCHES.items():
         print(f"{name}")
-        print(f"  {b['what']}")
+        print(f"  {bench['what']}")
         print(
-            f"  command  {' '.join(os.path.relpath(c, ROOT) if c.startswith(ROOT) else c for c in b['cmd'])}"
+            f"  command  {' '.join(os.path.relpath(arg, ROOT) if arg.startswith(ROOT) else arg for arg in bench['cmd'])}"
         )
-        print(f"  writes   {b['sections']}")
-        if b["time"]:
-            print(f"  time     {b['time']} on 16 CPUs")
-        gaps = missing(b, [])
+        print(f"  writes   {bench['sections']}")
+        if bench["time"]:
+            print(f"  time     {bench['time']} on 16 CPUs")
+        gaps = missing(bench, [])
         print("  ready" if not gaps else "  needs    " + "; ".join(gaps))
         print()
 
 
-def cmd_run(a, extra):
+def cmd_run(args, extra):
     """Runs the selected benches in order and writes the 'runs' section."""
-    names = list(BENCHES) if a.all else [n for n in a.only.split(",") if n]
-    bad = [n for n in names if n not in BENCHES]
+    names = list(BENCHES) if args.all else [name for name in args.only.split(",") if name]
+    bad = [name for name in names if name not in BENCHES]
     if bad or not names:
         sys.exit(
             f"unknown bench {bad}; `run_benchmarks.py list` shows them"
@@ -278,28 +277,28 @@ def cmd_run(a, extra):
     os.makedirs(WORK, exist_ok=True)
     # Benches of earlier invocations keep their rows, and a bench run again replaces its own.
     earlier = []
-    if a.report and os.path.exists(a.report):
-        old = results_file.read_report(a.report).get("runs", {}).get("tables", {})
-        earlier = [r for r in old.get("", []) if r.get("bench") not in names]
+    if args.report and os.path.exists(args.report):
+        old = results_file.read_report(args.report).get("runs", {}).get("tables", {})
+        earlier = [row for row in old.get("", []) if row.get("bench") not in names]
     rows = []
 
     def record():
         """Writes the runs section, after every bench so an interrupted campaign keeps what ran."""
         results_file.write_section(
-            a.report,
+            args.report,
             "runs",
             "The benches run by bench/run_benchmarks.py, with their exit status and wall time",
             [("", earlier + rows)],
         )
 
-    for n in names:
-        b = BENCHES[n]
-        gaps = missing(b, extra)
+    for name in names:
+        bench = BENCHES[name]
+        gaps = missing(bench, extra)
         if gaps:
-            print(f"[skip] {n}: needs {'; '.join(gaps)}", flush=True)
+            print(f"[skip] {name}: needs {'; '.join(gaps)}", flush=True)
             rows.append(
                 {
-                    "bench": n,
+                    "bench": name,
                     "status": "SKIP",
                     "wall_min": None,
                     "command": "",
@@ -308,49 +307,49 @@ def cmd_run(a, extra):
             )
             record()
             continue
-        cmd = list(b["cmd"])
-        for flag in b["flags"]:
-            v = getattr(a, flag[2:])
-            if v is not None:
-                cmd += [flag, str(v)]
-        if n != "validations":
-            cmd += ["--report", a.report]
+        cmd = list(bench["cmd"])
+        for flag in bench["flags"]:
+            value = getattr(args, flag.removeprefix("--"))
+            if value is not None:
+                cmd += [flag, str(value)]
+        if name != "validations":
+            cmd += ["--report", args.report]
         cmd += extra
         if ECOLI in cmd:
             genomes.path("ecoli")
-        log = os.path.join(WORK, f"{n}.log")
+        log = os.path.join(WORK, f"{name}.log")
         print(
-            f"[run] {n}: {' '.join(cmd)}\n      log {os.path.relpath(log, ROOT)}",
+            f"[run] {name}: {' '.join(cmd)}\n      log {os.path.relpath(log, ROOT)}",
             flush=True,
         )
-        t0 = time.time()
-        with open(log, "w") as f:
-            rc = subprocess.run(
-                cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, check=False
+        start = time.time()
+        with open(log, "w") as log_file:
+            exit_code = subprocess.run(
+                cmd, cwd=ROOT, stdout=log_file, stderr=subprocess.STDOUT, check=False
             ).returncode
-        mins = (time.time() - t0) / 60
+        mins = (time.time() - start) / SECONDS_PER_MINUTE
         print(
-            f"[{'ok' if rc == 0 else 'FAIL'}] {n}: exit {rc} after {mins:.1f} min",
+            f"[{'ok' if exit_code == 0 else 'FAIL'}] {name}: exit {exit_code} after {mins:.1f} min",
             flush=True,
         )
         rows.append(
             {
-                "bench": n,
-                "status": "PASS" if rc == 0 else f"FAIL exit {rc}",
+                "bench": name,
+                "status": "PASS" if exit_code == 0 else f"FAIL exit {exit_code}",
                 "wall_min": round(mins, 1),
                 "command": " ".join(
-                    os.path.relpath(c, ROOT) if c.startswith(ROOT) else c for c in cmd
+                    os.path.relpath(arg, ROOT) if arg.startswith(ROOT) else arg for arg in cmd
                 ),
                 "log": os.path.relpath(log, ROOT),
             }
         )
         record()
     count = {
-        k: sum(r["status"].startswith(k) for r in rows)
-        for k in ("PASS", "FAIL", "SKIP")
+        status: sum(row["status"].startswith(status) for row in rows)
+        for status in ("PASS", "FAIL", "SKIP")
     }
     print(
-        f"{count['PASS']} passed, {count['FAIL']} failed, {count['SKIP']} skipped -> {a.report}"
+        f"{count['PASS']} passed, {count['FAIL']} failed, {count['SKIP']} skipped -> {args.report}"
     )
     return 1 if count["FAIL"] else 0
 
@@ -360,40 +359,40 @@ def main():
     argv = sys.argv[1:]
     extra = []
     if "--" in argv:
-        i = argv.index("--")
-        argv, extra = argv[:i], argv[i + 1 :]
-    ap = argparse.ArgumentParser(
+        sep_idx = argv.index("--")
+        argv, extra = argv[:sep_idx], argv[sep_idx + 1 :]
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="show every bench, what it needs and what it writes")
-    r = sub.add_parser("run", help="run benches into one results file")
-    g = r.add_mutually_exclusive_group(required=True)
-    g.add_argument("--only", help="comma list of bench names (see list)")
-    g.add_argument(
+    run_parser = sub.add_parser("run", help="run benches into one results file")
+    group = run_parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--only", help="comma list of bench names (see list)")
+    group.add_argument(
         "--all", action="store_true", help="every bench, in the order of list"
     )
-    r.add_argument(
+    run_parser.add_argument(
         "--warmup",
         type=int,
         help="warmup runs of every timed command (each bench's default when omitted)",
     )
-    r.add_argument(
+    run_parser.add_argument(
         "--runs",
         type=int,
         help="measured runs of every timed command (each bench's default when omitted)",
     )
-    r.add_argument(
+    run_parser.add_argument(
         "--threads",
         type=int,
         help=f"threads of every tool (default: the usable CPUs, {hw.cpus()} here)",
     )
-    results_file.add_argument(r)
-    a = ap.parse_args(argv)
-    if a.cmd == "list":
+    results_file.add_argument(run_parser)
+    args = parser.parse_args(argv)
+    if args.cmd == "list":
         cmd_list()
         return 0
-    return cmd_run(a, extra)
+    return cmd_run(args, extra)
 
 
 if __name__ == "__main__":

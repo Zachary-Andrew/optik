@@ -31,9 +31,44 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # The variable has no effect outside Nix.
 export NIX_ENFORCE_NO_NATIVE=0
 
+# Fixed parameters of the validation workloads.
+readonly DEFAULT_KMER_LEN=31          # k when none is given (the dataset may then set its own)
+readonly DBG_MAX_K=31                 # dbruijn's largest k
+readonly OPTIK_MAX_K=32               # largest k of the indexes
+readonly SEED=42                      # RNG seed of the simulated reads and probes
+readonly SECOND_GENOME_SEED=7         # seed of the second-genome map suite
+readonly DBG_READ_COVERAGE=20         # step 3: simulated read coverage for -c 2, read length and error model
+readonly DBG_READ_LEN=150
+readonly DBG_READ_SUBST=0.01
+readonly DBG_READ_INDEL=0.001
+readonly OFFICIAL_SSHASH_M=15         # step 4: SSHash minimizer length
+readonly SHORT_READ_LEN=150           # steps 4 and 9: simulated read length, and their error rates
+readonly OFFICIAL_MAP_ERR=0.10
+readonly SECOND_GENOME_ERR=0.02
+readonly LONG_READS=30                # step 7: long reads per suite, their length and suite B's error rate
+readonly LONG_READ_LEN=50000
+readonly LONG_READ_ERR=0.001
+readonly DET_SHORT_READS=4000         # step 8: short and long reads of the determinism check, and their models
+readonly DET_SHORT_LEN=150
+readonly DET_SHORT_SUBST=0.02
+readonly DET_SHORT_INDEL=0.002
+readonly DET_LONG_READS=100
+readonly DET_LONG_LEN=8000
+readonly DET_LONG_SEED=43
+readonly DET_LONG_SUBST=0.05
+readonly DET_LONG_INDEL=0.01
+readonly DET_MIN_MAPPED_NUM=9         # at least 9/10 of the reads must map
+readonly DET_MIN_MAPPED_DEN=10
+readonly FUZZ_SEEDS="1 2 3"           # step 10: fuzz seeds and rounds per seed
+readonly FUZZ_ROUNDS=80
+readonly MAPQ_ERROR_RATES="0.01 0.04 0.08"   # MAPQ calibration error rates, reads per rate, and reads of the multi-genome check
+readonly MAPQ_READS=300000
+readonly MAPQ_MULTI_READS=20000
+readonly PAIRED_PAIRS=50000           # paired-end bench pairs
+
 # Defaults
 DATASET="${1:-ecoli_k31}"
-K="${2:-31}"
+KMER_LEN="${2:-$DEFAULT_KMER_LEN}"
 OPTIK_BIN="${OPTIK_BIN:-$PROJECT_ROOT/target/release/optik}"
 MINIMAP2_BIN="${MINIMAP2_BIN:-}"
 BIFROST_BIN="${BIFROST_BIN:-}"
@@ -118,17 +153,17 @@ else:
 }
 
 # The dataset's k applies unless k was given.
-if [ "$K" = "31" ]; then
+if [ "$KMER_LEN" = "$DEFAULT_KMER_LEN" ]; then
     DS_K=$(get_dataset_k)
-    [ -n "$DS_K" ] && K="$DS_K"
+    [ -n "$DS_K" ] && KMER_LEN="$DS_K"
 fi
 
 REF=$(get_dataset_ref)
 QUERIES=$(get_dataset_queries)
 # The dataset's files come with the SSHash checkout, so a missing one stops the suite here with the command that provides it.
-for f in "$REF" "$QUERIES"; do
-    if [ -n "$f" ] && [ ! -e "$f" ]; then
-        echo "error: $DATASET input $f is missing (bench/build_tools.sh sshash fetches it)" >&2
+for input_file in "$REF" "$QUERIES"; do
+    if [ -n "$input_file" ] && [ ! -e "$input_file" ]; then
+        echo "error: $DATASET input $input_file is missing (bench/build_tools.sh sshash fetches it)" >&2
         exit 1
     fi
 done
@@ -152,7 +187,7 @@ echo "  optik correctness validation suite"
 echo "=============================================="
 echo "  dataset:   $DATASET"
 echo "  reference: $REF"
-echo "  k:         $K"
+echo "  k:         $KMER_LEN"
 echo "  optik:     $OPTIK_BIN"
 echo "  minimap2:  ${MINIMAP2_BIN:-not found}"
 echo "  bifrost:   ${BIFROST_BIN:-not found}"
@@ -214,7 +249,7 @@ echo "  [1/9] Query validation"
 step_mark "1 Query validation"
 echo "----------------------------------------------"
 
-QUERY_ARGS=(-r "$REF_UNCOMPRESSED" -k "$K" --optik "$OPTIK_BIN" -s 42)
+QUERY_ARGS=(-r "$REF_UNCOMPRESSED" -k "$KMER_LEN" --optik "$OPTIK_BIN" -s "$SEED")
 [ -x "$SSHASH_BIN" ] && QUERY_ARGS+=(--sshash "$SSHASH_BIN")
 
 if python3 "$SCRIPT_DIR/validate_query.py" "${QUERY_ARGS[@]}"; then
@@ -232,8 +267,8 @@ echo "  [2/9] Mapping validation"
 step_mark "2 Mapping validation"
 echo "----------------------------------------------"
 
-MAP_ARGS=(-r "$REF_UNCOMPRESSED" -k "$K" --optik "$OPTIK_BIN"
-          -n "$NUM_READS" -s 42)
+MAP_ARGS=(-r "$REF_UNCOMPRESSED" -k "$KMER_LEN" --optik "$OPTIK_BIN"
+          -n "$NUM_READS" -s "$SEED")
 [ -x "$MINIMAP2_BIN" ] && MAP_ARGS+=(--minimap2 "$MINIMAP2_BIN")
 [ -n "$WFMASH_BIN" ] && [ -x "$WFMASH_BIN" ] && MAP_ARGS+=(--wfmash "$WFMASH_BIN")
 # When wgatools is available (temp/wgatools/target/release/wgatools or a system binary), the independent PAF round-trip checks are included, validate for position and CIGAR consistency and pafcov for reference depth.
@@ -292,13 +327,13 @@ else
     DBG_INPUT_UNCOMPRESSED="$DBG_INPUT"
 fi
 
-DBG_ARGS=(-i "$DBG_INPUT_UNCOMPRESSED" -k "$K"
+DBG_ARGS=(-i "$DBG_INPUT_UNCOMPRESSED" -k "$KMER_LEN"
           --optik "$OPTIK_BIN" --min-count 1 -t "$THREADS")
 [ -x "$BIFROST_BIN" ] && DBG_ARGS+=(--bifrost "$BIFROST_BIN")
 [ -x "$CUTTLEFISH_BIN" ] && DBG_ARGS+=(--cuttlefish "$CUTTLEFISH_BIN")
 
-if [ "$K" -gt 31 ]; then
-    skip "DBG validation" "k=$K exceeds dbruijn's k <= 31"
+if [ "$KMER_LEN" -gt "$DBG_MAX_K" ]; then
+    skip "DBG validation" "k=$KMER_LEN exceeds dbruijn's k <= $DBG_MAX_K"
 else
     step_mark "3 dbg -c 1"
     if python3 "$SCRIPT_DIR/validate_dbg.py" "${DBG_ARGS[@]}"; then
@@ -333,8 +368,8 @@ with open(src) as fh:
 with open(dst, "w") as fh:
     fh.write(">slice\n" + "".join(out) + "\n")
 PYEOF
-    python3 "$SCRIPT_DIR/gen_reads.py" -r "$DBG_SLICE" -c 20 -l 150 \
-        -e 0.01 --ins 0.001 --del 0.001 -s 42 -o "$DBG_READS" >/dev/null
+    python3 "$SCRIPT_DIR/gen_reads.py" -r "$DBG_SLICE" -c "$DBG_READ_COVERAGE" -l "$DBG_READ_LEN" \
+        -e "$DBG_READ_SUBST" --ins "$DBG_READ_INDEL" --del "$DBG_READ_INDEL" -s "$SEED" -o "$DBG_READS" >/dev/null
     DBG_ARGS_C2=("${DBG_ARGS[@]}")
     for i in "${!DBG_ARGS_C2[@]}"; do
         [ "${DBG_ARGS_C2[$i]}" = "--min-count" ] && DBG_ARGS_C2[$((i + 1))]=2
@@ -359,8 +394,8 @@ echo "----------------------------------------------"
 # optik's k-mer code is limited to k <= 32 (MAX_K).
 # optik cannot index datasets with a larger k, so for them the strict official suite is skipped with a warning rather than failed.
 OFFICIAL_PASS=0
-if [ "$K" -gt 32 ]; then
-    skip "official suite" "k=$K exceeds optik MAX_K=32"
+if [ "$KMER_LEN" -gt "$OPTIK_MAX_K" ]; then
+    skip "official suite" "k=$KMER_LEN exceeds optik MAX_K=$OPTIK_MAX_K"
 else
     OFF_WORKDIR="${OFF_WORKDIR:-/tmp/optik_official_$$}"
     rm -rf "$OFF_WORKDIR"
@@ -370,9 +405,9 @@ else
     if [ -z "$KMC_BIN" ] || [ ! -x "$KMC_BIN" ]; then
         skip "official query/dbg suites" "KMC not found (set KMC_BIN or run build_tools.sh)"
     else
-    OFF_ARGS=(-r "$REF_UNCOMPRESSED" -k "$K" --queries "$QUERIES" -t "$THREADS"
+    OFF_ARGS=(-r "$REF_UNCOMPRESSED" -k "$KMER_LEN" --queries "$QUERIES" -t "$THREADS"
               --optik "$OPTIK_BIN" --sshash "$SSHASH_BIN" --kmc "$KMC_BIN"
-              --sshash-m 15 -s 42 --workdir "$OFF_WORKDIR/query")
+              --sshash-m "$OFFICIAL_SSHASH_M" -s "$SEED" --workdir "$OFF_WORKDIR/query")
     step_mark "4 official query"
     if python3 "$SCRIPT_DIR/validate_official.py" query "${OFF_ARGS[@]}" \
             >"$OFF_WORKDIR/query.json" 2>"$OFF_WORKDIR/query.err"; then
@@ -386,9 +421,9 @@ else
 
     # The map suite checks exact positions on error-free reads, NM and CIGAR, sensitivity scored against the truth beside minimap2 on the same 10%-error reads, and samtools round trips.
     # Each mapper runs with its own documented defaults (optik map, minimap2 -ax sr or map-ont), and no seed parameters are forced.
-    MAP2_ARGS=(-r "$REF_UNCOMPRESSED" -k "$K" -n "$NUM_READS" -t "$THREADS"
-               --read-len 150 --err-rate 0.10
-               --optik "$OPTIK_BIN" -s 42 --workdir "$OFF_WORKDIR/map")
+    MAP2_ARGS=(-r "$REF_UNCOMPRESSED" -k "$KMER_LEN" -n "$NUM_READS" -t "$THREADS"
+               --read-len "$SHORT_READ_LEN" --err-rate "$OFFICIAL_MAP_ERR"
+               --optik "$OPTIK_BIN" -s "$SEED" --workdir "$OFF_WORKDIR/map")
     [ -x "$MINIMAP2_BIN" ] && MAP2_ARGS+=(--minimap2 "$MINIMAP2_BIN")
     [ -n "$WFMASH_BIN" ] && [ -x "$WFMASH_BIN" ] && MAP2_ARGS+=(--wfmash "$WFMASH_BIN")
     [ -x "$SAMTOOLS_BIN" ] && MAP2_ARGS+=(--samtools "$SAMTOOLS_BIN")
@@ -404,8 +439,8 @@ else
 
     # The dbg suite requires the unitig set to equal the KMC oracle with no branch crossings.
     if [ -x "$KMC_BIN" ]; then
-        DBG2_ARGS=(-i "$QUERIES" -k "$K" --min-count 1 -t "$THREADS"
-                  --optik "$OPTIK_BIN" --kmc "$KMC_BIN" -s 42
+        DBG2_ARGS=(-i "$QUERIES" -k "$KMER_LEN" --min-count 1 -t "$THREADS"
+                  --optik "$OPTIK_BIN" --kmc "$KMC_BIN" -s "$SEED"
                   --workdir "$OFF_WORKDIR/dbg")
         [ -x "$BIFROST_BIN" ] && DBG2_ARGS+=(--bifrost "$BIFROST_BIN")
         [ -x "$CUTTLEFISH_BIN" ] && DBG2_ARGS+=(--cuttlefish "$CUTTLEFISH_BIN")
@@ -493,14 +528,11 @@ echo "----------------------------------------------"
 # Runs only when SALMONELLA_REF points at a Salmonella reference (such as NC_003197.1, 4.86 Mb).
 # Reads of 500 bp or more take optik's chaining path, which writes one primary (with possibly soft-clipped flanks) plus supplementary records carrying SA tags.
 #
-#   Suite A maps 30 error-free 50 kb reads from both strands and checks them with
-#           validate_mapping.py.  The primary must be anchored at its origin
-#           (pos - 1 == gt + leading_S) on the truth strand with NM 0, parity
-#           with minimap2 -ax map-ont is scored against the truth, and the
-#           wgatools PAF round trip runs as well.
-#   Suite B maps 30 50 kb reads at 0.1% error with optik and wfmash, both on
-#           their defaults, and scores them against the simulation truth.  optik
-#           must place every read and at least as many as wfmash.
+#   Suite A maps 30 error-free 50 kb reads from both strands and checks them with validate_mapping.py.
+#           The primary must be anchored at its origin (pos - 1 == gt + leading_S) on the truth strand with NM 0.
+#           Parity with minimap2 -ax map-ont is scored against the truth, and the wgatools PAF round trip runs as well.
+#   Suite B maps 30 50 kb reads at 0.1% error with optik and wfmash, both on their defaults, and scores them against the simulation truth.
+#           optik must place every read, and at least as many as wfmash.
 if [ -n "${SALMONELLA_REF:-}" ] && [ -f "$SALMONELLA_REF" ]; then
     if [ ! -s "$SALMONELLA_REF.fai" ]; then
         if command -v samtools >/dev/null 2>&1; then
@@ -512,8 +544,8 @@ if [ -n "${SALMONELLA_REF:-}" ] && [ -f "$SALMONELLA_REF" ]; then
 
 
     SAL_A_FAIL=0
-    SAL_A_ARGS=(-r "$SALMONELLA_REF" -k "$K" --optik "$OPTIK_BIN"
-                -n 30 --read-len 50000 -s 42)
+    SAL_A_ARGS=(-r "$SALMONELLA_REF" -k "$KMER_LEN" --optik "$OPTIK_BIN"
+                -n "$LONG_READS" --read-len "$LONG_READ_LEN" -s "$SEED")
     [ -x "$MINIMAP2_BIN" ] && SAL_A_ARGS+=(--minimap2 "$MINIMAP2_BIN")
     [ -n "$WFMASH_BIN" ] && [ -x "$WFMASH_BIN" ] && SAL_A_ARGS+=(--wfmash "$WFMASH_BIN")
     [ -n "$WGATOOLS_BIN" ] && [ -x "$WGATOOLS_BIN" ] && SAL_A_ARGS+=(--wgatools "$WGATOOLS_BIN")
@@ -529,7 +561,7 @@ if [ -n "${SALMONELLA_REF:-}" ] && [ -f "$SALMONELLA_REF" ]; then
        [ -n "$WGATOOLS_BIN" ] && [ -x "$WGATOOLS_BIN" ]; then
         SAL_B_ARGS=(--ref "$SALMONELLA_REF" --optik "$OPTIK_BIN"
                     --wfmash "$WFMASH_BIN" --wgatools "$WGATOOLS_BIN"
-                    -n 30 -l 50000 -e 0.001)
+                    -n "$LONG_READS" -l "$LONG_READ_LEN" -e "$LONG_READ_ERR")
         if python3 "$SCRIPT_DIR/salmonella_long_reads.py" "${SAL_B_ARGS[@]}"; then
             echo "  => LONG-READ SUITE B (0.1% errors, wfmash baseline): PASS"
         else
@@ -566,19 +598,19 @@ with open_fn(src, "rt") as f, open(dst, "w") as o:
         o.write(line)
 PY
 H8_FAIL=0
-python3 "$SCRIPT_DIR/gen_reads.py" -r "$H8_REF" -n 4000 -l 150 -s 42 -e 0.02 \
-    --ins 0.002 --del 0.002 -o "$H8_WD/short.fa" >/dev/null || H8_FAIL=1
-python3 "$SCRIPT_DIR/gen_reads.py" -r "$H8_REF" -n 100 -l 8000 -s 43 -e 0.05 \
-    --ins 0.01 --del 0.01 -o "$H8_WD/long.fa" >/dev/null || H8_FAIL=1
+python3 "$SCRIPT_DIR/gen_reads.py" -r "$H8_REF" -n "$DET_SHORT_READS" -l "$DET_SHORT_LEN" -s "$SEED" -e "$DET_SHORT_SUBST" \
+    --ins "$DET_SHORT_INDEL" --del "$DET_SHORT_INDEL" -o "$H8_WD/short.fa" >/dev/null || H8_FAIL=1
+python3 "$SCRIPT_DIR/gen_reads.py" -r "$H8_REF" -n "$DET_LONG_READS" -l "$DET_LONG_LEN" -s "$DET_LONG_SEED" -e "$DET_LONG_SUBST" \
+    --ins "$DET_LONG_INDEL" --del "$DET_LONG_INDEL" -o "$H8_WD/long.fa" >/dev/null || H8_FAIL=1
 cat "$H8_WD/short.fa" "$H8_WD/long.fa" > "$H8_WD/reads.fa"
 for cfg in "1:1" "$THREADS:1" "$THREADS:0"; do
-    IFS=':' read -r t thp <<< "$cfg"
-    if ! OPTIK_THP="$thp" "$OPTIK_BIN" map -r "$H8_REF" -q "$H8_WD/reads.fa" -t "$t" \
-            -o "$H8_WD/t${t}_thp${thp}.sam" 2>"$H8_WD/t${t}_thp${thp}.err"; then
-        echo "  => optik map failed (t=$t THP=$thp): $(tail -1 "$H8_WD/t${t}_thp${thp}.err")"
+    IFS=':' read -r run_threads thp <<< "$cfg"
+    if ! OPTIK_THP="$thp" "$OPTIK_BIN" map -r "$H8_REF" -q "$H8_WD/reads.fa" -t "$run_threads" \
+            -o "$H8_WD/t${run_threads}_thp${thp}.sam" 2>"$H8_WD/t${run_threads}_thp${thp}.err"; then
+        echo "  => optik map failed (t=$run_threads THP=$thp): $(tail -1 "$H8_WD/t${run_threads}_thp${thp}.err")"
         H8_FAIL=1
     fi
-    grep -v '^@' "$H8_WD/t${t}_thp${thp}.sam" > "$H8_WD/t${t}_thp${thp}.body" 2>/dev/null || true
+    grep -v '^@' "$H8_WD/t${run_threads}_thp${thp}.sam" > "$H8_WD/t${run_threads}_thp${thp}.body" 2>/dev/null || true
 done
 for other in "t${THREADS}_thp1" "t${THREADS}_thp0"; do
     if ! cmp -s "$H8_WD/t1_thp1.body" "$H8_WD/$other.body"; then
@@ -586,13 +618,13 @@ for other in "t${THREADS}_thp1" "t${THREADS}_thp0"; do
         H8_FAIL=1
     fi
 done
-N8=$(wc -l < "$H8_WD/t1_thp1.body" 2>/dev/null || echo 0)
+H8_RECORDS=$(wc -l < "$H8_WD/t1_thp1.body" 2>/dev/null || echo 0)
 # Identical output is evidence only when the reads map, because an empty or all-unmapped SAM is also identical at every thread count.
-M8=$(awk -F'\t' '!and($2,4)' "$H8_WD/t1_thp1.body" 2>/dev/null | wc -l)
+H8_MAPPED=$(awk -F'\t' '!and($2,4)' "$H8_WD/t1_thp1.body" 2>/dev/null | wc -l)
 NREADS8=$(grep -c '^>' "$H8_WD/reads.fa" 2>/dev/null || echo 0)
-[ "$N8" -gt 0 ] && [ "$M8" -ge $((NREADS8 * 9 / 10)) ] || { echo "  => only $M8 mapped records for $NREADS8 reads"; H8_FAIL=1; }
+[ "$H8_RECORDS" -gt 0 ] && [ "$H8_MAPPED" -ge $((NREADS8 * DET_MIN_MAPPED_NUM / DET_MIN_MAPPED_DEN)) ] || { echo "  => only $H8_MAPPED mapped records for $NREADS8 reads"; H8_FAIL=1; }
 if [ "$H8_FAIL" -eq 0 ]; then
-    echo "  => DETERMINISM: PASS ($N8 records, $M8 mapped, identical at t=1, t=$THREADS, THP on/off)"
+    echo "  => DETERMINISM: PASS ($H8_RECORDS records, $H8_MAPPED mapped, identical at t=1, t=$THREADS, THP on/off)"
 else
     echo "  => DETERMINISM: FAIL"
     FAIL=1
@@ -609,8 +641,8 @@ echo "----------------------------------------------"
 # The truth-scored comparison of optik with minimap2 from step 4, repeated on another genome (2% error by default) so that parity is not tuned to one reference.
 if [ -n "${SALMONELLA_REF:-}" ] && [ -f "$SALMONELLA_REF" ] && [ -x "$MINIMAP2_BIN" ]; then
     SAL_WD="$(mktemp -d /tmp/optik_sal_map_XXXXXX)"
-    SAL_MAP_ARGS=(-r "$SALMONELLA_REF" -k "$K" -n "$NUM_READS" -t "$THREADS"
-                  --read-len 150 --err-rate 0.02 --optik "$OPTIK_BIN" -s 7
+    SAL_MAP_ARGS=(-r "$SALMONELLA_REF" -k "$KMER_LEN" -n "$NUM_READS" -t "$THREADS"
+                  --read-len "$SHORT_READ_LEN" --err-rate "$SECOND_GENOME_ERR" --optik "$OPTIK_BIN" -s "$SECOND_GENOME_SEED"
                   --minimap2 "$MINIMAP2_BIN" --workdir "$SAL_WD")
     [ -n "$WFMASH_BIN" ] && [ -x "$WFMASH_BIN" ] && SAL_MAP_ARGS+=(--wfmash "$WFMASH_BIN")
     [ -x "$SAMTOOLS_BIN" ] && SAL_MAP_ARGS+=(--samtools "$SAMTOOLS_BIN")
@@ -643,8 +675,8 @@ fi
 # fuzz_small.py generates random adversarial genomes (reverse-complement palindromes, repeats, homopolymers, N runs, lowercase, short records) at random k.
 # It checks membership counts, --ids and -c builds against a Python oracle, dbruijn segments against the solid k-mer set, and thread invariance, over three seeds of 80 rounds each.
 FUZZ_OK=1
-for seed in 1 2 3; do
-    python3 "$SCRIPT_DIR/fuzz_small.py" --optik "$OPTIK_BIN" --rounds 80 --seed "$seed" || FUZZ_OK=0
+for seed in $FUZZ_SEEDS; do
+    python3 "$SCRIPT_DIR/fuzz_small.py" --optik "$OPTIK_BIN" --rounds "$FUZZ_ROUNDS" --seed "$seed" || FUZZ_OK=0
 done
 if [ "$FUZZ_OK" -eq 1 ]; then
     echo "  => FUZZ (small adversarial genomes): PASS"
@@ -659,8 +691,8 @@ if [ -x "$MQC_MM2" ]; then
     # Read error rates of 1%, 4% and 8%.
     # The cap and the per-edit ratio were fitted across all three, and 8% failed the gate before the clip-length events were added.
     MQC_OK=1
-    for MQC_E in 0.01 0.04 0.08; do
-        python3 "$SCRIPT_DIR/mapq_calibration.py" --gate --reads 300000 --error "$MQC_E" \
+    for MQC_E in $MAPQ_ERROR_RATES; do
+        python3 "$SCRIPT_DIR/mapq_calibration.py" --gate --reads "$MAPQ_READS" --error "$MQC_E" \
             --optik "$OPTIK_BIN" --minimap2 "$MQC_MM2" --out "${TMPDIR:-/tmp}/optik_mapq_calibration" --report '' \
             > "/tmp/optik_mqc_$$.log" 2>&1 || { MQC_OK=0; echo "  error $MQC_E:"; grep -E "FAIL|OVERCONF" "/tmp/optik_mqc_$$.log" | grep -v minimap2 | head -4; }
     done
@@ -675,7 +707,7 @@ if [ -x "$MQC_MM2" ]; then
     # Per-mate accuracy must reach the single-end level with no over-confident MAPQ band, and proper-pair flags, TLEN and mate fields must be consistent.
     # samtools fixmate and markdup run, and with PICARD_BIN so does Picard ValidateSamFile, next to minimap2 -ax sr R1 R2.
     PB_REF="${TMPDIR:-/tmp}/optik_mapq_calibration/repeats_s17.fa"
-    if [ -f "$PB_REF" ] && python3 "$SCRIPT_DIR/paired_bench.py" --gate --ref "$PB_REF" --pairs 50000 \
+    if [ -f "$PB_REF" ] && python3 "$SCRIPT_DIR/paired_bench.py" --gate --ref "$PB_REF" --pairs "$PAIRED_PAIRS" \
             --optik "$OPTIK_BIN" --minimap2 "$MQC_MM2" --threads "$THREADS" \
             --out "${TMPDIR:-/tmp}/optik_paired_bench" --report '' > "/tmp/optik_pb_$$.log" 2>&1; then
         echo "  => PAIRED-END (repeat-rich genome, vs minimap2): PASS"
@@ -689,15 +721,15 @@ else
     skip "MAPQ calibration" "minimap2 not built (bench/build_tools.sh minimap2)"
 fi
 # mapq_calibration.py --multi tests the MAPQ model on fresh reads of several genomes (the seed-303 synthetic genome, Salmonella, and E. coli and hg38 chr21 when present).
-# Reads of 100, 150 and 250 bp at 1, 4 and 8% error and HiFi- and ONT-like long reads must show no MAPQ bin with significantly more wrong reads than its MAPQs imply, and no long-read record may carry a false indel of 50 bp or more.
+# Reads of 100, 150 and 250 bp at 1, 4 and 8% error and HiFi- and ONT-like long reads must show no MAPQ bin with significantly more wrong reads than its MAPQs imply, and no long-read record may contain a false indel of 50 bp or more.
 MQM_REFS=""
 # E. coli is downloaded into temp/genomes/ on first use, and left out when the download fails.
 ECOLI_FA="$(python3 "$SCRIPT_DIR/genomes.py" ecoli 2>/dev/null || true)"
-for r in "$ECOLI_FA" "$PROJECT_ROOT/temp/salmonella_LT2.fa" \
+for ref_path in "$ECOLI_FA" "$PROJECT_ROOT/temp/salmonella_LT2.fa" \
          "$PROJECT_ROOT/temp/scaling/chr21.fa"; do
-    [ -f "$r" ] && MQM_REFS="${MQM_REFS:+$MQM_REFS,}$r"
+    [ -f "$ref_path" ] && MQM_REFS="${MQM_REFS:+$MQM_REFS,}$ref_path"
 done
-if python3 "$SCRIPT_DIR/mapq_calibration.py" --multi --gate --refs "$MQM_REFS" --reads 20000 \
+if python3 "$SCRIPT_DIR/mapq_calibration.py" --multi --gate --refs "$MQM_REFS" --reads "$MAPQ_MULTI_READS" \
         --optik "$OPTIK_BIN" --threads "$THREADS" --out "${TMPDIR:-/tmp}/optik_mapq_multi" --report '' \
         > "/tmp/optik_mqm_$$.log" 2>&1; then
     echo "  => MAPQ CALIBRATION (fresh reads: genomes x read lengths x error, short + long reads): PASS"
@@ -791,18 +823,53 @@ else
     rm -rf "$PP_DIR"
 fi
 
+# Step 12.
+# The Lean proofs in lean/ must build with every theorem proved from the standard axioms.
+# Their models' test vectors must then agree with the binary, which ties the proved statements to the code.
+echo ""
+echo "----------------------------------------------"
+echo "  [12] Lean model"
+step_mark "12 Lean model"
+echo "----------------------------------------------"
+
+LEAN_DIR="$PROJECT_ROOT/lean"
+
+# pixi's tasks wrap lake and python3, so with elan's lake on PATH the same commands run without pixi.
+if command -v pixi >/dev/null 2>&1; then
+    LEAN_RUN=(pixi run)
+elif command -v lake >/dev/null 2>&1; then
+    LEAN_RUN=(env)
+else
+    LEAN_RUN=()
+fi
+
+if [ ${#LEAN_RUN[@]} -eq 0 ]; then
+    skip "Lean proofs and vectors (step 12)" "neither pixi nor lake found"
+else
+    LEAN_VECTORS="$(mktemp -d)"
+    if (cd "$LEAN_DIR" && "${LEAN_RUN[@]}" lake build >/dev/null && "${LEAN_RUN[@]}" python3 audit.py \
+            && "${LEAN_RUN[@]}" lake exe optik-vectors --out "$LEAN_VECTORS" --seed "$SEED") \
+        && python3 "$SCRIPT_DIR/validate_lean.py" --vectors "$LEAN_VECTORS" --optik "$OPTIK_BIN"; then
+        echo "  => LEAN MODEL: PASS"
+    else
+        echo "  => LEAN MODEL: FAIL"
+        FAIL=1
+    fi
+    rm -rf "$LEAN_VECTORS"
+fi
+
 # Summary
 echo ""
 echo "=============================================="
 if [ "${#SKIPPED[@]}" -gt 0 ]; then
     echo "  NOT RUN (${#SKIPPED[@]}):"
-    for x in "${SKIPPED[@]}"; do echo "    - $x"; done
+    for skipped_step in "${SKIPPED[@]}"; do echo "    - $skipped_step"; done
     [ "${REQUIRE_ALL:-0}" = "1" ] && FAIL=1
 fi
 step_mark ""
 echo ""
 echo "  step times:"
-for t in "${STEP_TIMES[@]}"; do echo "  $t"; done
+for step_time in "${STEP_TIMES[@]}"; do echo "  $step_time"; done
 echo "  total: $((SECONDS))s"
 if [ "$FAIL" -ne 0 ]; then
     echo "  SOME VALIDATIONS FAILED"

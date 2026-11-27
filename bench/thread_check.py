@@ -28,9 +28,10 @@ import time
 from pathlib import Path
 
 import hw
+from units import NS_PER_SECOND, PERCENT
 
-R = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# The CPUs optik's available_parallelism() sees, with affinity and cgroup quota applied.
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# The CPU count optik's available_parallelism() reports, with affinity and cgroup quota applied.
 CPUS = hw.cpus()
 DEFAULT_T = max(1, CPUS // 2)
 # Sampling period, the shortest span the busy gate judges and the CPU it allows above t.
@@ -38,48 +39,80 @@ DEFAULT_T = max(1, CPUS // 2)
 SAMPLE_S = 0.005
 BUSY_WINDOW_S = 0.05
 BUSY_SLACK = 0.25
+# whole-run CPU/wall may exceed the thread budget by this many CPUs
+UTIL_SLACK = 0.1
+# a child whose exec failed exits with the shell's "command not found" status
+EXEC_FAILED_EXIT = 127
+# permissions of a captured stderr file
+ERR_FILE_MODE = 0o644
+
+# The inputs are synthetic, made of a random genome, single-end read sets and a paired library.
+GENOME_SEED = 5
+GENOME_LEN = 2_000_000
+FASTA_LINE_WIDTH = 80
+READ_LEN = 150
+READ_SUB_RATE = 0.005  # per-base substitution probability
+REVCOMP_PROB = 0.5  # probability that a read is taken from the reverse strand
+FAKE_QUAL = "I"  # FASTQ quality character of every base
+# (file name, reads, seed, FASTQ?, opener) of each single-end set
+READS_PER_SET = 200_000
+READ_SETS = (
+    ("reads1.fa.gz", READS_PER_SET, 1, False, gzip.open),
+    ("reads2.fa.gz", READS_PER_SET, 2, False, gzip.open),
+    ("reads.fa", READS_PER_SET, 3, False, open),
+)
+PAIRS_SEED = 7
+NUM_PAIRS = 100_000
+FRAGMENT_LEN = 500  # R1 is the first READ_LEN bases of the fragment, R2 the reverse complement of the last READ_LEN
+
+
+# /proc/<pid>/stat puts the command name in parentheses, then state and ppid (proc(5)).
+STAT_COMM_END = ") "
+STAT_PPID = 1
+# The child's stderr descriptor, which execvp passes on.
+STDERR_FILENO = 2
 
 
 def tree(pid):
     """pid and every descendant, found through the parent links in /proc/*/stat."""
     kids = {}
-    for e in os.listdir("/proc"):
-        if not e.isdigit():
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
             continue
         try:
-            with open(f"/proc/{e}/stat") as f:
-                s = f.read()
+            with open(f"/proc/{entry}/stat") as handle:
+                stat_line = handle.read()
         except OSError:
-            continue
-        ppid = int(s[s.rindex(")") + 2 :].split()[1])
-        kids.setdefault(ppid, []).append(int(e))
+            continue  # the process exited while /proc was being scanned
+        ppid = int(stat_line[stat_line.rindex(STAT_COMM_END) + len(STAT_COMM_END) :].split()[STAT_PPID])
+        kids.setdefault(ppid, []).append(int(entry))
     out, todo = [], [pid]
     while todo:
-        p = todo.pop()
-        out.append(p)
-        todo += kids.get(p, [])
+        proc_pid = todo.pop()
+        out.append(proc_pid)
+        todo += kids.get(proc_pid, [])
     return out
 
 
 def running(pids):
     """Tasks in state R across the given processes, and each task's time on a CPU in ns, keyed by thread id, from the first field of its schedstat."""
-    n, on_cpu = 0, {}
-    for p in pids:
+    num_running, on_cpu = 0, {}
+    for proc_pid in pids:
         try:
-            tids = os.listdir(f"/proc/{p}/task")
+            tids = os.listdir(f"/proc/{proc_pid}/task")
         except OSError:
-            continue
-        for t in tids:
+            continue  # the process exited while /proc was being scanned
+        for tid in tids:
             try:
-                with open(f"/proc/{p}/task/{t}/stat") as f:
-                    s = f.read()
-                with open(f"/proc/{p}/task/{t}/schedstat") as f:
-                    on_cpu[int(t)] = int(f.read().split()[0])
+                with open(f"/proc/{proc_pid}/task/{tid}/stat") as handle:
+                    stat_line = handle.read()
+                with open(f"/proc/{proc_pid}/task/{tid}/schedstat") as handle:
+                    on_cpu[int(tid)] = int(handle.read().split()[0])
             except (OSError, ValueError, IndexError):
                 continue
-            if s[s.rindex(")") + 2] == "R":
-                n += 1
-    return n, on_cpu
+            if stat_line[stat_line.rindex(STAT_COMM_END) + len(STAT_COMM_END)] == "R":
+                num_running += 1
+    return num_running, on_cpu
 
 
 def peak_busy(samples, window):
@@ -89,8 +122,8 @@ def peak_busy(samples, window):
     A thread's time counts from the sample it first appears in, and the time a thread used between its last sample and its exit is lost, which can only lower the result."""
     times, cum, prev, total = [], [], {}, 0
     for when, on_cpu in samples:
-        for tid, ns in on_cpu.items():
-            total += max(0, ns - prev.get(tid, ns))
+        for tid, cpu_ns in on_cpu.items():
+            total += max(0, cpu_ns - prev.get(tid, cpu_ns))
         prev = on_cpu
         times.append(when)
         cum.append(total)
@@ -100,110 +133,106 @@ def peak_busy(samples, window):
             j += 1
         if j == len(times):
             break
-        best = max(best, (cum[j] - cum[i]) / 1e9 / (times[j] - times[i]))
+        best = max(best, (cum[j] - cum[i]) / NS_PER_SECOND / (times[j] - times[i]))
     return best
 
 
 def cpu_of(cmd, errf):
     """Run cmd and return (exit code, wall s, user + system s of the whole tree, samples of (time, tasks in state R, on-CPU ns per thread), stderr).
     wait4's rusage includes the children the command reaped."""
-    t0 = time.monotonic()
+    start = time.monotonic()
     pid = os.fork()
     if pid == 0:
         try:
-            fd = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(fd, 1)
-            err_fd = os.open(errf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-            os.dup2(err_fd, 2)
+            null_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null_fd, 1)
+            err_fd = os.open(errf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, ERR_FILE_MODE)
+            os.dup2(err_fd, STDERR_FILENO)
             os.execvp(cmd[0], cmd)
         finally:
-            os._exit(127)
+            os._exit(EXEC_FAILED_EXIT)
     samples = []
     while True:
-        done, status, ru = os.wait4(pid, os.WNOHANG)
+        done, status, rusage = os.wait4(pid, os.WNOHANG)
         if done:
             break
         n_running, on_cpu = running(tree(pid))
         samples.append((time.monotonic(), n_running, on_cpu))
         time.sleep(SAMPLE_S)
-    wall = time.monotonic() - t0
+    wall = time.monotonic() - start
     code = os.waitstatus_to_exitcode(status)
-    return code, wall, ru.ru_utime + ru.ru_stime, samples, Path(errf).read_text()
+    return code, wall, rusage.ru_utime + rusage.ru_stime, samples, Path(errf).read_text()
 
 
-def make_inputs(d):
+def make_inputs(work_dir):
     """Generate the genome, reads and paired FASTQ.gz in d once, returning their paths."""
-    os.makedirs(d, exist_ok=True)
-    g = os.path.join(d, "genome.fa")
-    if not os.path.exists(g):
-        r = random.Random(5)
-        seq = "".join(r.choice("ACGT") for _ in range(2_000_000))
-        with open(g, "w") as f:
-            f.write(
+    os.makedirs(work_dir, exist_ok=True)
+    genome_path = os.path.join(work_dir, "genome.fa")
+    if not os.path.exists(genome_path):
+        rng = random.Random(GENOME_SEED)
+        seq = "".join(rng.choice("ACGT") for _ in range(GENOME_LEN))
+        with open(genome_path, "w") as handle:
+            handle.write(
                 ">g\n"
-                + "\n".join(seq[i : i + 80] for i in range(0, len(seq), 80))
+                + "\n".join(seq[i : i + FASTA_LINE_WIDTH] for i in range(0, len(seq), FASTA_LINE_WIDTH))
                 + "\n"
             )
     else:
-        with open(g) as fh:
-            seq = "".join(x.strip() for x in fh if not x.startswith(">"))
+        with open(genome_path) as handle:
+            seq = "".join(line.strip() for line in handle if not line.startswith(">"))
     comp = str.maketrans("ACGT", "TGCA")
 
-    def reads(path, n, seed, fq=False, opener=open):
+    def reads(path, num_reads, seed, fastq=False, opener=open):
         """Write n random 150 bp reads of the genome as FASTA or FASTQ."""
-        r = random.Random(seed)
-        with opener(path, "wt") as f:
-            for i in range(n):
-                p = r.randrange(len(seq) - 150)
-                s = list(seq[p : p + 150])
-                for j in range(150):
-                    if r.random() < 0.005:
-                        s[j] = r.choice("ACGT")
-                s = "".join(s)
-                if r.random() < 0.5:
-                    s = s.translate(comp)[::-1]
-                f.write(f"@r{i}\n{s}\n+\n{'I' * 150}\n" if fq else f">r{i}\n{s}\n")
+        rng = random.Random(seed)
+        with opener(path, "wt") as handle:
+            for i in range(num_reads):
+                pos = rng.randrange(len(seq) - READ_LEN)
+                read_seq = list(seq[pos : pos + READ_LEN])
+                for j in range(READ_LEN):
+                    if rng.random() < READ_SUB_RATE:
+                        read_seq[j] = rng.choice("ACGT")
+                read_seq = "".join(read_seq)
+                if rng.random() < REVCOMP_PROB:
+                    read_seq = read_seq.translate(comp)[::-1]
+                handle.write(f"@r{i}\n{read_seq}\n+\n{FAKE_QUAL * READ_LEN}\n" if fastq else f">r{i}\n{read_seq}\n")
 
-    out = {"genome": g}
-    for name, n, seed, fq, op in (
-        ("reads1.fa.gz", 200_000, 1, False, gzip.open),
-        ("reads2.fa.gz", 200_000, 2, False, gzip.open),
-        ("reads.fa", 200_000, 3, False, open),
-    ):
-        p = os.path.join(d, name)
-        if not os.path.exists(p):
-            reads(p, n, seed, fq, op)
-        out[name] = p
+    out = {"genome": genome_path}
+    for name, num_reads, seed, fastq, opener in READ_SETS:
+        path = os.path.join(work_dir, name)
+        if not os.path.exists(path):
+            reads(path, num_reads, seed, fastq, opener)
+        out[name] = path
     # Paired mates come from the same fragments, with R2 the reverse complement of the far end.
-    r1, r2 = os.path.join(d, "pe_1.fq.gz"), os.path.join(d, "pe_2.fq.gz")
-    if not os.path.exists(r2):
-        r = random.Random(7)
-        with gzip.open(r1, "wt") as a, gzip.open(r2, "wt") as b:
-            for i in range(100_000):
-                p = r.randrange(len(seq) - 500)
-                m1 = seq[p : p + 150]
-                m2 = seq[p + 350 : p + 500].translate(comp)[::-1]
-                a.write(f"@p{i}/1\n{m1}\n+\n{'I' * 150}\n")
-                b.write(f"@p{i}/2\n{m2}\n+\n{'I' * 150}\n")
-    out["r1"], out["r2"] = r1, r2
+    mate1_path, mate2_path = os.path.join(work_dir, "pe_1.fq.gz"), os.path.join(work_dir, "pe_2.fq.gz")
+    if not os.path.exists(mate2_path):
+        rng = random.Random(PAIRS_SEED)
+        with gzip.open(mate1_path, "wt") as mate1_handle, gzip.open(mate2_path, "wt") as mate2_handle:
+            for i in range(NUM_PAIRS):
+                path = rng.randrange(len(seq) - FRAGMENT_LEN)
+                mate1 = seq[path : path + READ_LEN]
+                mate2 = seq[path + FRAGMENT_LEN - READ_LEN : path + FRAGMENT_LEN].translate(comp)[::-1]
+                mate1_handle.write(f"@p{i}/1\n{mate1}\n+\n{FAKE_QUAL * READ_LEN}\n")
+                mate2_handle.write(f"@p{i}/2\n{mate2}\n+\n{FAKE_QUAL * READ_LEN}\n")
+    out["r1"], out["r2"] = mate1_path, mate2_path
     return out
 
 
 def main():
     """Run every subcommand at each thread budget and apply the gates."""
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--optik", default=os.path.join(R, "target/release/optik"))
-    ap.add_argument("--work", default=os.path.join(R, "temp/thread_check"))
-    ap.add_argument(
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--optik", default=os.path.join(ROOT, "target/release/optik"))
+    parser.add_argument("--work", default=os.path.join(ROOT, "temp/thread_check"))
+    parser.add_argument(
         "--threads", default="1,2,4", help="explicit -t values (plus the default)"
     )
-    a = ap.parse_args()
-    optik = a.optik
-    inputs = make_inputs(a.work)
+    args = parser.parse_args()
+    optik = args.optik
+    inputs = make_inputs(args.work)
 
-    def in_work(f):
+    def in_work(name):
         """Path of f in the work directory."""
-        return os.path.join(a.work, f)
+        return os.path.join(args.work, name)
 
     # The indexes the query rows read are built once and not judged here.
     subprocess.run(
@@ -238,6 +267,7 @@ def main():
         check=True,
         capture_output=True,
     )
+    # Each job is one command line, run once per -t value and once without -t to check the default budget.
     jobs = {
         "dbruijn genome": [
             optik,
@@ -363,7 +393,7 @@ def main():
             in_work("o2.sam"),
         ],
     }
-    ts = [int(x) for x in a.threads.split(",")]
+    thread_counts = [int(value) for value in args.threads.split(",")]
     print(f"{CPUS} usable CPUs; default budget {DEFAULT_T}")
     print(
         f"{'command':30s} {'-t':>4s} {'budget':>6s} {'wall s':>7s} {'cpu/wall':>8s} {'busy':>5s} "
@@ -371,15 +401,16 @@ def main():
     )
     bad = 0
     for name, cmd in jobs.items():
-        for t in ts + [None]:
-            full = cmd + (["-t", str(t)] if t is not None else [])
-            budget = t if t is not None else DEFAULT_T
+        for threads in thread_counts + [None]:
+            full = cmd + (["-t", str(threads)] if threads is not None else [])
+            budget = threads if threads is not None else DEFAULT_T
             code, wall, cpu, samples, err = cpu_of(full, in_work("stderr.txt"))
-            n_r = [n for _, n, _ in samples]
-            over = sum(1 for n in n_r if n > budget)
+            n_r = [num_running for _, num_running, _ in samples]
+            over = sum(1 for num_running in n_r if num_running > budget)
             frac = over / len(samples) if samples else 0.0
             util = cpu / wall if wall > 0 else 0.0
-            busy = peak_busy([(w, c) for w, _, c in samples], BUSY_WINDOW_S)
+            # busy is the most CPU time per wall second over any BUSY_WINDOW_S span, which catches bursts that the whole-run average hides.
+            busy = peak_busy([(when, on_cpu) for when, _, on_cpu in samples], BUSY_WINDOW_S)
             why = []
             if code != 0:
                 why.append(
@@ -389,18 +420,19 @@ def main():
                 why.append(
                     f"{busy:.2f} CPUs busy over {BUSY_WINDOW_S} s > {budget} + {BUSY_SLACK}"
                 )
-            if util > budget + 0.1:
-                why.append(f"cpu/wall {util:.2f} > {budget} + 0.1")
-            if t is None and name.startswith("dbruijn"):
-                m = re.search(r"with (\d+) thread\(s\)", err)
-                if not m or int(m.group(1)) != DEFAULT_T:
+            if util > budget + UTIL_SLACK:
+                why.append(f"cpu/wall {util:.2f} > {budget} + {UTIL_SLACK}")
+            # Without -t, dbruijn must also report that it used the default budget.
+            if threads is None and name.startswith("dbruijn"):
+                match = re.search(r"with (\d+) thread\(s\)", err)
+                if not match or int(match.group(1)) != DEFAULT_T:
                     why.append(
-                        f"reports {m.group(1) if m else '?'} threads, default should be {DEFAULT_T}"
+                        f"reports {match.group(1) if match else '?'} threads, default should be {DEFAULT_T}"
                     )
             bad += bool(why)
             print(
-                f"{name:30s} {('-' if t is None else str(t)):>4s} {budget:6d} {wall:7.2f} {util:8.2f} "
-                f"{busy:5.2f} {max(n_r, default=0):5d} {100 * frac:6.2f}  {'PASS' if not why else 'FAIL ' + '; '.join(why)}",
+                f"{name:30s} {('-' if threads is None else str(threads)):>4s} {budget:6d} {wall:7.2f} {util:8.2f} "
+                f"{busy:5.2f} {max(n_r, default=0):5d} {PERCENT * frac:6.2f}  {'PASS' if not why else 'FAIL ' + '; '.join(why)}",
                 flush=True,
             )
     print("THREAD CHECK: " + ("PASS" if not bad else f"FAIL ({bad} runs)"))

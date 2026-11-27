@@ -5,12 +5,10 @@ The module-level functions run commands, wrap hyperfine, decompress inputs and g
 
 Nix library paths
     Some tools, kmercamel among them, need shared libraries from the Nix store.
-    Those directories are detected and prepended to LD_LIBRARY_PATH so that
-    subprocesses find the right .so files.
+    Those directories are detected and prepended to LD_LIBRARY_PATH so that subprocesses find the right .so files.
 
 RSS measurement
-    Hyperfine records each run's VmHWM from /proc when available, and the
-    bytes are reported in megabytes.
+    Hyperfine records each run's VmHWM from /proc when available, and the bytes are reported in megabytes.
 """
 
 import json
@@ -27,9 +25,12 @@ from pathlib import Path
 
 import hw
 import measure
-
-# Bytes in one megabyte (MiB) for memory reports
-BYTES_PER_MEGABYTE = 1024 * 1024
+from diagnostics import DETAIL_CHARS
+from fastq import (
+    FASTQ_LINES_PER_RECORD,
+    FASTQ_SEQ_LINE,
+)
+from units import BYTES_PER_MIB
 
 # Nix store paths of shared libraries that some tools need in the development environment.
 #
@@ -44,8 +45,22 @@ NIX_GLPK_LIB = "/nix/store/halm4fcvdny1842yaww22w160zjzc88k-glpk-5.0/lib"
 
 NIX_LIB_PATHS = [NIX_GLPK_LIB]
 
-# Characters of error output shown when a command fails
-ERROR_PREVIEW_CHARS = 500
+
+# Build threads when the runtime context names none
+DEFAULT_BUILD_THREADS = 8
+# Hyperfine measurement runs when the runtime context names none
+DEFAULT_HYPERFINE_RUNS = 3
+# last_bad value before any non-ACGT base was seen
+NO_BAD_BASE = -1
+
+
+# RSS scaling compares the first and last rows of a thread sweep, so it needs two of them.
+MIN_SCALING_ROWS = 2
+# Packed k-mers hold two bits per base, so BASE_MASK - code complements a base.
+BITS_PER_BASE = 2
+BASE_MASK = (1 << BITS_PER_BASE) - 1
+# Lemire's method draws 64-bit words and keeps the high half of the product.
+WORD_BITS = 64
 
 
 def _build_ld_path():
@@ -70,8 +85,8 @@ def check_binary(path):
     Runners check this before benchmarking a tool.
     Skipping missing tools quietly is left to the CLI layer above.
     """
-    p = Path(path)
-    return p.is_file() and os.access(p, os.X_OK)
+    file_path = Path(path)
+    return file_path.is_file() and os.access(file_path, os.X_OK)
 
 
 def run_cmd(cmd, timeout=None, verbose=False, env=None, cwd=None):
@@ -97,7 +112,7 @@ def run_cmd(cmd, timeout=None, verbose=False, env=None, cwd=None):
         The process result object and elapsed wall time in seconds.
     """
     if verbose:
-        print(f"  [cmd] {' '.join(str(c) for c in cmd)}", file=sys.stderr)
+        print(f"  [cmd] {' '.join(str(arg) for arg in cmd)}", file=sys.stderr)
 
     # Environment = the OS environment, then the Nix library paths, then any extras.
     merged_env = {**os.environ, **DEFAULT_ENV_VARS, **(env or {})}
@@ -169,23 +184,23 @@ def physical_core_list():
         return None
     if not first_by_core:
         return None
-    return [first_by_core[k] for k in sorted(first_by_core)]
+    return [first_by_core[core] for core in sorted(first_by_core)]
 
 
 def taskset_prefix(cpu_list):
     """taskset prefix to pin a command to `cpu_list`, or [] if unavailable."""
     if not cpu_list:
         return []
-    t = shutil.which("taskset")
-    if not t:
+    taskset = shutil.which("taskset")
+    if not taskset:
         return []
-    cpus = ",".join(str(c) for c in cpu_list)
-    return [t, "-c", cpus]
+    cpus = ",".join(str(cpu) for cpu in cpu_list)
+    return [taskset, "-c", cpus]
 
 
 def run_hyperfine(
     cmd,
-    runs=3,
+    runs=DEFAULT_HYPERFINE_RUNS,
     warmup=1,
     timeout=None,
     verbose=False,
@@ -201,7 +216,8 @@ def run_hyperfine(
 
     Parameters
     cmd : list[str] or str
-        The command to benchmark.  Lists are shell-quoted and joined.
+        The command to benchmark.
+        Lists are shell-quoted and joined.
     runs : int
         Number of measurement runs after warmup.
     warmup : int
@@ -215,18 +231,15 @@ def run_hyperfine(
     cwd : str or None
         Working directory for the subprocess.
     ignore_failure : bool
-        Pass --ignore-failure to hyperfine so it continues even when the
-        benchmarked command returns a non-zero exit code.  The exit codes
-        are recorded in the JSON results.
+        Pass --ignore-failure to hyperfine so it continues even when the benchmarked command returns a non-zero exit code.
+        The exit codes are recorded in the JSON results.
     pin_cpus : list[int] or None
-        When given, the command is run under `taskset -c <cpus>` so all
-        hyperfine runs and their threads stay on the listed CPUs.
+        When given, the command is run under `taskset -c <cpus>` so all hyperfine runs and their threads stay on the listed CPUs.
 
     Returns
     dict
-        Keys include mean_s, stddev_s, min_s, max_s, the times_s list,
-        mean_rss_mb, max_rss_mb, stdout, stderr, and the raw hyperfine
-        result dict.  On error the dict has a single key "error".
+        Keys include mean_s, stddev_s, min_s, max_s, the times_s list, mean_rss_mb, max_rss_mb, stdout, stderr, and the raw hyperfine result dict.
+        On error the dict has a single key "error".
     """
     # Without hyperfine, a single run through run_cmd stands in.
     if HYPERFINE_BIN is None:
@@ -258,12 +271,13 @@ def run_hyperfine(
 
     # Hyperfine discards command output by default, so the command string itself redirects stdout and stderr to files that are read once hyperfine finishes.
     if isinstance(cmd, (list, tuple)):
-        cmd_str = " ".join(shlex.quote(str(c)) for c in cmd)
+        cmd_str = " ".join(shlex.quote(str(arg)) for arg in cmd)
     else:
         cmd_str = str(cmd)
     prefix = taskset_prefix(pin_cpus)
     if prefix:
-        cmd_str = " ".join(shlex.quote(str(c)) for c in prefix) + " " + cmd_str
+        cmd_str = " ".join(shlex.quote(str(arg)) for arg in prefix) + " " + cmd_str
+    # With the redirect inside the timed shell, hyperfine never buffers the tool's output, and the last run's files remain for the correctness check.
     wrapped = f"{{ {cmd_str}; }} >{stdout_path} 2>{stderr_path}"
 
     hf_command = [
@@ -302,7 +316,7 @@ def run_hyperfine(
         return {"error": "hyperfine timed out"}
 
     if proc.returncode != 0:
-        err = (proc.stderr or "")[:ERROR_PREVIEW_CHARS]
+        err = (proc.stderr or "")[:DETAIL_CHARS]
         shutil.rmtree(work_dir, ignore_errors=True)
         return {"error": f"hyperfine failed: {err}"}
 
@@ -323,9 +337,9 @@ def run_hyperfine(
     memory_usage_bytes = first_result.get("memory_usage_byte") or []
     if memory_usage_bytes:
         mean_rss = round(
-            sum(memory_usage_bytes) / len(memory_usage_bytes) / BYTES_PER_MEGABYTE, 1
+            sum(memory_usage_bytes) / len(memory_usage_bytes) / BYTES_PER_MIB, 1
         )
-        max_rss = round(max(memory_usage_bytes) / BYTES_PER_MEGABYTE, 1)
+        max_rss = round(max(memory_usage_bytes) / BYTES_PER_MIB, 1)
     else:
         mean_rss = None
         max_rss = None
@@ -351,7 +365,7 @@ def run_hyperfine(
 def sweep_thread_counts(ctx):
     """Resolve the configured thread sweep to a concrete list of thread counts.
 
-    The sweep spec lives in ``ctx["threads_sweep"]`` and takes one of three forms.
+    The sweep spec is read from ``ctx["threads_sweep"]`` and takes one of three forms.
         "auto"   hw.thread_points(), powers of two up to the usable CPUs, plus the exact CPU count when it is not a power of two, so 12 CPUs give 1, 2, 4, 8, 12.
         "none"   or any false value disables the sweep and gives [].
         "1,2,4"  explicit comma-separated thread counts.
@@ -371,9 +385,9 @@ def sweep_thread_counts(ctx):
         try:
             counts.append(int(part))
         except ValueError:
-            continue
+            continue  # skip non-numeric fields
     seen = set()
-    return [t for t in counts if not (t in seen or seen.add(t))]
+    return [count for count in counts if not (count in seen or seen.add(count))]
 
 
 class ThreadSweepMixin:
@@ -418,17 +432,16 @@ class ThreadSweepMixin:
         phase : str
             Metric prefix, "build" or "query".
         cmd_factory : callable(threads:int) -> list[str] | None
-            Builds the benchmark command for a thread count.  Returning None
-            skips that count, as for a tool that clamps thread counts.
+            Builds the benchmark command for a thread count.
+            Returning None skips that count, as for a tool that clamps thread counts.
         gate : callable(CompletedProcess) -> bool | None
-            Optional correctness gate, run once and untimed at the first
-            swept count before any timing.  A False result aborts the sweep
-            with a RuntimeError, and None runs no gate.
+            Optional correctness gate, run once and untimed at the first swept count before any timing.
+            A False result aborts the sweep with a RuntimeError, and None runs no gate.
         timeout, ignore_failure
             Forwarded to hyperfine.
         **hf_kwargs
-            Further keyword arguments for run_hyperfine, such as env and
-            pin_cpus.  ``env`` also applies to the gate run.
+            Further keyword arguments for run_hyperfine, such as env and pin_cpus.
+            ``env`` also applies to the gate run.
 
         Returns
         (flat, rows, headline_hf, headline_threads)
@@ -448,10 +461,11 @@ class ThreadSweepMixin:
         default = self.sweep_default(phase)
         base_time = None
         verbose = self.ctx.get("verbose", False)
-        for i, t in enumerate(sweep):
-            cmd = cmd_factory(t)
+        for i, threads in enumerate(sweep):
+            cmd = cmd_factory(threads)
             if cmd is None:
                 continue
+            # The first thread count runs once outside hyperfine to check its output, so a sweep never times a broken command.
             if i == 0 and gate is not None:
                 gproc, _ = run_cmd(
                     cmd,
@@ -461,43 +475,45 @@ class ThreadSweepMixin:
                     cwd=hf_kwargs.get("cwd"),
                 )
                 if gproc.returncode != 0 or gate(gproc) is False:
-                    err = (gproc.stderr or gproc.stdout or "")[:ERROR_PREVIEW_CHARS]
+                    err = (gproc.stderr or gproc.stdout or "")[:DETAIL_CHARS]
                     raise RuntimeError(
-                        f"{self.tool_name()} {phase} thread-sweep gate failed at t={t}: {err}"
+                        f"{self.tool_name()} {phase} thread-sweep gate failed at t={threads}: {err}"
                     )
-            hf = self.run_hyperfine(
+            hyperfine_res = self.run_hyperfine(
                 cmd, timeout=timeout, ignore_failure=ignore_failure, **hf_kwargs
             )
-            if "error" in hf or hf.get("mean_s") is None:
+            if "error" in hyperfine_res or hyperfine_res.get("mean_s") is None:
                 continue
-            s = hf["mean_s"]
-            rss = hf.get("max_rss_mb")
+            secs = hyperfine_res["mean_s"]
+            rss = hyperfine_res.get("max_rss_mb")
+            # Speedups are relative to the first thread count that ran, which is normally one thread.
             if base_time is None:
-                base_time = s
+                base_time = secs
                 speedup = 1.0
             else:
-                speedup = round(base_time / s, 3) if s else None
+                speedup = round(base_time / secs, 3) if secs else None
             rows.append(
                 {
-                    "threads": t,
-                    "s": round(s, 4),
+                    "threads": threads,
+                    "s": round(secs, 4),
                     "rss": rss,
                     "speedup": speedup,
                 }
             )
-            flat[f"{phase}_s_t{t}"] = round(s, 4)
-            flat[f"{phase}_rss_t{t}"] = rss
-            if t > 1 and s:
-                flat[f"{phase}_speedup_t{t}"] = round(base_time / s, 3)
-            if t == default:
-                headline_hf = hf
-                headline_threads = t
+            flat[f"{phase}_s_t{threads}"] = round(secs, 4)
+            flat[f"{phase}_rss_t{threads}"] = rss
+            if threads > 1 and secs:
+                flat[f"{phase}_speedup_t{threads}"] = round(base_time / secs, 3)
+            # The measurement at the default thread count also becomes the tool's headline figure.
+            if threads == default:
+                headline_hf = hyperfine_res
+                headline_threads = threads
 
-        if len(rows) >= 2:
-            r0 = rows[0].get("rss")
-            r1 = rows[-1].get("rss")
-            if r0 and r1:
-                flat[f"{phase}_rss_scale"] = round(r1 / r0, 3)
+        if len(rows) >= MIN_SCALING_ROWS:
+            first_rss = rows[0].get("rss")
+            last_rss = rows[-1].get("rss")
+            if first_rss and last_rss:
+                flat[f"{phase}_rss_scale"] = round(last_rss / first_rss, 3)
         flat[f"{phase}_sweep_rows"] = rows
         return flat, rows, headline_hf, headline_threads
 
@@ -518,7 +534,7 @@ class ToolRunner:
     """
 
     def __init__(self, dataset, ctx):
-        self.ds = dataset or {}
+        self.dataset = dataset or {}
         self.ctx = ctx or {}
 
     @classmethod
@@ -552,7 +568,7 @@ class ToolRunner:
     @property
     def _hf_runs(self):
         """Number of hyperfine measurement runs from the runtime context."""
-        return self.ctx.get("runs", 3)
+        return self.ctx.get("runs", DEFAULT_HYPERFINE_RUNS)
 
     @property
     def _hf_warmup(self):
@@ -587,14 +603,14 @@ def ensure_uncompressed(path, temp_dir, strip_blank_lines=False):
 
     Decompression is kept apart from tool execution because only some tools, such as sshash build, minimap2 and kmercamel, read .gz natively, and build times should not include gzip decompression.
     """
-    p = Path(path)
-    if not str(p).endswith(".gz"):
-        return str(p)
-    out = Path(temp_dir) / p.stem
+    src_path = Path(path)
+    if not str(src_path).endswith(".gz"):
+        return str(src_path)
+    out = Path(temp_dir) / src_path.stem
     if not out.exists():
         import gzip
 
-        with gzip.open(p, "rt") as f_in, open(out, "w") as f_out:
+        with gzip.open(src_path, "rt") as f_in, open(out, "w") as f_out:
             if strip_blank_lines:
                 last = ""
                 for line in f_in:
@@ -618,12 +634,12 @@ def _canonical_kmer_int(kmer):
     base_code = {"A": 0, "C": 1, "G": 2, "T": 3}
     fwd = 0
     rev = 0
-    for ch in kmer:
-        b = base_code.get(ch.upper(), 0)
-        fwd = (fwd << 2) | b
-    for ch in reversed(kmer):
-        b = 3 - base_code.get(ch.upper(), 0)
-        rev = (rev << 2) | b
+    for base_char in kmer:
+        code = base_code.get(base_char.upper(), 0)
+        fwd = (fwd << BITS_PER_BASE) | code
+    for base_char in reversed(kmer):
+        code = BASE_MASK - base_code.get(base_char.upper(), 0)
+        rev = (rev << BITS_PER_BASE) | code
     return min(fwd, rev)
 
 
@@ -633,8 +649,8 @@ def _iter_fasta_seqs(path):
 
     opener = gzip.open if str(path).endswith(".gz") else open
     seq = []
-    with opener(str(path), "rt") as f:
-        for line in f:
+    with opener(str(path), "rt") as handle:
+        for line in handle:
             line = line.strip()
             if not line:
                 continue
@@ -648,7 +664,7 @@ def _iter_fasta_seqs(path):
             yield "".join(seq)
 
 
-def count_kmers(path, k, distinct=False):
+def count_kmers(path, kmer_len, distinct=False):
     """Count the k-mers of a FASTA file.
 
     Parameters
@@ -657,8 +673,7 @@ def count_kmers(path, k, distinct=False):
     k : int
         k-mer length.
     distinct : bool
-        True counts distinct *canonical* k-mers, and False the total count
-        (the sum of L - k + 1).
+        True counts distinct *canonical* k-mers, and False the total count (the sum of L - k + 1).
 
     k-mers holding a base other than A/C/G/T are skipped, as the indexed tools skip them.
 
@@ -668,52 +683,52 @@ def count_kmers(path, k, distinct=False):
     seen = set()
     valid = {"A", "C", "G", "T"}
     for seq in _iter_fasta_seqs(path):
-        n = len(seq) - k + 1
-        if n <= 0:
+        num_windows = len(seq) - kmer_len + 1
+        if num_windows <= 0:
             continue
         if distinct:
-            for i in range(n):
-                kmer = seq[i : i + k]
-                if kmer and all(c in valid for c in kmer):
+            for i in range(num_windows):
+                kmer = seq[i : i + kmer_len]
+                if kmer and all(base in valid for base in kmer):
                     seen.add(_canonical_kmer_int(kmer))
         else:
-            total += n
+            total += num_windows
     if distinct:
         return len(seen) if seen else None
     return total if total > 0 else None
 
 
-def count_invalid_windows(path, k):
+def count_invalid_windows(path, kmer_len):
     """Count the k-mer windows of a FASTA/FASTQ query file, plain or .gz, that hold a non-ACGT base.
 
     SSHash and optik report these as num_invalid_kmers.
     Tools that print only present or absent per window, SBWT and FMSI, count them as absent, so their negative count becomes total - positive - invalid to keep one meaning across the table."""
     import gzip
 
-    op = gzip.open if str(path).endswith(".gz") else open
+    opener = gzip.open if str(path).endswith(".gz") else open
     seqs = []
-    with op(str(path), "rt") as fh:
-        first = fh.read(1)
-        fh.seek(0)
+    with opener(str(path), "rt") as handle:
+        first = handle.read(1)
+        handle.seek(0)
         if first == "@":
-            for i, line in enumerate(fh):
-                if i % 4 == 1:
+            for i, line in enumerate(handle):
+                if i % FASTQ_LINES_PER_RECORD == FASTQ_SEQ_LINE:
                     seqs.append(line.strip())
         else:
             seqs = list(_iter_fasta_seqs(path))
     bad = 0
-    for sq in seqs:
-        u = sq.upper()
-        last_bad = -1  # index of the most recent non-ACGT base
-        for i, c in enumerate(u):
-            if c not in "ACGT":
+    for seq in seqs:
+        upper_seq = seq.upper()
+        last_bad = NO_BAD_BASE  # index of the most recent non-ACGT base
+        for i, base in enumerate(upper_seq):
+            if base not in "ACGT":
                 last_bad = i
-            if i >= k - 1 and last_bad > i - k:
+            if i >= kmer_len - 1 and last_bad > i - kmer_len:
                 bad += 1
     return bad
 
 
-def write_acgt_segments(path, k, out_path):
+def write_acgt_segments(path, kmer_len, out_path):
     """Write each maximal ACGT run of at least k bases in a query file as its own FASTA record.
 
     The input is FASTA or FASTQ, plain or .gz.
@@ -723,32 +738,41 @@ def write_acgt_segments(path, k, out_path):
     FMSI, for example, prints one character per base for such records, which cannot be attributed to windows."""
     import gzip
 
-    op = gzip.open if str(path).endswith(".gz") else open
-    with op(str(path), "rt") as fh:
-        first = fh.read(1)
-        fh.seek(0)
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(str(path), "rt") as handle:
+        first = handle.read(1)
+        handle.seek(0)
         if first == "@":
-            seqs = [line.strip() for i, line in enumerate(fh) if i % 4 == 1]
+            seqs = [line.strip() for i, line in enumerate(handle) if i % FASTQ_LINES_PER_RECORD == FASTQ_SEQ_LINE]
         else:
             seqs = list(_iter_fasta_seqs(path))
     valid = total = 0
     with open(out_path, "w") as out:
-        n = 0
-        for sq in seqs:
-            total += max(0, len(sq) - k + 1)
-            for run in re.findall(r"[ACGT]+", sq.upper()):
-                if len(run) >= k:
-                    out.write(f">s{n}\n{run}\n")
-                    n += 1
-                    valid += len(run) - k + 1
+        rec_idx = 0
+        for seq in seqs:
+            total += max(0, len(seq) - kmer_len + 1)
+            for run in re.findall(r"[ACGT]+", seq.upper()):
+                if len(run) >= kmer_len:
+                    out.write(f">s{rec_idx}\n{run}\n")
+                    rec_idx += 1
+                    valid += len(run) - kmer_len + 1
     return valid, total - valid
 
 
 POSITIVE_READ_COUNT = 20000
+# length and seed of the positive query reads
+POSITIVE_READ_LEN = 150
+POSITIVE_READ_SEED = 7
+# probability that a positive read is reverse-complemented
+REVCOMP_PROB = 0.5
+# seed of the random k-mer workload
+RANDOM_KMER_SEED = 42
+# bases a random k-mer draws from
+NUM_BASES = 4
 
 
 def generate_positive_reads(
-    fasta_path, output_path, count=POSITIVE_READ_COUNT, read_len=150, seed=7
+    fasta_path, output_path, count=POSITIVE_READ_COUNT, read_len=POSITIVE_READ_LEN, seed=POSITIVE_READ_SEED
 ):
     """Write a high-hit query FASTA made of substrings of the indexed sequences.
 
@@ -756,13 +780,13 @@ def generate_positive_reads(
     Nearly every query k-mer is then positive, and consecutive k-mers share locality like real reads from the indexed genome.
     Query sets dominated by negatives would only time cheap rejections, not lookups.
     """
-    import random as _r
+    import random as random_mod
 
-    rng = _r.Random(seed)
+    rng = random_mod.Random(seed)
     seqs = []
     parts = []
-    with open(fasta_path) as fh:
-        for line in fh:
+    with open(fasta_path) as handle:
+        for line in handle:
             line = line.strip()
             if line.startswith(">"):
                 if parts:
@@ -772,24 +796,24 @@ def generate_positive_reads(
                 parts.append(line.upper())
     if parts:
         seqs.append("".join(parts))
-    seqs = [s for s in seqs if s]
+    seqs = [seq for seq in seqs if seq]
     if not seqs:
         raise ValueError(f"no sequences in {fasta_path}")
-    weights = [len(s) for s in seqs]
+    weights = [len(seq) for seq in seqs]
     comp = str.maketrans("ACGT", "TGCA")
     with open(output_path, "w") as out:
         for i in range(count):
-            s = rng.choices(seqs, weights=weights)[0]
-            if len(s) > read_len:
-                p = rng.randrange(len(s) - read_len + 1)
-                s = s[p : p + read_len]
-            if rng.random() < 0.5:
-                s = s.translate(comp)[::-1]
-            out.write(f">p{i}\n{s}\n")
+            read = rng.choices(seqs, weights=weights)[0]
+            if len(read) > read_len:
+                start = rng.randrange(len(read) - read_len + 1)
+                read = read[start : start + read_len]
+            if rng.random() < REVCOMP_PROB:
+                read = read.translate(comp)[::-1]
+            out.write(f">p{i}\n{read}\n")
     return output_path
 
 
-def generate_random_kmers(output_path, k, count, seed=42):
+def generate_random_kmers(output_path, kmer_len, count, seed=RANDOM_KMER_SEED):
     """Write a FASTA file of uniformly random, independent k-mers.
 
     Each k-mer is drawn uniformly from the 4^k possible sequences.
@@ -809,30 +833,30 @@ def generate_random_kmers(output_path, k, count, seed=42):
     """
     rng = random.Random(seed)
     bases = ["A", "C", "G", "T"]
-    with open(output_path, "w") as f:
+    with open(output_path, "w") as handle:
         for i in range(count):
-            kmer = "".join(bases[lemire_randbelow(rng, 4)] for _ in range(k))
-            f.write(f">{i}\n{kmer}\n")
+            kmer = "".join(bases[lemire_randbelow(rng, NUM_BASES)] for _ in range(kmer_len))
+            handle.write(f">{i}\n{kmer}\n")
 
 
-def lemire_randbelow(rng, n):
+def lemire_randbelow(rng, bound):
     """Unbiased random integer in [0, n) by Lemire's method (Lemire 2019).
 
     Plain ``x % n`` carries modulo bias whenever n does not divide the PRNG range.
     Lemire's scheme maps the 64-bit draw into [0, n) uniformly and redraws only on a rare threshold collision.
     A power-of-two n reduces to a masked draw.
     """
-    if n <= 0:
+    if bound <= 0:
         raise ValueError("n must be >= 1")
-    if n & (n - 1) == 0:
-        return rng.getrandbits(n.bit_length() - 1)
-    t = (-n) % n
-    mask64 = (1 << 64) - 1
+    if bound & (bound - 1) == 0:
+        return rng.getrandbits(bound.bit_length() - 1)
+    threshold = (-bound) % bound
+    mask64 = (1 << WORD_BITS) - 1
     while True:
-        x = rng.getrandbits(64)
-        m = x * n
-        if (m & mask64) >= t:
-            return m >> 64
+        draw = rng.getrandbits(WORD_BITS)
+        product = draw * bound
+        if (product & mask64) >= threshold:
+            return product >> WORD_BITS
 
 
 def gate_query_report(text, tool, phase):
@@ -881,15 +905,15 @@ def unwrap_fasta(path, out_dir=None):
     Without --multiline, SSHash's query would treat alternate lines of a wrapped record as headers.
     The output goes to out_dir (by default next to the input) with a _uw_ prefix, and gzipped input is read transparently.
     """
-    p = Path(path)
-    if not p.exists() and p.with_suffix(p.suffix + ".gz").exists():
-        return unwrap_fasta(str(p.with_suffix(p.suffix + ".gz")), out_dir)
+    in_path = Path(path)
+    if not in_path.exists() and in_path.with_suffix(in_path.suffix + ".gz").exists():
+        return unwrap_fasta(str(in_path.with_suffix(in_path.suffix + ".gz")), out_dir)
 
     opener = __import__("gzip").open if str(path).endswith(".gz") else open
     records = []
-    with opener(path, "rt") as f:
+    with opener(path, "rt") as handle:
         buffer = []
-        for line in f:
+        for line in handle:
             if line.startswith(">"):
                 if buffer:
                     records.append("".join(buffer))
@@ -900,9 +924,9 @@ def unwrap_fasta(path, out_dir=None):
             records.append("".join(buffer))
 
     out_path = str(Path(out_dir or Path(path).parent) / ("_uw_" + Path(path).name))
-    with open(out_path, "w") as f:
+    with open(out_path, "w") as handle:
         for rec in records:
             if rec.startswith(">"):
                 # Each record becomes a header line followed by its joined sequence.
-                f.write(rec + "\n")
+                handle.write(rec + "\n")
     return out_path

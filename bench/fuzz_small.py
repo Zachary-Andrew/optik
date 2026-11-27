@@ -17,6 +17,7 @@ Usage: python3 bench/fuzz_small.py [--optik target/release/optik] [--rounds 80] 
 """
 
 import argparse
+import enum
 import os
 import random
 import subprocess
@@ -24,157 +25,231 @@ import sys
 import tempfile
 from pathlib import Path
 
-from sam_spec import DBG_MAX_K, SAM_FLAGS_SECONDARY_SUPPLEMENTARY
+from diagnostics import DETAIL_CHARS
+from dna import revcomp
+from sam_spec import (
+    DBG_MAX_K,
+    SAM_TAG_PREFIX_LEN,
+    GfaSegmentCol,
+    SamFlag,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-COMP = str.maketrans("ACGTacgt", "TGCAtgca")
 
 
-def rc(s):
-    """Reverse complement of s."""
-    return s.translate(COMP)[::-1]
+class Shape(enum.IntEnum):
+    """Adversarial sequence shapes a fuzz genome is built from, each drawn with equal chance.
+
+    The values are the draws of rng.randrange(len(Shape)), so reordering them changes every seeded genome.
+    """
+
+    RANDOM = 0
+    PALINDROME = 1
+    HOMOPOLYMER = 2
+    TANDEM = 3
+    N_RUN = 4
+    REPEAT = 5
+    """A copy of an earlier part of the record."""
+    RC_REPEAT = 6
+    """A reverse-complemented copy of an earlier part of the record."""
+    LOWERCASE = 7
 
 
-def kmers(s, k):
+class Edit(enum.IntEnum):
+    """Edits applied to a long read, each drawn with equal chance.
+
+    As with Shape, the values are the rng draws themselves.
+    """
+
+    SUBSTITUTION = 0
+    INSERTION = 1
+    DELETION = 2
+
+
+# A genome is at most MAX_RECORDS records of at most MAX_PARTS parts, each part one Shape.
+MAX_RECORDS = 6
+MAX_PARTS = 12
+MAX_RANDOM_LEN = 400
+MAX_PALINDROME_HALF = 30
+MAX_HOMOPOLYMER_LEN = 200
+MAX_TANDEM_UNIT = 7
+MIN_TANDEM_COPIES = 2
+MAX_TANDEM_COPIES = 60
+MAX_N_RUN = 20
+MAX_LOWERCASE_LEN = 60
+# k values a round draws from: odd and even, around the 2-bit word boundaries
+KMER_CHOICES = [3, 4, 5, 8, 11, 15, 16, 20, 21, 25, 31, 32]
+# a round's seed is seed x ROUND_SEED_MULT + round, a prime so seeds and rounds never collide
+ROUND_SEED_MULT = 100003
+# Each record contributes QUERIES_PER_RECORD query windows of up to QUERY_EXTRA bases past k.
+# A window may be reverse-complemented, and with QUERY_MUTATE_PROB it also gets one random base.
+# RANDOM_QUERIES fully random queries, up to RANDOM_QUERY_EXTRA bases past k, are added on top.
+QUERIES_PER_RECORD = 20
+QUERY_EXTRA = 40
+QUERY_MUTATE_PROB = 0.3
+RANDOM_QUERIES = 50
+RANDOM_QUERY_EXTRA = 30
+# spss-update removes every REMOVE_STRIDE-th query
+REMOVE_STRIDE = 3
+# short reads: records of at least SHORT_READ_MIN_REC bases give SHORT_READS_PER_REC reads of SHORT_READ_MIN_LEN..SHORT_READ_MAX_LEN bases with up to MAX_READ_SUBS random bases
+SHORT_READ_MIN_REC = 60
+SHORT_READS_PER_REC = 15
+SHORT_READ_MIN_LEN = 30
+SHORT_READ_MAX_LEN = 300
+MAX_READ_SUBS = 6
+REVCOMP_PROB = 0.5
+# long reads (the chaining path): records of at least LONG_READ_MIN_REC bases give LONG_READS_PER_REC reads of LONG_READ_MIN_LEN..LONG_READ_MAX_LEN bases, one edit per LONG_READ_EDIT_SPACING bases
+LONG_READ_MIN_REC = 600
+LONG_READS_PER_REC = 3
+LONG_READ_MIN_LEN = 500
+LONG_READ_MAX_LEN = 3000
+LONG_READ_EDIT_SPACING = 20
+# harness
+DEFAULT_ROUNDS = 80
+DEFAULT_SEED = 1
+RUN_TIMEOUT_S = 600
+
+
+def kmers(seq, kmer_len):
     """Each k-mer window of s, upper-cased, or None for a window holding a non-ACGT base."""
-    s = s.upper()
-    for i in range(len(s) - k + 1):
-        w = s[i : i + k]
-        yield w if all(c in "ACGT" for c in w) else None
+    seq = seq.upper()
+    for i in range(len(seq) - kmer_len + 1):
+        window = seq[i : i + kmer_len]
+        yield window if all(base in "ACGT" for base in window) else None
 
 
-def genome(r):
+def genome(rng):
     """Random genome of one to six records built from the adversarial shapes."""
     recs = []
-    for i in range(r.randint(1, 6)):
-        s = []
-        for _ in range(r.randint(1, 12)):
-            kind = r.randrange(8)
-            if kind == 0:
-                s.append("".join(r.choice("ACGT") for _ in range(r.randint(1, 400))))
-            elif kind == 1:
-                y = "".join(r.choice("ACGT") for _ in range(r.randint(1, 30)))
-                s.append(y + rc(y))
-            elif kind == 2:
-                s.append(r.choice("ACGT") * r.randint(1, 200))
-            elif kind == 3:
-                u = "".join(r.choice("ACGT") for _ in range(r.randint(1, 7)))
-                s.append(u * r.randint(2, 60))
-            elif kind == 4:
-                s.append("N" * r.randint(1, 20))
-            elif kind == 5 and s:
-                s.append(s[r.randrange(len(s))])
-            elif kind == 6 and s:
-                s.append(rc(s[r.randrange(len(s))]))
-            else:
-                s.append(
-                    "".join(r.choice("ACGT") for _ in range(r.randint(1, 60))).lower()
+    for i in range(rng.randint(1, MAX_RECORDS)):
+        parts = []
+        for _ in range(rng.randint(1, MAX_PARTS)):
+            kind = Shape(rng.randrange(len(Shape)))
+            if kind == Shape.RANDOM:
+                parts.append("".join(rng.choice("ACGT") for _ in range(rng.randint(1, MAX_RANDOM_LEN))))
+            elif kind == Shape.PALINDROME:
+                half = "".join(rng.choice("ACGT") for _ in range(rng.randint(1, MAX_PALINDROME_HALF)))
+                parts.append(half + revcomp(half))
+            elif kind == Shape.HOMOPOLYMER:
+                parts.append(rng.choice("ACGT") * rng.randint(1, MAX_HOMOPOLYMER_LEN))
+            elif kind == Shape.TANDEM:
+                unit = "".join(rng.choice("ACGT") for _ in range(rng.randint(1, MAX_TANDEM_UNIT)))
+                parts.append(unit * rng.randint(MIN_TANDEM_COPIES, MAX_TANDEM_COPIES))
+            elif kind == Shape.N_RUN:
+                parts.append("N" * rng.randint(1, MAX_N_RUN))
+            elif kind == Shape.REPEAT and parts:
+                parts.append(parts[rng.randrange(len(parts))])
+            elif kind == Shape.RC_REPEAT and parts:
+                parts.append(revcomp(parts[rng.randrange(len(parts))]))
+            else:  # Shape.LOWERCASE, or a repeat drawn before the record has a part to copy
+                parts.append(
+                    "".join(rng.choice("ACGT") for _ in range(rng.randint(1, MAX_LOWERCASE_LEN))).lower()
                 )
-        recs.append((f"r{i}", "".join(s)))
+        recs.append((f"r{i}", "".join(parts)))
     return recs
 
 
 def main():
     """Run every fuzz round and return 1 if any check failed, else 0."""
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--optik", default=os.path.join(HERE, "..", "target/release/optik"))
-    ap.add_argument("--rounds", type=int, default=80)
-    ap.add_argument("--seed", type=int, default=1)
-    a = ap.parse_args()
-    optik = a.optik
+    parser.add_argument("--optik", default=os.path.join(HERE, "..", "target/release/optik"))
+    parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    args = parser.parse_args()
+    optik = args.optik
     fails = []
     checks = 0
 
     def run(cmd):
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600, check=False
+            cmd, capture_output=True, text=True, timeout=RUN_TIMEOUT_S, check=False
         )
 
-    def kv(out, key):
+    def report_value(out, key):
         """Integer value of the report line starting with `key`."""
         for line in out.splitlines():
             if line.startswith(key):
                 return int(line.split("=")[1].split()[0])
         return None
 
-    with tempfile.TemporaryDirectory(prefix="optik_fuzz_") as td:
+    with tempfile.TemporaryDirectory(prefix="optik_fuzz_") as tmp_dir:
 
-        def in_dir(f):
+        def in_dir(name):
             """Path of f in this round's directory."""
-            return os.path.join(td, f)
+            return os.path.join(tmp_dir, name)
 
         def write(path, recs):
             """Write records as single-line FASTA."""
-            with open(path, "w") as f:
-                for n, s in recs:
-                    f.write(f">{n}\n{s}\n")
+            with open(path, "w") as handle:
+                for name, seq in recs:
+                    handle.write(f">{name}\n{seq}\n")
 
-        for rnd in range(a.rounds):
-            r = random.Random(a.seed * 100003 + rnd)
-            k = r.choice([3, 4, 5, 8, 11, 15, 16, 20, 21, 25, 31, 32])
-            recs = genome(r)
+        for rnd in range(args.rounds):
+            rng = random.Random(args.seed * ROUND_SEED_MULT + rnd)
+            kmer_len = rng.choice(KMER_CHOICES)
+            recs = genome(rng)
             write(in_dir("g.fa"), recs)
-            tag = f"seed {a.seed} round {rnd} k={k}"
+            tag = f"seed {args.seed} round {rnd} k={kmer_len}"
             cnt = {}
-            for _, s in recs:
-                for w in kmers(s, k):
-                    if w:
-                        c = min(w, rc(w))
-                        cnt[c] = cnt.get(c, 0) + 1
-            q = []
-            for _, s in recs:
-                if len(s) >= k:
-                    for _ in range(20):
-                        st = r.randrange(len(s) - k + 1)
-                        w = s[st : st + r.randint(k, k + 40)]
-                        if r.random() < 0.3:
-                            w = rc(w)
-                        if r.random() < 0.3:
-                            w = list(w)
-                            w[r.randrange(len(w))] = r.choice("ACGTN")
-                            w = "".join(w)
-                        q.append(w)
-            q += [
-                "".join(r.choice("ACGT") for _ in range(r.randint(k, k + 30)))
-                for _ in range(50)
+            for _, rec_seq in recs:
+                for window in kmers(rec_seq, kmer_len):
+                    if window:
+                        canon = min(window, revcomp(window))
+                        cnt[canon] = cnt.get(canon, 0) + 1
+            queries = []
+            for _, rec_seq in recs:
+                if len(rec_seq) >= kmer_len:
+                    for _ in range(QUERIES_PER_RECORD):
+                        start = rng.randrange(len(rec_seq) - kmer_len + 1)
+                        query_seq = rec_seq[start : start + rng.randint(kmer_len, kmer_len + QUERY_EXTRA)]
+                        if rng.random() < QUERY_MUTATE_PROB:
+                            query_seq = revcomp(query_seq)
+                        if rng.random() < QUERY_MUTATE_PROB:
+                            query_seq = list(query_seq)
+                            query_seq[rng.randrange(len(query_seq))] = rng.choice("ACGTN")
+                            query_seq = "".join(query_seq)
+                        queries.append(query_seq)
+            queries += [
+                "".join(rng.choice("ACGT") for _ in range(rng.randint(kmer_len, kmer_len + RANDOM_QUERY_EXTRA)))
+                for _ in range(RANDOM_QUERIES)
             ]
-            write(in_dir("q.fa"), [(f"q{i}", w) for i, w in enumerate(q)])
+            write(in_dir("q.fa"), [(f"q{i}", query_seq) for i, query_seq in enumerate(queries)])
 
-            def want(solid, q=q, k=k):
+            def want(solid, queries=queries, kmer_len=kmer_len):
                 """Expected (positive, negative, invalid) query counts against the solid set."""
                 pos = neg = inv = 0
-                for w in q:
-                    for x in kmers(w, k):
-                        if x is None:
+                for query_seq in queries:
+                    for kmer in kmers(query_seq, kmer_len):
+                        if kmer is None:
                             inv += 1
-                        elif min(x, rc(x)) in solid:
+                        elif min(kmer, revcomp(kmer)) in solid:
                             pos += 1
                         else:
                             neg += 1
                 return pos, neg, inv
 
             # Membership indexes at -c 1 and -c 2
-            for c in (1, 2):
-                solid = {x for x, v in cnt.items() if v >= c}
+            for min_count in (1, 2):
+                solid = {kmer for kmer, count in cnt.items() if count >= min_count}
                 builds = (
                     [["build-fm"], ["build-spss"]]
-                    if c == 1
+                    if min_count == 1
                     else [
                         ["build-fm", "-c", "2"],
                         ["build-spss", "--compact", "-c", "2"],
                     ]
                 )
-                for b in builds:
-                    p = run(
+                for build_args in builds:
+                    proc = run(
                         [
                             optik,
-                            *b,
+                            *build_args,
                             "-i",
                             in_dir("g.fa"),
                             "-k",
-                            str(k),
+                            str(kmer_len),
                             "-t",
                             "4",
                             "-o",
@@ -182,19 +257,21 @@ def main():
                         ]
                     )
                     checks += 1
+                    # A genome with no solid k-mer must be rejected, so a successful build is itself a failure.
                     if not solid:
-                        if p.returncode == 0:
+                        if proc.returncode == 0:
                             fails.append(
-                                f"{tag} {' '.join(b)}: no solid k-mers, yet rc 0"
+                                f"{tag} {' '.join(build_args)}: no solid k-mers, yet rc 0"
                             )
                         continue
-                    if p.returncode != 0:
+                    if proc.returncode != 0:
                         fails.append(
-                            f"{tag} {' '.join(b)}: rc {p.returncode}: {p.stderr.strip()[-160:]}"
+                            f"{tag} {' '.join(build_args)}: rc {proc.returncode}: {proc.stderr.strip()[-DETAIL_CHARS:]}"
                         )
                         continue
-                    ids = b[0] == "build-spss"
-                    p = run(
+                    # Only the SPSS index can report per-k-mer ids, so --ids is checked for that build alone.
+                    ids = build_args[0] == "build-spss"
+                    proc = run(
                         [
                             optik,
                             "query",
@@ -203,76 +280,78 @@ def main():
                             "-q",
                             in_dir("q.fa"),
                             "-k",
-                            str(k),
+                            str(kmer_len),
                             "-t",
                             "3",
                             *(["--ids", in_dir("ids.txt")] if ids else []),
                         ]
                     )
                     got = tuple(
-                        kv(p.stdout, f"num_{x}_kmers")
-                        for x in ("positive", "negative", "invalid")
+                        report_value(proc.stdout, f"num_{kind}_kmers")
+                        for kind in ("positive", "negative", "invalid")
                     )
                     checks += 1
                     if got != want(solid):
                         fails.append(
-                            f"{tag} {' '.join(b)} query: {got} != truth {want(solid)}"
+                            f"{tag} {' '.join(build_args)} query: {got} != truth {want(solid)}"
                         )
-                    if ids and p.returncode == 0:
-                        by, inv = {}, {}
-                        for w, line in zip(
-                            q,
+                    # The ids must be a bijection on canonical k-mers, with each k-mer getting one id and no id shared by two k-mers.
+                    if ids and proc.returncode == 0:
+                        ids_by_kmer, inv = {}, {}
+                        for query_seq, line in zip(
+                            queries,
                             Path(in_dir("ids.txt")).read_text().split("\n"),
                             strict=False,
                         ):
-                            for x, v in zip(kmers(w, k), line.split(), strict=False):
-                                if x is not None and v != "-1":
-                                    by.setdefault(min(x, rc(x)), set()).add(v)
-                        for x, vs in by.items():
-                            for v in vs:
-                                inv.setdefault(v, set()).add(x)
+                            for kmer, kmer_id in zip(kmers(query_seq, kmer_len), line.split(), strict=False):
+                                if kmer is not None and kmer_id != "-1":
+                                    ids_by_kmer.setdefault(min(kmer, revcomp(kmer)), set()).add(kmer_id)
+                        for kmer, kmer_ids in ids_by_kmer.items():
+                            for kmer_id in kmer_ids:
+                                inv.setdefault(kmer_id, set()).add(kmer)
                         checks += 1
-                        multi = sum(len(v) > 1 for v in by.values())
-                        shared = sum(len(v) > 1 for v in inv.values())
+                        multi = sum(len(ids) > 1 for ids in ids_by_kmer.values())
+                        shared = sum(len(kmers_of_id) > 1 for kmers_of_id in inv.values())
                         if multi or shared:
                             fails.append(
-                                f"{tag} {' '.join(b)} --ids: {multi} k-mers with several ids, "
+                                f"{tag} {' '.join(build_args)} --ids: {multi} k-mers with several ids, "
                                 f"{shared} ids shared by several k-mers"
                             )
 
             # spss-update, (base | add) - remove
-            def canon_set(seqs, k=k):
+            def canon_set(seqs, kmer_len=kmer_len):
                 """Canonical k-mers of every sequence in seqs."""
                 out = set()
-                for x in seqs:
-                    for w in kmers(x, k):
-                        if w:
-                            out.add(min(w, rc(w)))
+                for seq in seqs:
+                    for kmer in kmers(seq, kmer_len):
+                        if kmer:
+                            out.add(min(kmer, revcomp(kmer)))
                 return out
 
+            # The update test builds from half the records, adds the other half and removes some query k-mers, then compares against the same edit done on Python sets.
             half = max(1, len(recs) // 2)
             base, addr = recs[:half], recs[half:]
-            remr = [(f"x{i}", w) for i, w in enumerate(q[::3])]
+            remr = [(f"x{i}", query_seq) for i, query_seq in enumerate(queries[::REMOVE_STRIDE])]
             write(in_dir("base.fa"), base)
             write(in_dir("add.fa"), addr or [("e", "")])
             write(in_dir("rem.fa"), remr)
             upd = (
-                canon_set(s for _, s in base) | canon_set(s for _, s in addr)
-            ) - canon_set(w for _, w in remr)
-            if canon_set(s for _, s in base):
-                p = run(
+                canon_set(rec_seq for _, rec_seq in base) | canon_set(rec_seq for _, rec_seq in addr)
+            ) - canon_set(query_seq for _, query_seq in remr)
+            if canon_set(rec_seq for _, rec_seq in base):
+                proc = run(
                     [
                         optik,
                         "build-spss",
                         "-i",
                         in_dir("base.fa"),
                         "-k",
-                        str(k),
+                        str(kmer_len),
                         "-o",
                         in_dir("u.spss"),
                     ]
                 )
-                p = (
+                proc = (
                     run(
                         [
                             optik,
@@ -287,17 +366,18 @@ def main():
                             in_dir("u2.spss"),
                         ]
                     )
-                    if p.returncode == 0
-                    else p
+                    if proc.returncode == 0
+                    else proc
                 )
                 checks += 1
-                if p.returncode != 0:
+                # An update that leaves the set empty may fail, while any other failure is reported.
+                if proc.returncode != 0:
                     if upd:
                         fails.append(
-                            f"{tag} spss-update: rc {p.returncode}: {p.stderr.strip()[-160:]}"
+                            f"{tag} spss-update: rc {proc.returncode}: {proc.stderr.strip()[-DETAIL_CHARS:]}"
                         )
                 else:
-                    p = run(
+                    proc = run(
                         [
                             optik,
                             "query",
@@ -306,7 +386,7 @@ def main():
                             "-q",
                             in_dir("q.fa"),
                             "-k",
-                            str(k),
+                            str(kmer_len),
                             "-t",
                             "2",
                             "--ids",
@@ -314,26 +394,26 @@ def main():
                         ]
                     )
                     got = tuple(
-                        kv(p.stdout, f"num_{x}_kmers")
-                        for x in ("positive", "negative", "invalid")
+                        report_value(proc.stdout, f"num_{kind}_kmers")
+                        for kind in ("positive", "negative", "invalid")
                     )
                     if got != want(upd):
                         fails.append(
                             f"{tag} spss-update query: {got} != truth {want(upd)}"
                         )
-                    by = {}
-                    for w, line in zip(
-                        q,
+                    ids_by_kmer = {}
+                    for query_seq, line in zip(
+                        queries,
                         Path(in_dir("uids.txt")).read_text().split("\n"),
                         strict=False,
                     ):
-                        for x, v in zip(kmers(w, k), line.split(), strict=False):
-                            if x is not None and v != "-1":
-                                by.setdefault(min(x, rc(x)), set()).add(v)
+                        for kmer, kmer_id in zip(kmers(query_seq, kmer_len), line.split(), strict=False):
+                            if kmer is not None and kmer_id != "-1":
+                                ids_by_kmer.setdefault(min(kmer, revcomp(kmer)), set()).add(kmer_id)
                     checks += 1
-                    if any(len(v) > 1 for v in by.values()) or len(
-                        {next(iter(v)) for v in by.values()}
-                    ) != len(by):
+                    if any(len(ids) > 1 for ids in ids_by_kmer.values()) or len(
+                        {next(iter(ids)) for ids in ids_by_kmer.values()}
+                    ) != len(ids_by_kmer):
                         fails.append(
                             f"{tag} spss-update --ids: not one distinct id per k-mer"
                         )
@@ -341,24 +421,24 @@ def main():
             # FASTQ.gz input gives the same index answers.
             import gzip
 
-            with gzip.open(in_dir("g.fq.gz"), "wt") as f:
-                for n, x in recs:
-                    f.write(f"@{n}\n{x}\n+\n{'I' * len(x)}\n")
+            with gzip.open(in_dir("g.fq.gz"), "wt") as handle:
+                for name, rec_seq in recs:
+                    handle.write(f"@{name}\n{rec_seq}\n+\n{'I' * len(rec_seq)}\n")
             if cnt:
-                for b in (["build-fm"], ["build-spss"]):
-                    p1 = run(
+                for build_args in (["build-fm"], ["build-spss"]):
+                    build_proc = run(
                         [
                             optik,
-                            *b,
+                            *build_args,
                             "-i",
                             in_dir("g.fq.gz"),
                             "-k",
-                            str(k),
+                            str(kmer_len),
                             "-o",
                             in_dir("z.idx"),
                         ]
                     )
-                    p2 = (
+                    query_proc = (
                         run(
                             [
                                 optik,
@@ -368,122 +448,124 @@ def main():
                                 "-q",
                                 in_dir("q.fa"),
                                 "-k",
-                                str(k),
+                                str(kmer_len),
                             ]
                         )
-                        if p1.returncode == 0
-                        else p1
+                        if build_proc.returncode == 0
+                        else build_proc
                     )
                     got = tuple(
-                        kv(p2.stdout, f"num_{x}_kmers")
-                        for x in ("positive", "negative", "invalid")
+                        report_value(query_proc.stdout, f"num_{kind}_kmers")
+                        for kind in ("positive", "negative", "invalid")
                     )
                     checks += 1
                     if got != want(set(cnt)):
                         fails.append(
-                            f"{tag} {b[0]} from fastq.gz: {got} != truth {want(set(cnt))}"
+                            f"{tag} {build_args[0]} from fastq.gz: {got} != truth {want(set(cnt))}"
                         )
 
             # dbruijn segments partition the solid set, with exact KC
-            if k <= DBG_MAX_K:
-                for c in (1, 2):
-                    solid = {x for x, v in cnt.items() if v >= c}
+            if kmer_len <= DBG_MAX_K:
+                for min_count in (1, 2):
+                    solid = {kmer for kmer, count in cnt.items() if count >= min_count}
                     gfas = []
-                    for t in ("1", "4"):
-                        p = run(
+                    for threads in ("1", "4"):
+                        proc = run(
                             [
                                 optik,
                                 "dbruijn",
                                 "-i",
                                 in_dir("g.fa"),
                                 "-k",
-                                str(k),
+                                str(kmer_len),
                                 "-c",
-                                str(c),
+                                str(min_count),
                                 "-t",
-                                t,
+                                threads,
                                 "-o",
-                                in_dir(f"d{t}.gfa"),
+                                in_dir(f"d{threads}.gfa"),
                             ]
                         )
                         gfas.append(
                             (
-                                p.returncode,
-                                Path(in_dir(f"d{t}.gfa")).read_text()
-                                if p.returncode == 0
+                                proc.returncode,
+                                Path(in_dir(f"d{threads}.gfa")).read_text()
+                                if proc.returncode == 0
                                 else "",
                             )
                         )
                     checks += 2
                     if gfas[0] != gfas[1]:
                         fails.append(
-                            f"{tag} dbruijn -c {c}: GFA differs between -t 1 and -t 4"
+                            f"{tag} dbruijn -c {min_count}: GFA differs between -t 1 and -t 4"
                         )
                     rc0, text = gfas[0]
                     # No k-mer at all is an error, while k-mers of which none is solid give an empty graph, exiting 0 with a warning.
                     if not cnt:
                         if rc0 == 0:
                             fails.append(
-                                f"{tag} dbruijn -c {c}: input has no k-mers, yet rc 0"
+                                f"{tag} dbruijn -c {min_count}: input has no k-mers, yet rc 0"
                             )
                         continue
                     if rc0 != 0:
-                        fails.append(f"{tag} dbruijn -c {c}: rc {rc0}")
+                        fails.append(f"{tag} dbruijn -c {min_count}: rc {rc0}")
                         continue
                     seen, dup, kc_bad = set(), 0, 0
                     for line in text.splitlines():
                         if not line.startswith("S\t"):
                             continue
-                        f = line.split("\t")
-                        seq = f[2]
-                        kc = int(next(x for x in f if x.startswith("KC:i:"))[5:])
+                        fields = line.split("\t")
+                        seq = fields[GfaSegmentCol.SEQ]
+                        kc_tag = int(next(field for field in fields if field.startswith("KC:i:"))[SAM_TAG_PREFIX_LEN:])
                         tot = 0
-                        for w in kmers(seq, k):
-                            x = min(w, rc(w))
-                            if x in seen:
+                        for window in kmers(seq, kmer_len):
+                            kmer = min(window, revcomp(window))
+                            if kmer in seen:
                                 dup += 1
-                            seen.add(x)
-                            tot += cnt.get(x, 0)
-                        kc_bad += tot != kc
+                            seen.add(kmer)
+                            tot += cnt.get(kmer, 0)
+                        kc_bad += tot != kc_tag
                     if seen != solid or dup or kc_bad:
                         fails.append(
-                            f"{tag} dbruijn -c {c}: {len(seen ^ solid)} k-mers off the solid set, "
+                            f"{tag} dbruijn -c {min_count}: {len(seen ^ solid)} k-mers off the solid set, "
                             f"{dup} duplicated, {kc_bad} wrong KC"
                         )
 
             # map gives one primary per read and the same output at every thread count.
             reads = []
-            for _, s in recs:
-                if len(s) >= 60:
-                    for _ in range(15):
-                        length = r.randint(30, min(len(s), 300))
-                        st = r.randrange(len(s) - length + 1)
-                        w = list(s[st : st + length])
-                        for _ in range(r.randint(0, 6)):
-                            w[r.randrange(len(w))] = r.choice("ACGTN")
-                        w = "".join(w)
-                        reads.append(rc(w) if r.random() < 0.5 else w)
-                if len(s) >= 600:  # the long-read (chaining) path
-                    for _ in range(3):
-                        length = r.randint(500, min(len(s), 3000))
-                        st = r.randrange(len(s) - length + 1)
-                        w = list(s[st : st + length])
-                        for _ in range(length // 20):
-                            j = r.randrange(len(w))
-                            op = r.randrange(3)
-                            if op == 0:
-                                w[j] = r.choice("ACGT")
-                            elif op == 1:
-                                w.insert(j, r.choice("ACGT"))
-                            elif len(w) > 1:
-                                del w[j]
-                        w = "".join(w)
-                        reads.append(rc(w) if r.random() < 0.5 else w)
+            for _, rec_seq in recs:
+                if len(rec_seq) >= SHORT_READ_MIN_REC:
+                    for _ in range(SHORT_READS_PER_REC):
+                        length = rng.randint(SHORT_READ_MIN_LEN, min(len(rec_seq), SHORT_READ_MAX_LEN))
+                        start = rng.randrange(len(rec_seq) - length + 1)
+                        read_seq = list(rec_seq[start : start + length])
+                        for _ in range(rng.randint(0, MAX_READ_SUBS)):
+                            read_seq[rng.randrange(len(read_seq))] = rng.choice("ACGTN")
+                        read_seq = "".join(read_seq)
+                        reads.append(revcomp(read_seq) if rng.random() < REVCOMP_PROB else read_seq)
+                if len(rec_seq) >= LONG_READ_MIN_REC:  # the long-read (chaining) path
+                    for _ in range(LONG_READS_PER_REC):
+                        length = rng.randint(LONG_READ_MIN_LEN, min(len(rec_seq), LONG_READ_MAX_LEN))
+                        start = rng.randrange(len(rec_seq) - length + 1)
+                        read_seq = list(rec_seq[start : start + length])
+                        # Edits land at random positions about once per LONG_READ_EDIT_SPACING bases, mixing all three kinds.
+                        for _ in range(length // LONG_READ_EDIT_SPACING):
+                            pos = rng.randrange(len(read_seq))
+                            edit = Edit(rng.randrange(len(Edit)))
+                            if edit == Edit.SUBSTITUTION:
+                                read_seq[pos] = rng.choice("ACGT")
+                            elif edit == Edit.INSERTION:
+                                read_seq.insert(pos, rng.choice("ACGT"))
+                            elif len(read_seq) > 1:
+                                del read_seq[pos]
+                        read_seq = "".join(read_seq)
+                        reads.append(revcomp(read_seq) if rng.random() < REVCOMP_PROB else read_seq)
             if reads:
-                write(in_dir("r.fa"), [(f"m{i}", w) for i, w in enumerate(reads)])
+                write(in_dir("r.fa"), [(f"m{i}", read_seq) for i, read_seq in enumerate(reads)])
                 sams = []
-                for t in ("1", "4"):
-                    p = run(
+                # The same reads at -t 1 and -t 4 must give identical records.
+                for threads in ("1", "4"):
+                    proc = run(
                         [
                             optik,
                             "map",
@@ -492,17 +574,17 @@ def main():
                             "-q",
                             in_dir("r.fa"),
                             "-t",
-                            t,
+                            threads,
                             "-o",
-                            in_dir(f"m{t}.sam"),
+                            in_dir(f"m{threads}.sam"),
                         ]
                     )
                     # @PG CL records the command line (here -t), so it differs by design.
                     sam_text = ""
-                    if p.returncode == 0:
-                        with open(in_dir(f"m{t}.sam")) as fh:
-                            sam_text = "".join(x for x in fh if not x.startswith("@PG"))
-                    sams.append((p.returncode, sam_text))
+                    if proc.returncode == 0:
+                        with open(in_dir(f"m{threads}.sam")) as sam_handle:
+                            sam_text = "".join(line for line in sam_handle if not line.startswith("@PG"))
+                    sams.append((proc.returncode, sam_text))
                 checks += 2
                 if sams[0] != sams[1]:
                     fails.append(f"{tag} map: SAM differs between -t 1 and -t 4")
@@ -510,22 +592,22 @@ def main():
                 for line in sams[0][1].splitlines():
                     if line.startswith("@"):
                         continue
-                    f = line.split("\t")
-                    if not int(f[1]) & SAM_FLAGS_SECONDARY_SUPPLEMENTARY:
-                        prim[f[0]] = prim.get(f[0], 0) + 1
+                    fields = line.split("\t")
+                    if not int(fields[1]) & SamFlag.SECONDARY_SUPPLEMENTARY:
+                        prim[fields[0]] = prim.get(fields[0], 0) + 1
                 if (
                     sams[0][0] != 0
                     or len(prim) != len(reads)
-                    or any(v != 1 for v in prim.values())
+                    or any(count != 1 for count in prim.values())
                 ):
                     fails.append(
                         f"{tag} map: {len(prim)} reads with a primary of {len(reads)} "
                         f"(rc {sams[0][0]})"
                     )
 
-    for f in fails:
-        print("  [FAIL]", f)
-    print(f"fuzz_small: {a.rounds} rounds, {checks} checks, {len(fails)} failures")
+    for failure in fails:
+        print("  [FAIL]", failure)
+    print(f"fuzz_small: {args.rounds} rounds, {checks} checks, {len(fails)} failures")
     print("fuzz_small: ALL PASS" if not fails else "fuzz_small: FAILED")
     return 1 if fails else 0
 

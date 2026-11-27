@@ -162,7 +162,7 @@ def insert_helpers(src):
 
 def main():
     """Patch every site under the given WFA2-lib directory, or leave all of them alone."""
-    if len(sys.argv) != 2:
+    if len(sys.argv[1:]) != 1:
         print("usage: " + __doc__.split("Usage:")[1].strip(), file=sys.stderr)
         return 1
     root = sys.argv[1]
@@ -182,11 +182,11 @@ def main():
                 .replace("wf_store_u64(", "WF_STORE_U64(")
             )
             continue
-        for old, new, n in edits:
+        for old, new, expected in edits:
             got = src.count(old)
-            if got != n:
+            if got != expected:
                 print(
-                    f"wfa2_unaligned_loads: {rel}: anchor {old!r} found {got}x, expected {n}x "
+                    f"wfa2_unaligned_loads: {rel}: anchor {old!r} found {got}x, expected {expected}x "
                     "(upstream drift; nothing modified)",
                     file=sys.stderr,
                 )

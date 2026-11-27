@@ -11,70 +11,70 @@ using namespace tpoptoa;
 
 int main() {
     std::mt19937_64 rng(7);
-    const char* B = "ACGT";
+    const char* bases = "ACGT";
     std::vector<std::string> seqs;
-    for (std::size_t L : {2500000ul, 1048600ul, 5000ul, 20ul}) {
-        std::string s(L, 'A');
-        for (auto& c : s) c = B[rng() & 3];
-        for (int r = 0; r < 40 && L > 10000; ++r) {          // repeats and N runs
-            std::size_t a = rng() % (L - 3000), b = rng() % (L - 3000);
-            s.replace(b, 2000, s.substr(a, 2000));
-            std::size_t n = rng() % (L - 50);
-            for (int t = 0; t < int(rng() % 40); ++t) s[n + t] = 'N';
+    for (std::size_t seq_len : {2500000ul, 1048600ul, 5000ul, 20ul}) {
+        std::string seq(seq_len, 'A');
+        for (auto& ch : seq) ch = bases[rng() & 3];
+        for (int r = 0; r < 40 && seq_len > 10000; ++r) {          // repeats and N runs
+            std::size_t src_pos = rng() % (seq_len - 3000), dst_pos = rng() % (seq_len - 3000);
+            seq.replace(dst_pos, 2000, seq.substr(src_pos, 2000));
+            std::size_t n_start = rng() % (seq_len - 50);
+            for (int t = 0; t < int(rng() % 40); ++t) seq[n_start + t] = 'N';
         }
-        seqs.push_back(s);
+        seqs.push_back(seq);
     }
     std::vector<std::pair<const char*, std::size_t>> refs;
-    for (auto& s : seqs) refs.push_back({s.data(), s.size()});
+    for (auto& seq : seqs) refs.push_back({seq.data(), seq.size()});
     int fail = 0;
-    for (unsigned k : {15u, 21u}) for (unsigned w : {5u, 10u, 50u}) {
+    for (unsigned kmer_len : {15u, 21u}) for (unsigned window : {5u, 10u, 50u}) {
         std::map<uint64_t, std::vector<uint64_t>> oracle;
         for (std::size_t rid = 0; rid < refs.size(); ++rid)
-            extract_minimizers(refs[rid].first, refs[rid].second, k, w, [&](const MinimizerSeed& m) {
-                oracle[m.kmer].push_back((uint64_t(rid) << 33) | (uint64_t(m.pos) << 1) | m.rev);
+            extract_minimizers(refs[rid].first, refs[rid].second, kmer_len, window, [&](const MinimizerSeed& seed) {
+                oracle[seed.kmer].push_back((uint64_t(rid) << 33) | (uint64_t(seed.pos) << 1) | seed.rev);
             });
         std::size_t occ = 0;
-        for (auto& [key, v] : oracle) { std::sort(v.begin(), v.end()); occ += v.size(); }
-        for (unsigned th : {1u, 3u, 8u}) {
+        for (auto& [key, posts] : oracle) { std::sort(posts.begin(), posts.end()); occ += posts.size(); }
+        for (unsigned num_threads : {1u, 3u, 8u}) {
             SeedIndex idx;
-            if (!idx.build(refs, k, w, 1u << 30, th)) { std::printf("build failed\n"); ++fail; continue; }
+            if (!idx.build(refs, kmer_len, window, 1u << 30, num_threads)) { std::printf("build failed\n"); ++fail; continue; }
             std::size_t bad = idx.distinct() != oracle.size() || idx.occurrences() != occ;
-            for (auto& [key, v] : oracle) {
-                auto [p, n] = idx.find(key);
-                bad += !p || n != v.size() || !std::equal(v.begin(), v.end(), p);
+            for (auto& [key, posts] : oracle) {
+                auto [posts_ptr, count] = idx.find(key);
+                bad += !posts_ptr || count != posts.size() || !std::equal(posts.begin(), posts.end(), posts_ptr);
             }
-            std::size_t fp = 0;
+            std::size_t false_pos = 0;
             for (int i = 0; i < 20000; ++i) {
-                uint64_t x = rng() & kmer_mask(k), xr = reverse_complement(x, k);
-                x = std::min(x, xr);
-                fp += !oracle.count(x) && idx.find(x).first;
+                uint64_t kmer = rng() & kmer_mask(kmer_len), rev_comp = reverse_complement(kmer, kmer_len);
+                kmer = std::min(kmer, rev_comp);
+                false_pos += !oracle.count(kmer) && idx.find(kmer).first;
             }
             // pipelined collect() == naive per-minimizer find() in read order
             std::size_t cbad = 0;
             for (int i = 0; i < 300; ++i) {
                 const auto& src = seqs[rng() % 2];
-                std::size_t L = 50 + rng() % 400, p0 = rng() % (src.size() - L);
-                std::string rd = src.substr(p0, L);
-                for (auto& c : rd) if (rng() % 50 == 0) c = B[rng() & 3];
+                std::size_t read_len = 50 + rng() % 400, read_start = rng() % (src.size() - read_len);
+                std::string read = src.substr(read_start, read_len);
+                for (auto& ch : read) if (rng() % 50 == 0) ch = bases[rng() & 3];
                 std::vector<SeedIndex::Hit> got, want;
-                idx.collect(rd.data(), rd.size(), got);
-                extract_minimizers(rd.data(), rd.size(), k, w, [&](const MinimizerSeed& s) {
-                    auto [pp, nn] = idx.find(s.kmer);
-                    if (!pp) return;
-                    for (uint32_t t = 0; t < nn; ++t) {
-                        const bool rev = ((pp[t] & 1) != 0) != s.rev;
-                        want.push_back({uint32_t(pp[t] >> 33), rev ? 1u : 0u,
-                                        uint32_t((pp[t] >> 1) & 0xFFFFFFFFu),
-                                        rev ? uint32_t(rd.size() - k - s.pos) : s.pos});
+                idx.collect(read.data(), read.size(), got);
+                extract_minimizers(read.data(), read.size(), kmer_len, window, [&](const MinimizerSeed& seed) {
+                    auto [posts_ptr, count] = idx.find(seed.kmer);
+                    if (!posts_ptr) return;
+                    for (uint32_t t = 0; t < count; ++t) {
+                        const bool rev = ((posts_ptr[t] & 1) != 0) != seed.rev;
+                        want.push_back({uint32_t(posts_ptr[t] >> 33), rev ? 1u : 0u,
+                                        uint32_t((posts_ptr[t] >> 1) & 0xFFFFFFFFu),
+                                        rev ? uint32_t(read.size() - kmer_len - seed.pos) : seed.pos});
                     }
                 });
                 cbad += got.size() != want.size() || !std::equal(got.begin(), got.end(), want.begin(),
-                    [](const auto& a, const auto& b) {
-                        return a.rid == b.rid && a.rev == b.rev && a.rpos == b.rpos && a.qpos == b.qpos; });
+                    [](const auto& lhs, const auto& rhs) {
+                        return lhs.rid == rhs.rid && lhs.rev == rhs.rev && lhs.rpos == rhs.rpos && lhs.qpos == rhs.qpos; });
             }
             std::printf("k=%u w=%-2u t=%u distinct=%zu occ=%zu bad=%zu fp=%zu collect_bad=%zu\n",
-                        k, w, th, idx.distinct(), idx.occurrences(), bad, fp, cbad);
-            fail += bad != 0 || fp != 0 || cbad != 0;
+                        kmer_len, window, num_threads, idx.distinct(), idx.occurrences(), bad, false_pos, cbad);
+            fail += bad != 0 || false_pos != 0 || cbad != 0;
         }
     }
     std::printf(fail ? "seed_index_stress: %d FAILURE(S)\n" : "seed_index_stress: ALL PASS\n", fail);

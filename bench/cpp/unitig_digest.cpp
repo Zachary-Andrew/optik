@@ -11,56 +11,79 @@
 #include <cstring>
 #include <string>
 
-static uint64_t hash_canon(const std::string& s) {
+/// Number of distinct byte values, the size of the complement table.
+constexpr int kByteValues = 256;
+/// Clearing this bit upper-cases an ASCII letter.
+constexpr char kAsciiLowerBit = 0x20;
+/// 64-bit FNV-1a offset basis and prime.
+constexpr uint64_t kFnvOffsetBasis = 0xcbf29ce484222325ULL;
+constexpr uint64_t kFnvPrime = 0x100000001b3ULL;
+
+/// MurmurHash3's fmix64 finalizer, so that digests of similar unitig sets differ in every bit.
+/// This tool builds standalone, so it keeps its own copy of mix64() from include/wyhash.hpp.
+static uint64_t fmix64(uint64_t value) {
+    // Shift and multipliers chosen by Austin Appleby for MurmurHash3 by search for the best avalanche.
+    constexpr unsigned shift = 33;
+    constexpr uint64_t first_multiplier = 0xff51afd7ed558ccdULL;
+    constexpr uint64_t second_multiplier = 0xc4ceb9fe1a85ec53ULL;
+
+    value ^= value >> shift;
+    value *= first_multiplier;
+    value ^= value >> shift;
+    value *= second_multiplier;
+    value ^= value >> shift;
+    return value;
+}
+
+static uint64_t hash_canon(const std::string& seq) {
     struct Comp {
-        char t[256] = {};
+        char table[kByteValues] = {};
         constexpr Comp() {
             constexpr char kFwd[] = "ACGTNacgtn", kRev[] = "TGCANTGCAN";
-            for (int i = 0; i < 10; ++i) t[static_cast<unsigned char>(kFwd[i])] = kRev[i];
+            for (int i = 0; i < int(sizeof(kFwd)) - 1; ++i) table[static_cast<unsigned char>(kFwd[i])] = kRev[i];
         }
     };
-    static constexpr Comp ct{};
-    const char* comp = ct.t;
-    const std::size_t n = s.size();
+    static constexpr Comp comp_table{};
+    const char* comp = comp_table.table;
+    const std::size_t len = seq.size();
     // compare the sequence with its reverse complement position by position
     int dir = 0;
-    for (std::size_t i = 0; i < n && dir == 0; ++i) {
-        const char f = s[i] & ~0x20, r = comp[static_cast<unsigned char>(s[n - 1 - i])];
-        if (f != r) dir = f < r ? 1 : -1;
+    for (std::size_t i = 0; i < len && dir == 0; ++i) {
+        const char fwd_base = seq[i] & ~kAsciiLowerBit, rev_base = comp[static_cast<unsigned char>(seq[len - 1 - i])];
+        if (fwd_base != rev_base) dir = fwd_base < rev_base ? 1 : -1;
     }
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (std::size_t i = 0; i < n; ++i) {
-        const char c = dir >= 0 ? (s[i] & ~0x20) : comp[static_cast<unsigned char>(s[n - 1 - i])];
-        h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ULL;
+    uint64_t hash = kFnvOffsetBasis;
+    for (std::size_t i = 0; i < len; ++i) {
+        const char base = dir >= 0 ? (seq[i] & ~kAsciiLowerBit) : comp[static_cast<unsigned char>(seq[len - 1 - i])];
+        hash = (hash ^ static_cast<unsigned char>(base)) * kFnvPrime;
     }
-    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
-    return h;
+    return fmix64(hash);
 }
 
 int main(int argc, char** argv) {
     if (argc != 2) { std::fprintf(stderr, "usage: unitig_digest FILE\n"); return 2; }
-    std::FILE* f = std::fopen(argv[1], "r");
-    if (!f) { std::perror(argv[1]); return 2; }
-    uint64_t cnt = 0, bases = 0, sum = 0, xr = 0;
+    std::FILE* file = std::fopen(argv[1], "r");
+    if (!file) { std::perror(argv[1]); return 2; }
+    uint64_t cnt = 0, bases = 0, sum = 0, xor_sum = 0;
     std::string cur;
     bool have = false;
     auto done = [&] {
         if (!have) return;
-        const uint64_t h = hash_canon(cur);
-        ++cnt; bases += cur.size(); sum += h; xr ^= h;
+        const uint64_t hash = hash_canon(cur);
+        ++cnt; bases += cur.size(); sum += hash; xor_sum ^= hash;
         cur.clear(); have = false;
     };
     char* line = nullptr;
     std::size_t cap = 0;
     ssize_t len;
-    while ((len = getline(&line, &cap, f)) > 0) {
+    while ((len = getline(&line, &cap, file)) > 0) {
         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
         if (line[0] == 'S' && line[1] == '\t') {             // GFA segment
             done();
-            const char* p = std::strchr(line + 2, '\t');
-            if (!p) continue;
-            const char* q = std::strchr(p + 1, '\t');
-            cur.assign(p + 1, q ? q : line + len);
+            const char* seq_start = std::strchr(line + 2, '\t');
+            if (!seq_start) continue;
+            const char* seq_end = std::strchr(seq_start + 1, '\t');
+            cur.assign(seq_start + 1, seq_end ? seq_end : line + len);
             have = true;
             done();
         } else if (line[0] == '>') {                          // FASTA record
@@ -72,8 +95,8 @@ int main(int argc, char** argv) {
     }
     done();
     std::free(line);
-    std::fclose(f);
+    std::fclose(file);
     std::printf("%llu %llu %016llx %016llx\n", (unsigned long long)cnt, (unsigned long long)bases,
-                (unsigned long long)sum, (unsigned long long)xr);
+                (unsigned long long)sum, (unsigned long long)xor_sum);
     return 0;
 }

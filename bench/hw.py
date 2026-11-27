@@ -12,9 +12,19 @@ The benches read the same limits here, so a bench under taskset, in a container 
 import math
 import os
 
+from units import BYTES_PER_GIB, BYTES_PER_KIB, BYTES_PER_MIB
+
 CGROUP_ROOT = "/sys/fs/cgroup"
+# the cgroup v2 line of /proc/self/cgroup starts with this prefix
+CGROUP_V2_PREFIX = "0::"
 # Room left outside a bench's memory cap for the bench itself, the page cache of its inputs and the rest of the system.
 CAP_HEADROOM_BYTES = 2 << 30
+
+
+# The default cap never drops below half of the memory.
+MIN_CAP_SHARE_DEN = 2
+# Thread sweeps double the count at each step.
+SWEEP_GROWTH = 2
 
 
 def _cgroup_dirs():
@@ -22,8 +32,8 @@ def _cgroup_dirs():
 
     Empty under cgroup v1 or without /proc/self/cgroup."""
     try:
-        with open("/proc/self/cgroup") as f:
-            rel = next((x[3:].strip() for x in f if x.startswith("0::")), None)
+        with open("/proc/self/cgroup") as handle:
+            rel = next((line[len(CGROUP_V2_PREFIX):].strip() for line in handle if line.startswith(CGROUP_V2_PREFIX)), None)
     except OSError:
         return []
     if rel is None:
@@ -40,8 +50,8 @@ def _cgroup_dirs():
 def _read(path):
     """Stripped text of a small file, or None when it cannot be read."""
     try:
-        with open(path) as f:
-            return f.read().strip()
+        with open(path) as handle:
+            return handle.read().strip()
     except OSError:
         return None
 
@@ -51,29 +61,29 @@ def cpus():
 
     The affinity mask, bounded by the tightest cgroup v2 cpu.max quota (quota over period, rounded up) on the process's path.
     This is the count Rust's available_parallelism() gives optik."""
-    n = len(os.sched_getaffinity(0))
-    for d in _cgroup_dirs():
-        v = _read(os.path.join(d, "cpu.max"))
-        if not v:
+    count = len(os.sched_getaffinity(0))
+    for cgroup_dir in _cgroup_dirs():
+        cpu_max = _read(os.path.join(cgroup_dir, "cpu.max"))
+        if not cpu_max:
             continue
-        quota, _, period = v.partition(" ")
+        quota, _, period = cpu_max.partition(" ")
         if quota != "max" and period:
-            n = min(n, max(1, math.ceil(int(quota) / int(period))))
-    return max(1, n)
+            count = min(count, max(1, math.ceil(int(quota) / int(period))))
+    return max(1, count)
 
 
 def mem_bytes():
     """MemTotal, bounded by the tightest cgroup v2 memory.max on this process's path."""
     mem = None
-    with open("/proc/meminfo") as f:
-        for line in f:
+    with open("/proc/meminfo") as handle:
+        for line in handle:
             if line.startswith("MemTotal:"):
-                mem = int(line.split()[1]) * 1024
+                mem = int(line.split()[1]) * BYTES_PER_KIB
                 break
-    for d in _cgroup_dirs():
-        v = _read(os.path.join(d, "memory.max"))
-        if v and v != "max":
-            mem = min(mem, int(v))
+    for cgroup_dir in _cgroup_dirs():
+        mem_max = _read(os.path.join(cgroup_dir, "memory.max"))
+        if mem_max and mem_max != "max":
+            mem = min(mem, int(mem_max))
     return mem
 
 
@@ -82,35 +92,35 @@ def default_cap_bytes():
 
     Never below half of mem_bytes(), so a small machine still gets a usable cap."""
     mem = mem_bytes()
-    return max(mem // 2, mem - CAP_HEADROOM_BYTES)
+    return max(mem // MIN_CAP_SHARE_DEN, mem - CAP_HEADROOM_BYTES)
 
 
 def default_cap_str():
     """default_cap_bytes() as a size string memcap.parse_size() reads, in whole MiB."""
-    return f"{default_cap_bytes() >> 20}M"
+    return f"{default_cap_bytes() // BYTES_PER_MIB}M"
 
 
-def thread_points(lo=1, n=None):
+def thread_points(min_threads=1, max_threads=None):
     """Thread counts of a scaling sweep, i.e. powers of two from @lo up to @n, plus @n itself when it is not a power of two.
     @n defaults to cpus().
 
     With 12 CPUs this gives 1, 2, 4, 8, 12, and with 32 it gives 1 to 32."""
-    n = cpus() if n is None else n
-    lo = max(1, min(lo, n))
-    pts, t = [], 1
-    while t <= n:
-        if t >= lo:
-            pts.append(t)
-        t *= 2
-    if not pts or pts[-1] != n:
-        pts.append(n)
-    if pts[0] != lo:
-        pts.insert(0, lo)
+    max_threads = cpus() if max_threads is None else max_threads
+    min_threads = max(1, min(min_threads, max_threads))
+    pts, threads = [], 1
+    while threads <= max_threads:
+        if threads >= min_threads:
+            pts.append(threads)
+        threads *= SWEEP_GROWTH
+    if not pts or pts[-1] != max_threads:
+        pts.append(max_threads)
+    if pts[0] != min_threads:
+        pts.insert(0, min_threads)
     return pts
 
 
 if __name__ == "__main__":
     print(f"cpus {cpus()}")
-    print(f"mem_gib {mem_bytes() / 2**30:.1f}")
+    print(f"mem_gib {mem_bytes() / BYTES_PER_GIB:.1f}")
     print(f"default_cap {default_cap_str()}")
     print(f"thread_points {thread_points()}")
